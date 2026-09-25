@@ -1,0 +1,9 @@
+# Only scripts and notes are tracked; logs, request/result JSON, the SAWMOD project and dumps stay local.
+*
+!.gitignore
+!*.py
+!*.jl
+!*.sh
+!*.md
+!attic/
+!attic/*.jl

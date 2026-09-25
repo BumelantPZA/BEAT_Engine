@@ -161,10 +161,14 @@ function _normalized_metal_regular_kernel_mode(value=nothing)
         :pair_gather => :pair_gather,
         :chunked => :pair_gather,
         :chunked_pair_gather => :pair_gather,
+        :pair_gather_v4 => :pair_gather_v4,
+        :gather_v4 => :pair_gather_v4,
+        :pair_tilereduce => :pair_tilereduce,
+        :tilereduce => :pair_tilereduce,
     )
     normalized = get(aliases, mode, nothing)
     normalized === nothing && error(
-        "BLAB_METAL_REGULAR_KERNEL_MODE must be pair_gather, pair_atomic, pair_owned, or entry_owned; got $(value).",
+        "BLAB_METAL_REGULAR_KERNEL_MODE must be pair_gather, pair_gather_v4, pair_tilereduce, pair_atomic, pair_owned, or entry_owned; got $(value).",
     )
     return normalized
 end

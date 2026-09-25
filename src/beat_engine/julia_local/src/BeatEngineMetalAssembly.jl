@@ -70,6 +70,10 @@ function _assemble_regular_galerkin_operators_metal_native(
             _launch_metal_regular_atomic_kernels!(operators, native_cache, k)
         elseif regular_kernel_mode == :pair_gather
             _launch_metal_regular_gather_kernels!(operators, native_cache, k)
+        elseif regular_kernel_mode == :pair_gather_v4
+            _launch_metal_regular_gather_v4_kernels!(operators, native_cache, k)
+        elseif regular_kernel_mode == :pair_tilereduce
+            _launch_metal_regular_tilereduce_kernels!(operators, native_cache, k)
         else
             _launch_metal_regular_entry_kernels!(operators, native_cache, k)
         end
@@ -94,6 +98,24 @@ function _assemble_regular_galerkin_operators_metal_native(
                 )
             elseif regular_kernel_mode == :pair_gather
                 _launch_metal_symmetry_regular_gather_kernels!(
+                    operators,
+                    native_cache,
+                    image_cache,
+                    transform,
+                    k;
+                    skip_image_singular=skip_image_singular,
+                )
+            elseif regular_kernel_mode == :pair_gather_v4
+                _launch_metal_symmetry_regular_gather_v4_kernels!(
+                    operators,
+                    native_cache,
+                    image_cache,
+                    transform,
+                    k;
+                    skip_image_singular=skip_image_singular,
+                )
+            elseif regular_kernel_mode == :pair_tilereduce
+                _launch_metal_symmetry_regular_tilereduce_kernels!(
                     operators,
                     native_cache,
                     image_cache,
@@ -135,7 +157,7 @@ function _assemble_regular_galerkin_operators_metal_native(
             end
         end
         timing !== nothing && (timing["metal_native_singular_cache"] = cache_elapsed)
-        singular_launch! = regular_kernel_mode in (:pair_atomic, :pair_gather) ?
+        singular_launch! = regular_kernel_mode in (:pair_atomic, :pair_gather, :pair_gather_v4, :pair_tilereduce) ?
             _launch_metal_singular_block_scatter_kernels! :
             _launch_metal_singular_block_gather_kernels!
         singular_elapsed = @elapsed begin
@@ -180,7 +202,9 @@ function _assemble_regular_galerkin_operators_metal_native(
     color_count = length(native_cache.color_offsets) - 1
     kernel_name = regular_kernel_mode == :pair_owned ? "colored_pair_owned" :
         regular_kernel_mode == :pair_atomic ? "fused_pair_atomic" :
-        regular_kernel_mode == :pair_gather ? "chunked_pair_gather" : "entry_owned"
+        regular_kernel_mode == :pair_gather ? "chunked_pair_gather" :
+        regular_kernel_mode == :pair_gather_v4 ? "chunked_pair_gather_v4" :
+        regular_kernel_mode == :pair_tilereduce ? "chunked_pair_tilereduce" : "entry_owned"
     mode_name = "metal_native_" * kernel_name * (singular_mode == :native ? "" : "_host_singular")
     return merge(
         operators,
@@ -199,7 +223,7 @@ function _assemble_regular_galerkin_operators_metal_native(
             regular_kernel_launches=regular_kernel_mode == :pair_owned ?
                 2 * (image_count + 1) * color_count^2 :
                 regular_kernel_mode == :pair_atomic ? (image_count + 1) :
-                regular_kernel_mode == :pair_gather ? 3 * (image_count + 1) * _metal_gather_chunk_count(native_cache) :
+                regular_kernel_mode in (:pair_gather, :pair_gather_v4, :pair_tilereduce) ? 3 * (image_count + 1) * _metal_gather_chunk_count(native_cache) :
                 2 * (image_count + 1),
             regular_kernel_mode=mode_name,
             regular_assembly_mode=Symbol(mode_name),

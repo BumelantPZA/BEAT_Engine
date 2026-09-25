@@ -2816,8 +2816,51 @@ function solve_request_impl(request; event_mode=false)
     )
     coupled_system = nothing
     # Test prefetch: assemble frequency i+1's Metal BEM operators while frequency i's host stages run.
-    prefetch_operators = use_condensed_solver && bem_backend == :metal && Threads.nthreads() > 1 &&
+    # Test pipeline: frequency i+1's first half (GPU operators, BEM matrices, FEM condensation) runs
+    # while frequency i does its dense stage, solve and outputs. Two MUMPS stores alternate by
+    # frequency so i+1's factorization never touches the solver i's solve still reads.
+    pipeline = use_condensed_solver && bem_backend == :metal && Threads.nthreads() > 1 &&
+               get(ENV, "BLAB_TEST_COUPLED_PIPELINE", "0") == "1"
+    prefetch_operators = !pipeline && use_condensed_solver && bem_backend == :metal && Threads.nthreads() > 1 &&
                          get(ENV, "BLAB_TEST_COUPLED_PREFETCH", "0") == "1"
+    pipeline_caches = pipeline ? (coupled_cache, merge(coupled_cache, (mumps_store=Dict{Symbol,Any}(),))) : nothing
+    pending_build = nothing
+    start_pipeline_build = function (index)
+        ready = Channel{Nothing}(1)
+        gate_open = Channel{Nothing}(1)
+        task = Threads.@spawn build_condensed_coupled_system(
+            fem_mesh,
+            bem_mesh,
+            interface_map,
+            FloatType(request["frequencies_hz"][index]),
+            sound_speed,
+            density;
+            quadrature_order=quadrature_order,
+            regular_quadrature_order=quadrature_selections[index].order,
+            singular_order=singular_order,
+            cache=pipeline_caches[isodd(index) ? 1 : 2],
+            validation_diagnostics=validation_diagnostics,
+            symmetry_mode=symmetry_mode,
+            bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
+            wall_impedances=fem_domains.wall_impedances,
+            transducers=transducers,
+            transducer_operators=transducer_operators,
+            prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
+            allow_transducer_condensation=!rom_requested &&
+                isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing)),
+            stage_gate=() -> (put!(ready, nothing); take!(gate_open)),
+        )
+        bind(ready, task)
+        return (task=task, ready=ready, gate_open=gate_open)
+    end
+    fetch_build = function (build)
+        try
+            fetch(build.task)
+        catch exception
+            exception isa TaskFailedException || rethrow()
+            rethrow(exception.task.result)
+        end
+    end
     prefetch_blas = tryparse(Int, get(ENV, "BLAB_TEST_PREFETCH_BLAS_THREADS", ""))
     process_blas_threads = BLAS.get_num_threads()
     prefetch_operators && !isnothing(prefetch_blas) && BLAS.set_num_threads(prefetch_blas)
@@ -2843,7 +2886,21 @@ function solve_request_impl(request; event_mode=false)
             else
                 nothing
             end
-            coupled_system = if use_condensed_solver
+            coupled_system = if pipeline
+                current_build = something(pending_build, start_pipeline_build(frequency_index))
+                pending_build = nothing
+                try
+                    take!(current_build.ready)   # this frequency's first half is done
+                catch
+                    fetch_build(current_build)   # surfaces the build's own error
+                    rethrow()
+                end
+                if frequency_index < length(frequencies_all) && get(ENV, "BLAB_TEST_PIPELINE_SERIAL", "0") != "1"
+                    pending_build = start_pipeline_build(frequency_index + 1)
+                end
+                put!(current_build.gate_open, nothing)
+                fetch_build(current_build)
+            elseif use_condensed_solver
                 build_condensed_coupled_system(
                     fem_mesh,
                     bem_mesh,
@@ -3468,6 +3525,18 @@ function solve_request_impl(request; event_mode=false)
             solved_count = frequency_index
         end
     finally
+        if pending_build !== nothing
+            try
+                put!(pending_build.gate_open, nothing)
+                release_condensed_coupled_system!(fetch_build(pending_build))
+            catch
+            end
+        end
+        if pipeline_caches !== nothing
+            solver = get(pipeline_caches[2].mumps_store, :solver, nothing)
+            isnothing(solver) || BeatEngineCoupledCondensed.BeatEngineMumps.mumps_release!(solver)
+            empty!(pipeline_caches[2].mumps_store)
+        end
         if next_operators !== nothing
             try
                 BeatEngineCoupledCondensed.release_operator_storage!(fetch(next_operators).operators)

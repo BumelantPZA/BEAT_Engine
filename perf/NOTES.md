@@ -1,0 +1,222 @@
+# SAWMOD Metal performance experiments (2026-09-25)
+
+## Round 4 status (2026-09-26, at compaction) — START HERE
+**2026-09-26 later: ROLLED BACK to the round-3 code (the 58 s in-app version).** The user asked for
+the previous working version. Removed: the pipeline (coupled_solver.jl), stage_gate, the MUMPS call
+lock + MUMPS server task (BeatEngineMumps.jl), the CHOLMOD mass-solve lock and the diagnostic timers.
+The round-4 copies of those three files are in perf/attic/*.round4.jl. Everything below about
+BLAB_TEST_COUPLED_PIPELINE / the locks describes that removed code.
+Open finding from reading the timers: `fem_condensation_s` starts before the GPU stage and ends at
+the fetch after bem_matrix, so it is max(condensation work, GPU 0.42 + bem_matrix 0.13), not the
+condensation alone. Its parts (factorization 0.24, Schur 0.04, transducer 0.04, mass 0.04) sum to
+~0.35, so GPU + bem_matrix (~0.55) is probably the real first-half critical path. Unmeasured.
+In-app (user): 50-freq SAWMOD 141 s (Apple Metal) -> 58 s (Apple Metal test). App test solver =
+prefetch 0 + pair_tilereduce + Accelerate + BLAB_METAL_FIELD_FAST=3 + BLAB_TEST_DENSE_STATS=1.
+Harness per-freq (12 freqs): ~1.25 s. CPU is mostly idle (~2 of 10 cores busy on average).
+Critical path per freq: [FEM condensation 0.6 (MUMPS, ~1 core) || GPU assembly 0.45 + bem_matrix
+0.13] then serial: interface elimination 0.16 + dense LU 0.23 + solve 0.08 + field 0.09.
+
+Tried and FAILED (unsolved, don't loop on it): pipeline BLAB_TEST_COUPLED_PIPELINE=1 (off by
+default) — frequency i+1's first half (GPU asm + condensation + bem_matrix) runs as a task gated
+before its dense stage, while frequency i does elimination/LU/solve/field. Two MUMPS stores
+alternate by frequency (pipeline_caches in coupled_solver.jl). Crashes (segfault / bus error inside
+MUMPS factorization, once in plain Julia code) at random frequencies, only when overlapped.
+Two alternating instances without overlap (BLAB_TEST_PIPELINE_SERIAL=1) work fine.
+Already added: global lock around every zmumps_c call + its thread-count set (BeatEngineMumps.jl
+_MUMPS_CALL_LOCK; harmless when sequential), a lock on CHOLMOD mass solves. Still crashed.
+Untested idea in the code: `_on_mumps_server` runs all MUMPS calls on one long-lived task with a
+256 MB stack (active only with the pipeline env), theory = MUMPS keeps pointers into task stacks.
+If revisiting: consider instead a single MUMPS instance and doing frequency i's MUMPS work (RHS
+reduction) before i+1's factorization starts, or drop the pipeline.
+Other remaining ideas (lower gain): interface elimination product 0.12 (ComplexF64 GEMM);
+MUMPS threads (BLAB_MUMPS_THREADS, default 4) / condensation internals.
+
+## Round 3: CPU side and field (2026-09-26, after the kernel work)
+App test solver now: prefetch OFF + pair_tilereduce + Accelerate + BLAB_METAL_FIELD_FAST=3 +
+BLAB_TEST_DENSE_STATS=1. Big batch (12 freqs x 2, big2.log): app setting before 1.74 s/freq ->
+1.31 (1.33x); same with prefetch on 1.46. maxrel 2.2e-5 (from the field, see below).
+- Prefetch no longer helps: GPU assembly (~0.45) hides behind FEM condensation (~0.6) anyway,
+  and prefetch makes bem_matrix (0.1 alone) contend with condensation (0.6).
+- Fast field (`BeatEngineMetalFieldFast.jl`, BLAB_METAL_FIELD_FAST=1/2/3): 0.32 -> 0.09 s/freq.
+  maxrel 2.2e-5 vs the precise kernel (~0.0002 dB). Mode 2 (precise sin/cos, fast rsqrt only) gives
+  the same 2.2e-5, so this is float32 radius rounding amplified by the phase at 20 kHz, not
+  fast-math error; the precise kernel carries the same size of error. Mode 3 = fast sin/cos after
+  Cody-Waite range reduction (fma), used in the app.
+- Dense factorization (`RefinedDenseLU`): opnorm(A, Inf) took 96 ms (row-major walk of a
+  column-major matrix) + maximum(abs) 37 ms around a 186 ms Float32 LU. `_dense_abs_stats` does
+  both in one threaded row-block pass, 10 ms, bit-identical. c_factorization 0.34 -> 0.23.
+- Harness: quick.py job option "dump": true writes queue/<job>.<config>.r<n>.timings.json with
+  every timing key (medians over freqs).
+CPU breakdown now (prefetch off, s/freq): FEM condensation ~0.6 (MUMPS factorization 0.24,
+Schur extraction 0.04, transducer solves 0.04, mass solve 0.06) runs alongside GPU assembly 0.45
++ bem_matrix 0.1; then serial: interface elimination 0.16 (a ComplexF64 product 0.12), dense LU
+0.23, solve 0.08, field 0.09. Next candidates: the condensation (biggest; MUMPS settings or
+reusing the symbolic analysis), the elimination product.
+
+## Kernel work: Fable's plan implemented (2026-09-26)
+Result: the far-field kernel went 1.62 -> ~0.45 s/freq (3.6x); SAWMOD end to end with prefetch
+2.29 -> 1.63 s/freq (1.40x) with tilereduce + Accelerate. maxrel vs pair_gather 2.6e-7 (3 freqs) /
+4.8e-7 (12 freqs, 20 Hz-20 kHz), limit 1e-6. Now the default of the app's "Apple Metal test" solver
+(boundary-lab src/blab/solvers/engine_distribution.py METAL_TEST_SOLVER_OPTIONS: prefetch +
+BLAB_METAL_REGULAR_KERNEL_MODE=pair_tilereduce + BLAB_TEST_BLAS=accelerate).
+In the app (user, 2026-09-26, SAWMOD 50 freqs): Apple Metal 141.3 s vs Apple Metal test 79.4 s
+= 1.78x (2.83 -> 1.59 s/freq, matches the harness).
+Plan: `../../beat-engine-fable/fable/PROPOSALS.md`. Code: new files
+`julia_local/src/BeatEngineMetalGatherV4Kernels.jl`, `BeatEngineMetalTileReduceKernels.jl` (included
+from BeatEngineMetal.jl), mode wiring in BeatEngineMetalAssembly.jl / Common.jl, release hooks in
+BeatEngineMetalRegular.jl. pair_gather is untouched and still the default.
+
+Kernel stage split, s/freq (prefetch off, BLAB_METAL_GATHER_TIMING=1, BLAB_TEST_ASM_TIMING, medians;
+the machine was shared with other apps, runs vary ~±15%):
+| mode                                   | kernel | pairs | gather D/H | gather S/K' |
+| pair_gather (baseline)                 | 1.62   | 0.80  | 0.60       | 0.21        |
+| tile 32x4 (no code)                    | 1.58   | 0.75  | 0.62       | 0.21        | (8x32/64x4 worse)
+| pair_gather_v4 (float4 groups)         | 1.05   | 0.66  | 0.24       | 0.13        | bit-identical
+| v4 + BLAB_METAL_V4_PACKED=1 (load diet)| 0.61-0.67 | 0.21 | 0.25     | 0.13        | 2.5e-7
+| pair_tilereduce TY=8, min-node order   | 0.58   | 0.43  | 0.09       | 0.07        |
+| pair_tilereduce TY=16, patch order     | 0.44-0.49 | 0.32-0.36 | 0.07 | 0.04       | default
+- Load diet = float4 points/normals/curls + rule constants as a Val tuple (compile-time) + both
+  quadrature loops unrolled. Biggest single win (pair stage 3.3x). Not bit-identical (fastmath
+  reassociation after unrolling), 2.5e-7.
+- tilereduce: Fable's padded tables failed its own go check (S_max 39 > 32, padded 2.44x), so slots
+  are CSR per tile (unpadded). Test order = greedy compact patches (1.12 slots/element vs 1.41 for
+  min-node sort; BLAB_METAL_TILEREDUCE_ORDER=min_node for the old one). BLAB_METAL_TILEREDUCE_TY
+  (default 16; 8 slower), BLAB_METAL_TILEREDUCE_BARRIER=simd (SIMD-group barriers: no faster, off).
+  Results are bit-reproducible run to run and across TY/barrier variants.
+- The reduction roughly doubles the pair stage (0.21 -> 0.32); the gathers drop 0.38 -> 0.11.
+  BLAB_TEST_TR_SKIP_REDUCE=1 is useless for attribution (the compiler then drops the maths too).
+- Idea 4 (images summed in the gather) skipped: gathers are 0.11 < the plan's 0.15 threshold.
+- Test hooks: BLAB_TEST_DUMP_GATHER_MESH=<file> (element order + P1 dofs, v4 mode) feeds
+  perf/tiletables.py and perf/patchorder.py (host-only slot statistics). perf/asmsum.py
+  summarizes BLAB_TEST_ASM_TIMING files.
+End to end, prefetch on, 12 freqs x 2 rounds (big1.log):
+  pf 2.29 | pf+v4p 1.88 (1.21x) | pf+tr 1.83 (1.25x) | pf+v4p+acc 1.73 (1.32x) | pf+tr+acc 1.63 (1.40x)
+  Accelerate now pays off because the GPU is no longer the bottleneck.
+Next bottleneck (outside the kernel): with prefetch, `bem_matrix` takes ~0.6 s/freq (0.13 without
+prefetch): burton_miller_neumann_matrices + dense products on the CPU, contending with the FEM
+condensation task. Also fem_condensation ~0.6-0.7 and field 0.31 (GPU). Remaining kernel idea: a
+cheaper in-group reduction (fewer phases / staged slot tables), worth ~0.1 s at most.
+Exterior-only note: metal_direct_assembly_available() requires pair_gather, so with tilereduce an
+exterior-only project takes the non-fused Metal path (correct, possibly slower); SAWMOD is coupled.
+
+## Status at handoff (2026-09-25 evening)
+- Prefetch works and is confirmed in the app: warm SAWMOD solve 29.9 s (Apple Metal) vs
+  24.6 s (Apple Metal test) = 1.22x, identical results. Nothing is running.
+- The app offers both solvers side by side (see "Using the test build in the Boundary Lab GUI").
+- The app froze once at the end of a solve: a Qt/PySide deadlock in upstream GUI code, not the
+  solver. Fixed locally (see "GUI freeze fix"); watch whether it recurs.
+- 2026-09-25 later: options 1 (Accelerate) and 2 (kernel group size) tested, no end-to-end
+  gain (see "Round 2 findings"). Neither is enabled in the app test build. The remaining
+  offer: upstream the prefetch, or one of the GPU-side ideas listed there.
+- Working style the user wants: short test cycles (quick.py, not 110 s full runs), report
+  progress, diagnose a failure once instead of restarting in a loop.
+
+Test checkout of BEAT Engine v0.2.0, branch `perf/experiments` (uncommitted edits).
+The user's real install (`../boundary-lab`, BEAT 0.2.0 from the release wheel) is untouched;
+this copy is loaded only via `PYTHONPATH=<this checkout>/src` with boundary-lab's venv python.
+Machine: M1 Pro, 8P+2E cores, 16-core GPU, 16 GB. Boundary Lab's default is 10 Julia threads.
+
+## Code changes (test only)
+- `julia_local/src/BeatEngineCoupledCondensed.jl`: `condensed_metal_operators(...)` plus the
+  `prefetched_operators` / `on_operators_ready` kwargs on `build_condensed_coupled_system`.
+- `julia_local/coupled_solver.jl`: with `BLAB_TEST_COUPLED_PREFETCH=1` the coupled loop starts
+  frequency i+1's GPU BEM operator assembly as soon as frequency i's operators are ready.
+  `BLAB_TEST_PREFETCH_BLAS_THREADS` optionally sets the BLAS threads while prefetch is active.
+  A `solver_options["test_env"]` hook in both request handlers sets per-request env vars.
+
+## Findings (s/freq, SAWMOD, Metal)
+- Baseline 2.70-2.89 (12 freqs, ±7% run to run). Stages per freq: GPU BEM operator 1.5-1.6
+  (critical path), FEM condensation ~0.5 of real work (overlapped with the BEM stage, its timer
+  includes the wait), then host-only: bem_matrix 0.12, block 0.25, elim 0.23, dense fact 0.36,
+  Metal field 0.31 (7,322 points, also on the GPU).
+- The existing cross-frequency pipeline only covers exterior-only solves, not coupled ones.
+- Prefetch: 2.21-2.24 (12 freqs), 1.29x on 2 runs each; 2.44 vs 2.76 in the 6-freq warm A/B
+  (1.13x, dilutes because frequency 1 can't be prefetched). Outputs bit-identical (0.0 rel).
+  Peak memory +~400 MB. It loses some gain to contention: bem_matrix 0.12->0.42 and field
+  0.31->0.60-0.74 while the next assembly runs on the GPU.
+- GPU floor with the current kernels ≈ 1.6 operator + 0.3 field ≈ 1.9 s/freq.
+- No effect (within noise): 8 vs 10 threads, MUMPS 6 threads, prefetch with BLAS 9.
+  Worse: MUMPS 2 threads (2.89), stage overlap off (3.15).
+
+- In the app (user, 2026-09-25, same SAWMOD solve, 8 Julia threads which is the GUI's Metal
+  default): first solve 84.2 old vs 79.2 test (incl.
+  ~54 s Julia start + compile each); second, warm solve 29.9 vs 24.6 s = 1.22x.
+
+## Round 2 findings (4 freqs x 2 rounds unless noted; SAWMOD, warm worker, 10 threads)
+- Kernel group size: 512 can't run (the fused singular kernel is capped at 384 threads by
+  register use). 64/128/256: GPU assembly 1.65-1.66 s/freq either way, totals within noise,
+  with and without prefetch. No gain.
+- Accelerate vs OpenBLAS: micro (n=3116) LU c32 249->199 ms, c64 430->356, GEMM c32 122->27
+  (4.5x), c64 242->120. In the solve (12 freqs x 3 rounds, prefetch on): block+elim+fact
+  1.15->0.76 s/freq, but total 2.37->2.33 (1.01x) because the field eval grew 0.48->0.78:
+  with prefetch the run is GPU-bound (next-freq assembly ~1.65 + field ~0.3 of a 2.33 s cycle).
+  Prefetch off: 2.81->2.79 (1.01x). MUMPS/FEM condensation unchanged. maxrel 6e-8..8e-8.
+  Switch left in the test solver: BLAB_TEST_BLAS=accelerate (per request; off by default).
+  Accelerate needs the "\x1a$NEWLAPACK$ILP64" suffix hint (as AppleAccelerate.jl uses);
+  without "\x1a" libblastrampoline only forwards LP64 and every ILP64 call fails.
+- Where the 1.65 s GPU assembly goes (BLAB_TEST_ASM_TIMING=<file>, BLAB_METAL_GATHER_TIMING=1):
+  regular (far-field) kernel ~1.6 s, same at 100 Hz and 15 kHz; singular+images <0.1 s.
+  Inside it: pair values 0.81, gather DLP/hypersingular 0.60, gather SLP/adjoint 0.22.
+  Coupled path already uses quadrature order 2 (the minimum).
+- Regular kernel modes (prefetch off, 3 freqs): pair_gather 1.6 s (default), pair_atomic 3.2,
+  pair_owned 5.5, entry_owned 29. Gather budget MB 128/256/512/2048: 1.69/1.58/1.61/1.89
+  (256 vs 512 is noise; bigger is worse).
+- Harness bug fixed: quick.py used to unset only the env keys the current job named, so a
+  previous job's settings leaked (one job ran with prefetch on by accident). It now resets
+  every key any job has used.
+
+## Ideas not yet tried (GPU is the bottleneck with prefetch)
+- The user wants to optimize the core kernel itself (not batching, not moving work): short
+  handoff for outside ideas in `GPU_KERNEL_HANDOFF.md`. For a Fable cloud session: brief is
+  `CLAUDE.md` on branch `fable/gpu-kernel` (worktree `../../beat-engine-fable`, from v0.2.0),
+  user guide `FABLE_CLOUD_GUIDE.md`. Fable writes `fable/PROPOSALS.md` only (no code); Claude
+  implements each idea as a new BLAB_METAL_REGULAR_KERNEL_MODE here and A/Bs it with quick.py.
+- Assemble two frequencies per kernel pass (geometry shared, only e^{ikr} differs) to cut the
+  0.81 s pair stage; fits the prefetch pipeline.
+- Take the field evaluation (~0.3 s GPU, 0.5-0.8 under contention) off the GPU critical path:
+  CPU evaluation, or defer it so it doesn't overlap the next assembly.
+- Ordering field evaluation to avoid contending with the prefetched assembly.
+- Accelerate becomes worthwhile when the dense steps dominate again (larger models: dense
+  O(n^3) grows faster than assembly O(N^2)).
+
+## Harness
+- Quick A/B, one warm worker (~60 s warm-up once, then ~80 s per two-config job):
+  start `PYTHONPATH=$PWD/../src ../../boundary-lab/.venv/bin/python quick.py &` from perf/,
+  wait for `queue/READY`, then
+  `./job.sh j02 '{"configs":{"pf":{"BLAB_TEST_COUPLED_PREFETCH":"1"},"pf_gs128":{"BLAB_TEST_COUPLED_PREFETCH":"1","BLAB_METAL_KERNEL_GROUPSIZE":"128"}}}'`
+  Restart it after editing Julia sources. Stop with a plain `kill` (SIGTERM is handled).
+- Full runs: `./run.sh <name> <threads> ENV=VAL ...` (benchmark_worker.py, 12 freqs, 2 repeats,
+  ~110 s each) and `python3 cmp.py <names...>`. Never run two benchmarks at once.
+- Pitfalls hit: relative `--out` paths break the worker (use absolute); overlap setting is
+  `off` not `0`; a chained `run.sh` once kept running after a failure, overlapping two
+  benchmarks and invalidating that batch (fixed: run.sh now returns the real exit code).
+
+## Using the test build in the Boundary Lab GUI
+boundary-lab has a local (uncommitted) solver entry "BEAT Engine (Apple Metal test)" = id
+`beat_metal_test`: same "metal" requests, but the solver script and Julia project come from this
+checkout, and requests carry `solver_options.test_env = {BLAB_TEST_COUPLED_PREFETCH: "1"}`.
+Code: `src/blab/solvers/engine_distribution.py` (METAL_TEST_* paths), `registry.py`,
+`beat_engine_runtime.py` (alias metal_test -> metal), `coupled_backend.py`
+(PhysicalSystemProductionBackend). Only shows up if this checkout exists. Expected side effect:
+`tests/test_solver_backends.py::test_solver_backend_registry_offers_only_physical_backends` fails.
+Verified end to end (3 freqs SAWMOD via headless path): results bit-identical to beat_metal,
+bem_operator_s ~0 on prefetched frequencies. Edits to the Julia sources here take effect
+after restarting the app (the worker is persistent).
+
+## GUI freeze fix (boundary-lab, uncommitted)
+Symptom: window froze right after a solve finished (process alive, ~1% CPU, no crash report;
+the "session ended" line missing from `~/.boundary-lab/logs/startup-*.log`). `sample <pid>`
+showed the main thread in `QStackedWidget.setCurrentIndex` -> layout -> `QObject::connectImpl`
+waiting on Qt's connection mutex, while the solve QThread ran the worker's `deleteLater` ->
+`~QObject` -> `QThreadWrapper::disconnectNotify` -> `PyGILState_Ensure` (waiting for the GIL).
+Fix: `src/blab/ui/system_solve.py` and `src/blab/ui/generator_worker.py` call
+`self.moveToThread(QCoreApplication.instance().thread())` before `finished.emit()`, so the
+worker is destroyed on the GUI thread. Verified with a small Qt script (destroyed on main
+thread) and 65 passing GUI controller tests; the race itself can't be forced. Worth reporting
+upstream. If the app freezes again: `sample <pid> 3` and read the main thread and QThread stacks.
+
+## Undo everything
+- boundary-lab: `git checkout -- src/blab/solvers src/blab/ui` (removes the test solver entry
+  and the freeze fix).
+- This checkout: `git checkout -- src` and delete `perf/` (also removes the BLAB_TEST_BLAS and
+  BLAB_TEST_ASM_TIMING hooks).

@@ -729,7 +729,16 @@ end
 `M_kk⁻¹ rhs` for a complex right-hand side. The Cholesky path solves the real and imaginary parts
 as one real panel.
 """
+# The test pipeline runs one frequency's presolve alongside the previous frequency's solve, both
+# on the shared cached factor; CHOLMOD solves are serialized to be safe.
+const _MASS_SOLVE_LOCK = ReentrantLock()
+
 function _mass_block_solve(block, rhs::AbstractMatrix)
+    block.kind == :cholmod && return lock(() -> _mass_block_solve_unlocked(block, rhs), _MASS_SOLVE_LOCK)
+    return _mass_block_solve_unlocked(block, rhs)
+end
+
+function _mass_block_solve_unlocked(block, rhs::AbstractMatrix)
     if block.kind == :cholmod
         rows, columns = size(rhs)
         panel = Matrix{Float64}(undef, rows, 2 * columns)
@@ -1670,6 +1679,7 @@ function build_condensed_coupled_system(
     allow_transducer_condensation::Bool=true,
     prefetched_operators=nothing,
     on_operators_ready=nothing,
+    stage_gate=nothing,
 ) where {T<:AbstractFloat}
     # `relative_residual` needs the monolithic coupled matrix, which this formulation never
     # forms. `fem_interior_residual` on each solution is the condensed-appropriate check.
@@ -1857,7 +1867,9 @@ function build_condensed_coupled_system(
         elimination_split[:mass_prep] = interface_mass_factorization_s
         mass_in_fem_stage = _interface_mass_overlap_enabled(bem_backend)
     end
+    fem_stage_work = Ref(0.0)   # diagnostic: the stage's own work, without the overlap wait
     fem_stage = () -> begin
+        fem_stage_work_started = time_ns()
         stage_condensation = _build_condensation(
             fem_system,
             interface_operators,
@@ -1872,6 +1884,7 @@ function build_condensed_coupled_system(
                 resolved_transducer_operators, gamma_fem_vertices,
             ),
         ) : nothing
+        fem_stage_work[] = (time_ns() - fem_stage_work_started) / 1.0e9
         (stage_condensation, presolve)
     end
     condensation_started = time_ns()
@@ -1934,6 +1947,7 @@ function build_condensed_coupled_system(
         prepared.identity_p1_dp0,
         wavenumber,
     )
+    elimination_split[:diag_bm_matrices] = (time_ns() - bem_matrix_started) / 1.0e9
     # `operators` is dead from here on and the matrices above are freshly
     # allocated host arrays, so free the Metal buffers now rather than leaking
     # one operator set per condensed frequency.
@@ -1960,6 +1974,11 @@ function build_condensed_coupled_system(
         end
     end
     fem_condensation_s = (time_ns() - condensation_started) / 1.0e9
+    elimination_split[:diag_fem_stage_work] = fem_stage_work[]
+    # Test pipeline (BLAB_TEST_COUPLED_PIPELINE): the GPU operators, the BEM matrices and the FEM
+    # condensation are done; wait here until the previous frequency has finished its dense stage,
+    # solve and outputs, so only this first half overlaps it.
+    isnothing(stage_gate) || stage_gate()
 
     block_assembly_started = time_ns()
     fem_count = length(fem_mesh.vertices)
@@ -2143,6 +2162,7 @@ function build_condensed_coupled_system(
             schur_double = nothing
             interface_block = _split_timed!(() -> ComplexF64.(bem_interface_block), elimination_split, :block_convert)
             schur_coupling, motion_coupling = _split_timed!(elimination_split, :product) do
+                elimination_split[:diag_rows] = size(interface_block, 1); elimination_split[:diag_inner] = size(interface_block, 2); elimination_split[:diag_cols] = size(schur_solution, 2)
                 (interface_block * schur_solution, interface_block * motion_solution)
             end
             _split_timed!(elimination_split, :scatter) do
