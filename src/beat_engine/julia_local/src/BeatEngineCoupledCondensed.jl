@@ -1857,7 +1857,9 @@ function build_condensed_coupled_system(
         elimination_split[:mass_prep] = interface_mass_factorization_s
         mass_in_fem_stage = _interface_mass_overlap_enabled(bem_backend)
     end
+    fem_stage_work = Ref(0.0)   # test diagnostic: the stage's own work, without the overlap wait
     fem_stage = () -> begin
+        fem_stage_work_started = time_ns()
         stage_condensation = _build_condensation(
             fem_system,
             interface_operators,
@@ -1872,6 +1874,7 @@ function build_condensed_coupled_system(
                 resolved_transducer_operators, gamma_fem_vertices,
             ),
         ) : nothing
+        fem_stage_work[] = (time_ns() - fem_stage_work_started) / 1.0e9
         (stage_condensation, presolve)
     end
     condensation_started = time_ns()
@@ -1928,12 +1931,14 @@ function build_condensed_coupled_system(
     isnothing(on_operators_ready) || on_operators_ready()
 
     bem_matrix_started = time_ns()
-    bem_lhs, bem_rhs_operator = burton_miller_neumann_matrices(
+    bem_lhs, bem_rhs_operator = (get(ENV, "BLAB_TEST_BM_THREADED", "0") == "1" ?
+                                 _test_burton_miller_matrices_threaded : burton_miller_neumann_matrices)(
         operators,
         prepared.identity_p1_p1,
         prepared.identity_p1_dp0,
         wavenumber,
     )
+    elimination_split[:diag_bm_matrices] = (time_ns() - bem_matrix_started) / 1.0e9
     # `operators` is dead from here on and the matrices above are freshly
     # allocated host arrays, so free the Metal buffers now rather than leaking
     # one operator set per condensed frequency.
@@ -1960,6 +1965,7 @@ function build_condensed_coupled_system(
         end
     end
     fem_condensation_s = (time_ns() - condensation_started) / 1.0e9
+    elimination_split[:diag_fem_stage_work] = fem_stage_work[]
 
     block_assembly_started = time_ns()
     fem_count = length(fem_mesh.vertices)
@@ -2109,10 +2115,19 @@ function build_condensed_coupled_system(
                 fem_stage_presolve
             end
             interface_block = _split_timed!(() -> ComplexF64.(bem_interface_block), elimination_split, :block_convert)
-            _flux_block_products!(
-                coupled, bem_range, bem_columns, mass_operator, presolve.schur_blocks, interface_block,
-                elimination_split,
-            )
+            if get(ENV, "BLAB_TEST_ELIM_F32", "0") == "1" && eltype(bem_interface_block) === ComplexF32
+                # Test: the block products in single precision (cgemm, ~4x zgemm). The BEM block is
+                # single precision already; only the per-block W = M⁻¹S is rounded down. Not bit-identical.
+                _flux_block_products!(
+                    coupled, bem_range, bem_columns, mass_operator, [ComplexF32.(block) for block in presolve.schur_blocks],
+                    bem_interface_block, elimination_split,
+                )
+            else
+                _flux_block_products!(
+                    coupled, bem_range, bem_columns, mass_operator, presolve.schur_blocks, interface_block,
+                    elimination_split,
+                )
+            end
             if transducer_count > 0
                 motion_coupling = _split_timed!(
                     () -> interface_block * presolve.motion_solution, elimination_split, :product,
@@ -2251,6 +2266,29 @@ function build_condensed_coupled_system(
             replay_factorization_s=0.0,
         ),
     )
+end
+
+# Test (BLAB_TEST_BM_THREADED=1): `burton_miller_neumann_matrices` with each output column on its own
+# thread. The per-entry expressions are the broadcasts' own, in the same order, so the result is
+# bit-identical; the broadcasts run on one thread and took ~0.15 s/freq on the critical path.
+function _test_burton_miller_matrices_threaded(operators, identity_p1_p1, identity_p1_dp0, k::T) where {T<:AbstractFloat}
+    coupling = burton_miller_coupling(k)
+    half = Complex{T}(0.5)
+    D, H = operators.double_layer, operators.hypersingular
+    S, Kp = operators.single_layer, operators.adjoint_double_layer
+    lhs = Matrix{Complex{T}}(undef, size(D))
+    rhs = Matrix{Complex{T}}(undef, size(S))
+    Threads.@threads for j in axes(lhs, 2)
+        @inbounds for i in axes(lhs, 1)
+            lhs[i, j] = half * identity_p1_p1[i, j] - D[i, j] + coupling * H[i, j]
+        end
+    end
+    Threads.@threads for j in axes(rhs, 2)
+        @inbounds for i in axes(rhs, 1)
+            rhs[i, j] = -S[i, j] - coupling * (Kp[i, j] + half * identity_p1_dp0[i, j])
+        end
+    end
+    return lhs, rhs
 end
 
 """

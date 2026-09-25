@@ -7,3 +7,5 @@
 !*.md
 !attic/
 !attic/*.jl
+!devenv/
+!devenv/*.toml

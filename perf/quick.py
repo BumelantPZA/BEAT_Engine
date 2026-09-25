@@ -6,11 +6,16 @@ perf/queue/*.json:  {"configs": {"name": {"ENV": "value", ...}, ...},
 Configs run interleaved (a b a b ...). Every env key used by any config of any job so
 far is unset for configs that don't name it. Results go to perf/queue/<job>.out.
 Accuracy is the max relative L2 difference against the first config.
-Restart the server after editing Julia sources.
+
+`quick.py --revise` runs perf/dev_worker.jl instead: Julia source edits are picked up before every
+solve (Revise), so the ~60 s start happens once. After changing a `struct` or a `const`, touch
+perf/queue/RESTART and the worker restarts before the next job. Without --revise, restart the
+server after editing Julia sources.
 """
 
 import base64
 import json
+import os
 import signal
 import statistics
 import sys
@@ -106,14 +111,37 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     QUEUE.mkdir(exist_ok=True)
     paths = engine_paths("metal")
-    worker = EngineWorker(julia_executable="julia", solver_script=paths.system_solver,
-                          julia_threads="10", julia_project=paths.project)
-    started = time.perf_counter()
-    worker.ensure_started()
-    run_config(worker, {}, [200.0, 5000.0], QUEUE / "warmup.json")
-    (QUEUE / "READY").write_text(f"warm in {time.perf_counter() - started:.1f} s\n")
+    revise = "--revise" in sys.argv
+    script, environment = paths.system_solver, None
+    if revise:
+        script = PERF / "dev_worker.jl"
+        environment = dict(os.environ, BLAB_DEV_SOLVER_DIR=str(paths.system_solver.parent),
+                           JULIA_LOAD_PATH=f"@:{PERF / 'devenv'}:@stdlib")
+
+    def start():
+        worker = EngineWorker(julia_executable="julia", solver_script=script, julia_threads="10",
+                              julia_project=paths.project, environment=environment)
+        started = time.perf_counter()
+        worker.ensure_started()
+        run_config(worker, {}, [200.0, 5000.0], QUEUE / "warmup.json")
+        (QUEUE / "READY").write_text(f"warm in {time.perf_counter() - started:.1f} s (revise={revise})\n")
+        print(f"worker warm in {time.perf_counter() - started:.1f} s (revise={revise})", flush=True)
+        return worker
+
+    (QUEUE / "RESTART").unlink(missing_ok=True)
+    worker = start()
     try:
         while True:
+            if (QUEUE / "RESTART").exists():
+                (QUEUE / "RESTART").unlink()
+                print("restarting worker", flush=True)
+                worker.terminate()
+                worker = start()
+            stray = [p.name for p in QUEUE.glob("*.json") if not p.name.endswith((".job.json", ".timings.json"))
+                     and p.name not in ("request.json", "warmup.json")]
+            if stray and not getattr(main, "warned", False):
+                print(f"ignored (jobs must be named <name>.job.json): {stray}", flush=True)
+                main.warned = True
             jobs = sorted(QUEUE.glob("*.job.json"))
             if not jobs:
                 time.sleep(0.5)
@@ -124,9 +152,10 @@ def main():
                 run_job(worker, json.loads(job_path.read_text()), out)
             except BaseException as exc:  # keep serving after a bad job
                 out.write_text(f"FAILED: {exc!r}\n")
-                if isinstance(exc, KeyboardInterrupt):
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):   # SIGTERM arrives as SystemExit
                     raise
             job_path.rename(job_path.with_suffix(".done"))
+            print(f"done {job_path.name}", flush=True)
     finally:
         worker.terminate()
 

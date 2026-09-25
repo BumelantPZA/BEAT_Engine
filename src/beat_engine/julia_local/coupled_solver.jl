@@ -3857,7 +3857,9 @@ function run_worker()
             elseif operation == "solve"
                 cleanup = cleanup_options(options)
                 release_all_bem_field_evaluation_caches!()
-                outcome = solve_request(request; event_mode=true)
+                # perf/dev_worker.jl: apply source edits, and call through the newest world so they count.
+                isdefined(Main, :BLAB_DEV_WORKER) && Main._dev_revise()
+                outcome = Base.invokelatest(solve_request, request; event_mode=true)
                 # Preserve historical driver reclamation by default. Campaign
                 # clients may opt into bounded reuse; cancellation, pressure,
                 # periodic cleanup and failures still take the full path.
@@ -3904,7 +3906,9 @@ function run_worker()
     end
 end
 
-if "--worker" in ARGS
+if isdefined(Main, :BLAB_DEV_WORKER)
+    # perf/dev_worker.jl (Revise hot reload, test harness) starts the worker itself.
+elseif "--worker" in ARGS
     try
         run_worker()
     catch exception

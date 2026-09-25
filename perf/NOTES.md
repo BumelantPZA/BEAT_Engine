@@ -1,5 +1,27 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
+## Round 5 (2026-09-26) — START HERE
+Checkpoint: git tag `metal-test-58s` (branch perf/experiments, pushed to the user's fork
+BumelantPZA/BEAT_Engine) = the round-3 code the app ran at 58 s. Later commits build on it.
+
+Harness: `quick.py --revise` runs perf/dev_worker.jl (Revise from perf/devenv, stacked by
+JULIA_LOAD_PATH): Julia edits are applied before every solve, so the ~65 s start happens once.
+Do NOT edit sources while a job runs (the next solve picks the edit up mid-job). struct/const edits:
+touch queue/RESTART. Jobs must be named `<name>.job.json` (a plain .json is ignored; that is what
+looked like a hang once). Revise mode measured ~6% slower than plain (1.69/1.51/1.46 vs
+1.58/1.44/1.35, 3 freqs) — fine for in-worker A/B; use plain mode for headline numbers.
+
+Findings (12 freqs x 2, big3.out; app config 1.19 s/freq):
+- `fem_condensation_s` = max(condensation work, GPU + bem_matrix): the condensation's own work is
+  0.38 (diag timer), GPU 0.42 + bem_matrix 0.10 = 0.52 → the first half is GPU-bound, not MUMPS.
+- BLAB_TEST_BM_THREADED=1: threaded Burton-Miller combination, bit-identical. bem_matrix 0.10 -> 0.04,
+  first half 0.54 -> 0.47. End to end within noise (1.19 vs 1.19). Candidate for the app (free).
+- BLAB_TEST_ELIM_F32=1: interface-elimination block products in ComplexF32. product 0.127 -> 0.032,
+  total 1.07 (1.11x) but maxrel 2.7e-4 (~0.002 dB; the fast field is 2.2e-5). User's call. Off.
+- GPU LU (perf/mps_lu_micro.jl): MPS real-embedded 2n LU 408 ms vs CPU ComplexF32 lu! 189 ms. Dead end.
+Per-freq budget now: first half 0.47 (GPU-bound; condensation 0.38 right behind) + elimination 0.15
++ LU 0.21 + solve 0.07 + field 0.09 + ~0.08 request/output overhead.
+
 ## Round 4 status (2026-09-26, at compaction) — START HERE
 **2026-09-26 later: ROLLED BACK to the round-3 code (the 58 s in-app version).** The user asked for
 the previous working version. Removed: the pipeline (coupled_solver.jl), stage_gate, the MUMPS call
