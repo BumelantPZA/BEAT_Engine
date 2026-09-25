@@ -2,12 +2,12 @@
 
 This branch is BEAT Engine v0.2.0, unmodified except for this file. It's a coupled FEM-BEM
 acoustic solver in Julia; the Apple GPU path uses Metal.jl 1.10.3. You're asked for
-**architecture and ideas for making one GPU kernel faster**. The user benchmarks
-everything locally on the real machine.
+**architecture, ideas and an implementation plan for making one GPU kernel faster**. You
+write no code: another agent implements the plan and benchmarks it on the real machine.
 
 ## Hard limits of this session (read first; the budget is small)
 - This sandbox is Linux with no Apple GPU. **Don't install Julia, instantiate environments,
-  or run tests or the solver.** Nothing here can run Metal code.
+  run tests or the solver, or write code.** Nothing here can run Metal code.
 - Read the files listed under "Code" first. Only open other files when a specific question
   needs them. Don't survey the repo.
 - Out of scope: batching several frequencies into one pass, moving work between CPU and
@@ -63,14 +63,33 @@ everything locally on the real machine.
 - `BeatEngineMetalCommon.jl`: `MetalRegularAssemblyCache` (the data the kernels read),
   launch helpers and env switches.
 
-## Deliverables
-**Stage 1 (do this, then stop and wait):** write `fable/PROPOSALS.md`. Aim for about 2
-pages, ranked. For each idea give:
-- what changes in the kernel, and why it should help on Apple GPUs specifically
-- a bound on the gain, from the timings above
-- the accuracy risk
-- the effort
-- how to verify it locally with one env-var A/B
+## Deliverable: a plan, no code
+**Don't write or change any code.** Another agent (Claude on the user's Mac, which has the
+GPU) implements and benchmarks whatever you propose. Your output is one file,
+`fable/PROPOSALS.md`. Commit and push it, then stop.
+
+1. **Diagnosis** (short): from the code and the timings, what most likely limits each
+   stage: pair 0.81, gather D/H 0.60, gather S/K' 0.22. Name the evidence, and say which
+   quick local measurement would confirm it, e.g. a stage timing, a counter, or a one-line
+   kernel variant.
+2. **Ideas, ranked.** For each one:
+   - what changes in the kernel, and why it should help on Apple GPUs specifically
+   - a bound on the gain, from the timings above
+   - the accuracy risk
+   - the effort
+3. **Implementation plan for the top 2-3 ideas**, detailed enough to code without guessing:
+   - kernel structure: grid and threadgroup shape, what each thread and threadgroup owns
+   - threadgroup memory layout and size
+   - the loop order
+   - how the sums reach the operators with no atomics
+   - how symmetry passes and skipped (singular or adjacent) pairs are handled
+   - which existing functions to reuse
+   - pitfalls
+   Each one is added as a new `BLAB_METAL_REGULAR_KERNEL_MODE` value next to `pair_gather`,
+   which stays untouched.
+4. **Test plan:** the order to try things in, with small experiments first. Give a
+   go/no-go threshold per idea. For each idea, also say what must be checked for
+   correctness: relative L2 against `pair_gather` ≲ 1e-6.
 
 Things worth judging:
 - avoiding or shrinking the 48-value buffer (threadgroup tiles with in-group reduction,
@@ -79,20 +98,13 @@ Things worth judging:
   test-element data across trials, register pressure)
 - sharing work across the 4 symmetry passes
 - safe FP16 or mixed precision in the far field
+- pair tile shape
 
-Commit and push the file to this branch.
-
-**Stage 2 (only when the user picks an idea):** implement it as a new
-`BLAB_METAL_REGULAR_KERNEL_MODE` value, e.g. `tiled_gather`, next to the existing modes.
-Leave `pair_gather` untouched and make sure the symmetry passes work. The user can then
-A/B it with one env var. Julia/Metal.jl kernel rules:
-- type-stable, no allocations, Int32 indexing as in the existing kernels
-- threadgroup memory via `MtlThreadGroupArray`, barriers via `threadgroup_barrier`, SIMD
-  functions from Metal.jl
-
-You can't compile it, so re-read the code for type and index errors before committing.
-List what needs checking on the real machine at the end of the PROPOSALS file. Commit and
-push.
+Metal.jl facts for the plan:
+- threadgroup memory is `MtlThreadGroupArray`
+- barriers are `threadgroup_barrier`
+- SIMD-group shuffles and reductions are available
+- the kernels use Int32 indexing and must be type-stable and allocation-free
 
 Follow `AGENTS.md` where it applies: no numerical baseline changes, and performance claims
 are made only after local measurement.
