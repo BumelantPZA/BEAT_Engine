@@ -18,6 +18,13 @@ Findings (12 freqs x 2, big3.out; app config 1.19 s/freq):
   first half 0.54 -> 0.47. End to end within noise (1.19 vs 1.19). Candidate for the app (free).
 - BLAB_TEST_ELIM_F32=1: interface-elimination block products in ComplexF32. product 0.127 -> 0.032,
   total 1.07 (1.11x) but maxrel 2.7e-4 (~0.002 dB; the fast field is 2.2e-5). User's call. Off.
+- App (2026-09-26): BLAB_TEST_BM_THREADED=1 added to boundary-lab's METAL_TEST_SOLVER_OPTIONS
+  (engine_distribution.py). boundary-lab has no user fork, so the app-side diff is kept here:
+  perf/app_patches/engine_distribution.diff (git -C ../boundary-lab apply it to restore).
+- Next (user approved, not started): pipeline crash bisection. Re-add the round-4 pipeline
+  (perf/attic) WITHOUT the locks, reproduce with ~24 freqs, then serialize one overlap pairing at a
+  time with a shared test lock: i+1 condensation vs i's elimination+LU (BLAS), vs i's solve
+  (MUMPS/CHOLMOD), and i+1 GPU assembly vs i's field (GPU). Report after the bisection; max 2 fixes.
 - GPU LU (perf/mps_lu_micro.jl): MPS real-embedded 2n LU 408 ms vs CPU ComplexF32 lu! 189 ms. Dead end.
 Per-freq budget now: first half 0.47 (GPU-bound; condensation 0.38 right behind) + elimination 0.15
 + LU 0.21 + solve 0.07 + field 0.09 + ~0.08 request/output overhead.

@@ -9,3 +9,5 @@
 !attic/*.jl
 !devenv/
 !devenv/*.toml
+!app_patches/
+!app_patches/*.diff

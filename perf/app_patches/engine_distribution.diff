@@ -1,0 +1,51 @@
+diff --git a/src/blab/solvers/engine_distribution.py b/src/blab/solvers/engine_distribution.py
+index 40299fc..e2f1c56 100644
+--- a/src/blab/solvers/engine_distribution.py
++++ b/src/blab/solvers/engine_distribution.py
+@@ -1,5 +1,7 @@
+ """The required, independently released BEAT Engine dependency."""
+ 
++from pathlib import Path
++
+ try:
+     import beat_engine
+ except ImportError as exc:
+@@ -12,4 +14,38 @@ from beat_engine import backend_catalog as backend_catalog
+ from beat_engine import backend_info as engine_backend_info
+ from beat_engine import engine_paths as engine_paths
+ 
++# Local experiment, not upstream: "BEAT Engine (Apple Metal test)" runs the Julia
++# sources of the sibling beat-engine-test checkout (coupled Metal prefetch). Its
++# requests are still marked "metal"; only the solver script and Julia project differ.
++METAL_TEST_BACKEND_ID = "beat_metal_test"
++METAL_TEST_LABEL = "BEAT Engine (Apple Metal test)"
++METAL_TEST_ROOT = Path(__file__).resolve().parents[4] / "beat-engine-test" / "src" / "beat_engine"
++METAL_TEST_PROJECT = METAL_TEST_ROOT / "julia_metal"
++METAL_TEST_SYSTEM_SOLVER = METAL_TEST_ROOT / "julia_local" / "coupled_solver.jl"
++METAL_TEST_SOURCE_SOLVER = METAL_TEST_ROOT / "julia_local" / "solver.jl"
++METAL_TEST_SOLVER_OPTIONS = {
++    "test_env": {
++        # 2026-09-26 (beat-engine-test perf/NOTES.md): tile-reduced far-field kernel, Apple
++        # Accelerate, fast field evaluation, fused dense-norm pass. Prefetch is off: with the
++        # faster kernel the GPU assembly hides behind the FEM condensation, and prefetch only
++        # adds CPU contention (1.31 vs 1.46 s/freq).
++        "BLAB_TEST_COUPLED_PREFETCH": "0",
++        "BLAB_METAL_REGULAR_KERNEL_MODE": "pair_tilereduce",
++        "BLAB_TEST_BLAS": "accelerate",
++        "BLAB_METAL_FIELD_FAST": "3",
++        "BLAB_TEST_DENSE_STATS": "1",
++        # 2026-09-26 round 5: threaded Burton-Miller matrix build, bit-identical (bem_matrix 0.10 -> 0.04).
++        "BLAB_TEST_BM_THREADED": "1",
++    }
++}
++
++
++def metal_test_available() -> bool:
++    return METAL_TEST_SYSTEM_SOLVER.exists() and (METAL_TEST_PROJECT / "Manifest.toml").exists()
++
++
++def is_metal_test_backend(value: object) -> bool:
++    return str(value or "").strip().lower() in {"metal_test", METAL_TEST_BACKEND_ID}
++
++
+ __all__ = ["backend_catalog", "engine_backend_info", "engine_paths"]
