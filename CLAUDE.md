@@ -1,6 +1,6 @@
 # Task: make the Metal BEM far-field assembly kernel faster
 
-This branch is BEAT Engine v0.2.0, unmodified except for this file. It's a coupled FEM-BEM
+This branch is BEAT Engine v0.2.0, unmodified except for this file and `fable/KERNEL_EXCERPT.jl`. It's a coupled FEM-BEM
 acoustic solver in Julia; the Apple GPU path uses Metal.jl 1.10.3. You're asked for
 **architecture, ideas and an implementation plan for making one GPU kernel faster**. You
 write no code: another agent implements the plan and benchmarks it on the real machine.
