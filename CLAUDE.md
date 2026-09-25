@@ -5,11 +5,15 @@ acoustic solver in Julia; the Apple GPU path uses Metal.jl 1.10.3. You're asked 
 **architecture, ideas and an implementation plan for making one GPU kernel faster**. You
 write no code: another agent implements the plan and benchmarks it on the real machine.
 
-## Hard limits of this session (read first; the budget is small)
+## Hard limits of this session (read first; keep usage small)
+- The user wants this to take only a small part of their usage. Work in one pass: read,
+  think, write the file once, commit, push, stop. No drafts, no rewrites, no subagents, no
+  web searches.
 - This sandbox is Linux with no Apple GPU. **Don't install Julia, instantiate environments,
   run tests or the solver, or write code.** Nothing here can run Metal code.
-- Read the files listed under "Code" first. Only open other files when a specific question
-  needs them. Don't survey the repo.
+- **Read only `fable/KERNEL_EXCERPT.jl`** (~880 lines, all the relevant code). Open a
+  repo file only if the excerpt truly lacks something you need, and then only that
+  function. Don't survey the repo.
 - Out of scope: batching several frequencies into one pass, moving work between CPU and
   GPU, pipelining or overlap (already done locally), changing quadrature order or accuracy
   settings. Stay inside the core calculation.
@@ -54,30 +58,30 @@ write no code: another agent implements the plan and benchmarks it on the real m
     - `entry_owned`: 29 s
   - Pair tile shape is `BLAB_METAL_ATOMIC_TILE` (16x16 default); not tuned yet.
 
-## Code (all under `src/beat_engine/julia_local/src/`)
-- `BeatEngineMetalGatherKernels.jl`: the current path. Header comment, pair kernel, both
-  gather kernels, launch loop.
-- `BeatEngineMetalAtomicKernels.jl` from line ~89: `_metal_regular_pair_blocks`, the
-  per-pair maths shared by all variants.
-- `BeatEngineMetalAssembly.jl`: mode dispatch and the symmetry-image loop.
-- `BeatEngineMetalCommon.jl`: `MetalRegularAssemblyCache` (the data the kernels read),
-  launch helpers and env switches.
+## Code
+`fable/KERNEL_EXCERPT.jl` holds verbatim copies, each marked with its source file and lines
+under `src/beat_engine/julia_local/src/`:
+- the cache struct and launch helper
+- the skip test for singular pairs
+- the per-pair maths: `_metal_trial_term`, `_metal_regular_pair_blocks`
+- the whole current gather path, with its header comment
+- the mode dispatch and symmetry-image loop
 
 ## Deliverable: a plan, no code
 **Don't write or change any code.** Another agent (Claude on the user's Mac, which has the
 GPU) implements and benchmarks whatever you propose. Your output is one file,
-`fable/PROPOSALS.md`. Commit and push it, then stop.
+`fable/PROPOSALS.md`, **at most ~250 lines**. Commit and push it, then stop.
 
 1. **Diagnosis** (short): from the code and the timings, what most likely limits each
    stage: pair 0.81, gather D/H 0.60, gather S/K' 0.22. Name the evidence, and say which
    quick local measurement would confirm it, e.g. a stage timing, a counter, or a one-line
    kernel variant.
-2. **Ideas, ranked.** For each one:
+2. **Ideas, ranked, at most 6.** For each one, a few lines:
    - what changes in the kernel, and why it should help on Apple GPUs specifically
    - a bound on the gain, from the timings above
    - the accuracy risk
    - the effort
-3. **Implementation plan for the top 2-3 ideas**, detailed enough to code without guessing:
+3. **Implementation plan for the top 2 ideas**, detailed enough to code without guessing:
    - kernel structure: grid and threadgroup shape, what each thread and threadgroup owns
    - threadgroup memory layout and size
    - the loop order
