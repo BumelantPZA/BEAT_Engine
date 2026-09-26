@@ -1,5 +1,5 @@
 diff --git a/src/blab/solvers/engine_distribution.py b/src/blab/solvers/engine_distribution.py
-index 40299fc..07da51a 100644
+index 40299fc..b77c5b8 100644
 --- a/src/blab/solvers/engine_distribution.py
 +++ b/src/blab/solvers/engine_distribution.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 40299fc..07da51a 100644
  try:
      import beat_engine
  except ImportError as exc:
-@@ -12,4 +14,71 @@ from beat_engine import backend_catalog as backend_catalog
+@@ -12,4 +14,74 @@ from beat_engine import backend_catalog as backend_catalog
  from beat_engine import backend_info as engine_backend_info
  from beat_engine import engine_paths as engine_paths
  
@@ -69,6 +69,9 @@ index 40299fc..07da51a 100644
 +        # delays a pivot, the search alone cost 0.04 s per factorization; a failed factorization
 +        # retries with the default threshold). 50-freq 0.642 -> 0.623 s/freq, maxrel 4.4e-8.
 +        "BLAB_TEST_MUMPS_CNTL": "1=0",
++        # Round 11: no Float32 FEM system assembled only to be replaced by the Float64 one (bit-identical,
++        # -0.006 s/freq).
++        "BLAB_TEST_FEM_F32_SKIP": "1",
 +    }
 +}
 +

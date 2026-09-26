@@ -2235,7 +2235,11 @@ function build_condensed_coupled_system(
 
     omega = T(2pi) * frequency_hz
     wavenumber = omega / sound_speed
-    fem_system = assemble_fem_dynamic_stiffness(
+    # Test (BLAB_TEST_FEM_F32_SKIP=1): the Float64 system below replaces this one on Metal; don't
+    # assemble it (and its wall terms) only to drop it. Bit-identical.
+    skip_fem_single = T !== Float64 && _fem_float64_enabled(bem_backend) &&
+                      get(ENV, "BLAB_TEST_FEM_F32_SKIP", "0") == "1"
+    fem_system = skip_fem_single ? nothing : assemble_fem_dynamic_stiffness(
         prepared.stiffness,
         prepared.mass,
         wavenumber;
@@ -2251,7 +2255,7 @@ function build_condensed_coupled_system(
         )
         for operator in prepared.wall_impedance_operators
     ]
-    for (operator, admittance) in zip(prepared.wall_impedance_operators, wall_admittances)
+    skip_fem_single || for (operator, admittance) in zip(prepared.wall_impedance_operators, wall_admittances)
         fem_system -= neumann_scale(density, omega) * admittance .* operator.matrix
     end
     interface_operators = prepared.interface_operators
