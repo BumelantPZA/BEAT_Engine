@@ -336,8 +336,20 @@ function _quiet!(s::ZMumpsStruc)
     set_icntl!(s, 19, 3)   # centralized Schur complement, by columns
     set_icntl!(s, 20, 0)   # dense right-hand sides
     set_icntl!(s, 21, 0)   # centralized solution
+    # Test (BLAB_TEST_MUMPS_ICNTL="7=5,35=2", BLAB_TEST_MUMPS_CNTL="7=1e-12"): overrides, applied
+    # before the analysis.
+    for (name, setter) in (("BLAB_TEST_MUMPS_ICNTL", (i, v) -> set_icntl!(s, i, parse(Int, v))),
+                           ("BLAB_TEST_MUMPS_CNTL", (i, v) -> _test_set_cntl!(s, i, parse(Float64, v))))
+        for item in split(get(ENV, name, ""), ','; keepempty=false)
+            index, value = split(strip(item), '=')
+            setter(parse(Int, index), value)
+        end
+    end
     return s
 end
+
+_test_set_cntl!(s::ZMumpsStruc, index::Integer, value::Real) =
+    GC.@preserve s unsafe_store!(_field_pointer(s, :cntl, Float64), Float64(value), index)
 
 function _check(solver::MumpsSchurSolver, phase::AbstractString)
     status = infog(solver.struc, 1)

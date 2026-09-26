@@ -55,7 +55,10 @@ const TEST_BLAS_MODE = Ref("openblas")
 const TEST_BLAS_STARTUP = Ref{Any}(nothing)
 
 function test_apply_blas!()
-    mode = lowercase(get(ENV, "BLAB_TEST_BLAS", "openblas")) == "accelerate" ? "accelerate" : "openblas"
+    requested = lowercase(get(ENV, "BLAB_TEST_BLAS", "openblas"))
+    # "hybrid": Julia's ILP64 calls on Accelerate, MUMPS's LP64 calls on OpenBLAS32 (so
+    # BLAB_MUMPS_THREADS applies again).
+    mode = requested in ("accelerate", "hybrid") ? requested : "openblas"
     mode == TEST_BLAS_MODE[] && return
     if isnothing(TEST_BLAS_STARTUP[])
         TEST_BLAS_STARTUP[] = (libs=[l.libname for l in BLAS.get_config().loaded_libs],
@@ -65,6 +68,10 @@ function test_apply_blas!()
         # "\x1a" tells libblastrampoline to drop the trailing underscore: zgemm_64_ -> zgemm$NEWLAPACK$ILP64.
         BLAS.lbt_forward(TEST_ACCELERATE; clear=true, suffix_hint="\x1a\$NEWLAPACK\$ILP64")
         BLAS.lbt_forward(TEST_ACCELERATE; clear=false, suffix_hint="\x1a\$NEWLAPACK")
+    elseif mode == "hybrid"
+        BLAS.lbt_forward(TEST_ACCELERATE; clear=true, suffix_hint="\x1a\$NEWLAPACK\$ILP64")
+        openblas32 = Base.require(BeatEngineCoupledCondensed.BeatEngineMumps.OPENBLAS32_PKGID)
+        BLAS.lbt_forward(Base.invokelatest(getproperty, openblas32, :libopenblas_path); clear=false)
     else
         for (i, lib) in enumerate(TEST_BLAS_STARTUP[].libs)
             BLAS.lbt_forward(lib; clear=(i == 1))

@@ -1364,7 +1364,11 @@ function _build_mumps_condensation(
             transducer_count = size(surface, 2)
             columns = hcat(Matrix(surface), Matrix(force))
             reduced = mumps_reduce(solver, columns)
-            interior_solution = mumps_interior_solve(solver, columns)
+            # Test (BLAB_TEST_MUMPS_EXPAND=1): the expansion of that reduction with x_Γ = 0 is
+            # A_II⁻¹ b_I, the interior solve, but reuses the reduction's forward sweep.
+            interior_solution = get(ENV, "BLAB_TEST_MUMPS_EXPAND", "0") == "1" ?
+                                mumps_expand(solver, zeros(ComplexF64, length(solver.schur_variables), size(columns, 2))) :
+                                mumps_interior_solve(solver, columns)
             motion_solution = interior_solution[interior_vertices, 1:transducer_count]
             force_interior = force[interior_vertices, :]
             (
