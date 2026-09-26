@@ -1,6 +1,6 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
-## Round 6 (2026-09-26) — Fable plan (beat-engine-fable/fable/PLAN.md) — START HERE
+## Round 6 (2026-09-26) — Fable plan (beat-engine-fable/fable/PLAN.md). Handoff: perf/HANDOFF.md — START HERE
 Best config so far = app + BLAB_TEST_GC_DEFER=1 + BLAB_TEST_BLOCKED_LU=512:
 **1.224 -> 1.084 s/freq (1.13x)**, 12 freqs, Revise mode, maxrel 1.3e-7. Not yet in the app.
 Timer corrections (the handoff table double-counted): block_assembly_s CONTAINS
