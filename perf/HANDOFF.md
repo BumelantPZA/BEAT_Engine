@@ -6,8 +6,8 @@ To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-tes
 
 ## Where things stand
 - Goal: shorten the whole SAWMOD coupled FEM-BEM solve (50 freqs) in Boundary Lab's
-  "BEAT Engine (Apple Metal test)" solver. In-app: 141 s (stock Apple Metal) → 58 s (round 3).
-  Round 6 is enabled in the app, but the in-app result is pending the user's benchmark.
+  "BEAT Engine (Apple Metal test)" solver. In-app, 50 freqs: 141 s (stock Apple Metal) → 58 s
+  (round 3) → **51.2 s (round 6, user-measured 2026-09-26)**.
 - Harness (12 freqs, Revise mode): 1.224 → **1.084 s/freq** with round 6, maxrel 1.3e-7.
 - Code: this checkout, branch `perf/experiments`, pushed to the user's fork
   (`git push fork perf/experiments`, BumelantPZA/BEAT_Engine). **Never push to `origin`
@@ -72,6 +72,7 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 | 3 | Fast field eval (`FIELD_FAST=3`, maxrel 2.2e-5), fused dense-norm pass, prefetch off | 141 → 58 s in-app |
 | 5 | Threaded Burton-Miller combine (`BM_THREADED`), exact | first half 0.54 → 0.47 |
 | 6 | `GC_DEFER`: GC off during a frequency, one collection after (was 1.1 GB/freq, 5 pauses, 0.12–0.16 s), exact | −0.05 s/freq |
+| 6 | (both round-6 rows together: in-app 58 → 51.2 s) | |
 | 6 | `BLOCKED_LU=512`: right-looking blocked LU, Accelerate getrf panel + cgemm trailing update (cgetrf runs at 0.3 TFLOP/s, cgemm at 2.0), maxrel 1.3e-7, refinement 1.5 → 2 steps | −0.085 s/freq |
 
 ## What didn't work — don't retry without a new reason

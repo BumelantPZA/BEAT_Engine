@@ -2,7 +2,7 @@
 
 ## Round 6 (2026-09-26) — Fable plan (beat-engine-fable/fable/PLAN.md). Handoff: perf/HANDOFF.md — START HERE
 Best config so far = app + BLAB_TEST_GC_DEFER=1 + BLAB_TEST_BLOCKED_LU=512:
-**1.224 -> 1.084 s/freq (1.13x)**, 12 freqs, Revise mode, maxrel 1.3e-7. Not yet in the app.
+**1.224 -> 1.084 s/freq (1.13x)**, 12 freqs, Revise mode, maxrel 1.3e-7. In the app: 50-freq SAWMOD 58 -> 51.2 s (user, 2026-09-26).
 Timer corrections (the handoff table double-counted): block_assembly_s CONTAINS
 interface_elimination_s (pure assembly ~0.01); fem_schur_extraction_s CONTAINS
 fem_transducer_solves_s. New timers: interface_elim_lu_{isfinite,stats,convert,getrf}_s and
