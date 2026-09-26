@@ -1,5 +1,5 @@
 diff --git a/src/blab/solvers/engine_distribution.py b/src/blab/solvers/engine_distribution.py
-index 40299fc..95e0299 100644
+index 40299fc..1401de1 100644
 --- a/src/blab/solvers/engine_distribution.py
 +++ b/src/blab/solvers/engine_distribution.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 40299fc..95e0299 100644
  try:
      import beat_engine
  except ImportError as exc:
-@@ -12,4 +14,91 @@ from beat_engine import backend_catalog as backend_catalog
+@@ -12,4 +14,94 @@ from beat_engine import backend_catalog as backend_catalog
  from beat_engine import backend_info as engine_backend_info
  from beat_engine import engine_paths as engine_paths
  
@@ -89,6 +89,9 @@ index 40299fc..95e0299 100644
 +        # Round 11: Float64 FEM system values written into the stiffness pattern through cached index
 +        # maps (0.016 -> 0.008 s, -0.05 GB/freq, bit-identical).
 +        "BLAB_TEST_FEM_INPLACE": "1",
++        # Round 11: the transducer interior solve (MUMPS expand, 0.011 s) runs beside the interface-mass
++        # presolve in the FEM stage (bit-identical, 0.475 -> 0.468 s/freq).
++        "BLAB_TEST_EXPAND_OVERLAP": "1",
 +    }
 +}
 +

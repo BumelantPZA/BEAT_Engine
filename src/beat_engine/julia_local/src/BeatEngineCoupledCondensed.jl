@@ -1686,21 +1686,39 @@ function _build_mumps_condensation(
                 error("Transducer motion operators must have one row per FEM vertex.")
             transducer_count = size(surface, 2)
             columns = hcat(Matrix(surface), Matrix(force))
+            test_reduce_started = time_ns()
             reduced = mumps_reduce(solver, columns)
-            # Test (BLAB_TEST_MUMPS_EXPAND=1): the expansion of that reduction with x_Γ = 0 is
-            # A_II⁻¹ b_I, the interior solve, but reuses the reduction's forward sweep.
-            interior_solution = get(ENV, "BLAB_TEST_MUMPS_EXPAND", "0") == "1" ?
-                                mumps_expand(solver, zeros(ComplexF64, length(solver.schur_variables), size(columns, 2))) :
-                                mumps_interior_solve(solver, columns)
-            motion_solution = interior_solution[interior_vertices, 1:transducer_count]
-            force_interior = force[interior_vertices, :]
+            test_reduce_s = (time_ns() - test_reduce_started) / 1.0e9
+            # The interior solve and what depends on it.
+            interior_fields = () -> begin
+                test_expand_started = time_ns()
+                # Test (BLAB_TEST_MUMPS_EXPAND=1): the expansion of that reduction with x_Γ = 0 is
+                # A_II⁻¹ b_I, the interior solve, but reuses the reduction's forward sweep.
+                interior_solution = get(ENV, "BLAB_TEST_MUMPS_EXPAND", "0") == "1" ?
+                                    mumps_expand(solver, zeros(ComplexF64, length(solver.schur_variables), size(columns, 2))) :
+                                    mumps_interior_solve(solver, columns)
+                test_expand_s = (time_ns() - test_expand_started) / 1.0e9
+                test_stats = get(ENV, "BLAB_TEST_MUMPS_STATS", "")
+                isempty(test_stats) || open(io -> println(io, "reduce_s=$test_reduce_s expand_s=$test_expand_s"), test_stats, "a")
+                motion_solution = interior_solution[interior_vertices, 1:transducer_count]
+                force_interior = force[interior_vertices, :]
+                (
+                    motion_solution=motion_solution,
+                    force_solution=interior_solution[interior_vertices, (transducer_count+1):end],
+                    motion_force_correction=Matrix(transpose(force_interior) * motion_solution),
+                )
+            end
+            # Test (BLAB_TEST_EXPAND_OVERLAP=1, with MUMPS_EXPAND): the FEM stage runs `interior_fields`
+            # beside its interface-mass presolve, which reads only `motion_gamma` and calls no MUMPS,
+            # and merges the result in.
+            deferred = get(ENV, "BLAB_TEST_EXPAND_OVERLAP", "0") == "1" && get(ENV, "BLAB_TEST_MUMPS_EXPAND", "0") == "1"
             (
                 motion_interior=surface[interior_vertices, :],
-                motion_solution=motion_solution,
-                force_solution=interior_solution[interior_vertices, (transducer_count+1):end],
+                (deferred ? (motion_solution=nothing, force_solution=nothing, motion_force_correction=nothing) :
+                 interior_fields())...,
                 motion_gamma=reduced[:, 1:transducer_count],
                 force_gamma=reduced[:, (transducer_count+1):end],
-                motion_force_correction=Matrix(transpose(force_interior) * motion_solution),
+                test_interior_fields=deferred ? interior_fields : nothing,
             )
         else
             (
@@ -2430,6 +2448,8 @@ function build_condensed_coupled_system(
             gamma_fem_vertices;
             condensation_options...,
         )
+        interior_fields = get(stage_condensation, :test_interior_fields, nothing)
+        interior_task = isnothing(interior_fields) ? nothing : Threads.@spawn(interior_fields())
         presolve = mass_in_fem_stage ? _flux_mass_presolve(
             mass_operator,
             stage_condensation.schur,
@@ -2438,6 +2458,7 @@ function build_condensed_coupled_system(
                 resolved_transducer_operators, gamma_fem_vertices,
             ),
         ) : nothing
+        isnothing(interior_task) || (stage_condensation = merge(stage_condensation, fetch(interior_task)))
         fem_stage_work[] = (time_ns() - fem_stage_work_started) / 1.0e9
         (stage_condensation, presolve)
     end
