@@ -871,10 +871,17 @@ function assemble_exterior_direct_metal(
     # assembler: A and every excitation's b are formed on the GPU without
     # materializing S, D, D' or H.
     started = time_ns()
+    # Test (BLAB_TEST_FUSED_TIMING=<file>): the fused assembler's own stage split, one line per call.
+    test_timing_file = get(ENV, "BLAB_TEST_FUSED_TIMING", "")
+    test_timing = isempty(test_timing_file) ? nothing : Dict{String,Float64}()
     system = assemble_burton_miller_neumann_system_metal(
         mesh, p1_space, dp0_space, reduce(hcat, neumann_values), wavenumber, rule; kwargs...,
+        (isnothing(test_timing) ? (;) : (timing=test_timing,))...,
     )
-    return system, (time_ns() - started) / 1.0e9
+    elapsed = (time_ns() - started) / 1.0e9
+    isnothing(test_timing) || open(io -> println(io, "total=$elapsed ", join(("$k=$v" for (k, v) in test_timing), " ")),
+                                   test_timing_file, "a")
+    return system, elapsed
 end
 
 function solve_exterior_direct_metal_system(system)

@@ -25,6 +25,24 @@ To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-tes
 - App side: `../boundary-lab/src/blab/solvers/engine_distribution.py` (`METAL_TEST_SOLVER_OPTIONS`) and
   `coupled_backend.py` (threads). No fork; diffs in `perf/app_patches/`. Restart the app after engine edits.
 
+## Bottleneck survey, round 12 (2026-09-26, app path unless noted, M1 Pro, warm = run 2)
+| | Test | Stock Metal | Split (test, per freq) |
+|---|---|---|---|
+| SAWMOD 50 freqs | 24.9 s warm (0.47), cold 84.7 s (60.4 to 1st freq) | 131.4 s warm (2.61), cold 181.6 (53.1) | CPU chain: FEM stage 0.33 (MUMPS 0.27) + LU 0.11 on fresh freqs; now MUMPS_WK -0.017 |
+| prototype2 quarter, 200 freqs | 13.9 s (0.068), cold 59.1 (44.6) | 20.5 s (0.101), cold 58.5 (38.9) | GPU-bound: assembly 47 ms (regular kernel 35 = pairs 21 + lhs gather 11 + rhs gather 5.5; singular 7.3 + image 2.3; misc 3.5), field 14, CPU solve 5 |
+Accuracy test vs stock: SAWMOD pressure maxrel <= 1.0e-4/freq (stale-LU range), coil current 2.6e-5;
+prototype2 3.8e-5 (2 of 1.46 M points > 0.1 dB, both 74-83 dB below the max). `scratchpad/cmp_raw.py`.
+Prototype sample (`sample` on the worker): host 78 % idle in Metal completion waits, cgetrf 5 %, GC 2 %.
+Tried and rejected: wavelength quadrature on Metal (order 2 while kh <= 2): only 0.071 -> 0.062 s/freq,
+maxrel 0.27 (order-2 assembly 37 vs 47 ms: the regular kernel is gather-bound, not evaluation-bound).
+Biggest remaining items: (1) cold start ~40-60 s on the first solve after an app start, both
+backends: `coupled_solver.jl` includes the engine from source (only the exterior driver has a
+precompiled bundle, `julia_engine/BeatEngineMetalBundle`); (2) SAWMOD: MUMPS (single instance,
+~55 % of the cycle); (3) prototype: the fused exterior kernel's two gather passes (16 of 47 ms).
+Tools: `BLAB_TEST_FUSED_TIMING=<file>` (fused assembler stage split per call, with
+`BLAB_METAL_GATHER_TIMING=1` for pairs/gathers), `perf/proto2q.json` (quarter-mesh request),
+`APP_TIMING_DUMP=<pkl>` in app_timing.py.
+
 ## Next session: extensive tests of prototype and SAWMOD solves (user request, 2026-09-26)
 State: everything committed and pushed (last `7ffde50`); harness stopped; the user has not yet pushed
 the app patches (`perf/app_patches/engine_distribution.diff`, `coupled_backend.diff`) nor restarted
