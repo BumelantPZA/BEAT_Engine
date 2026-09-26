@@ -854,7 +854,10 @@ end
 function metal_direct_assembly_available()
     return BeatEngineCore._normalized_metal_assembly_mode(nothing) != :host_staged &&
            BeatEngineCore._normalized_metal_singular_mode() == :native &&
-           BeatEngineCore._normalized_metal_regular_kernel_mode() == :pair_gather
+           BeatEngineCore._normalized_metal_regular_kernel_mode() in (:pair_gather, :pair_tilereduce)
+    # pair_tilereduce is the production kernel of the four-operator path (coupled solves); the fused
+    # direct assembler has its own kernel and ignores the mode. Excluding it sent exterior sweeps to
+    # the four-operator path without the sweep pipeline (0.27 -> 0.67 s/freq on a waveguide).
 end
 
 function assemble_exterior_direct_metal(
@@ -900,6 +903,13 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     components = system["components"]
     port_objects = system["excitation_ports"]
     options = get(request, "solver_options", Dict{String,Any}())
+    # Test hook, as in the coupled path. ENV is process-wide, so without this an exterior request
+    # inherits whatever the last coupled request of this worker set (e.g. the tile-reduce kernel,
+    # which turns the fused direct assembly off).
+    for (key, value) in get(options, "test_env", Dict{String,Any}())
+        value === nothing ? delete!(ENV, String(key)) : (ENV[String(key)] = string(value))
+    end
+    test_apply_blas!()
     precision_name = lowercase(String(get(options, "precision", "float32")))
     FloatType = precision_name == "float64" ? Float64 : precision_name == "float32" ? Float32 :
                 error("Exterior precision must be float32 or float64.")
