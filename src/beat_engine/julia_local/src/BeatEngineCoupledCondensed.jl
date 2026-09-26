@@ -225,7 +225,19 @@ function _test_dense_mul!(y, factorization::RefinedDenseLU, x, alpha, beta)
     isnothing(correction) && return y
     for part in correction.parts
         gathered = x[part.columns, :]
-        mul!(view(y, correction.rows, :), part.coupling, part.schur * gathered, alpha, one(eltype(y)))
+        projected = similar(gathered, size(part.schur, 1), size(gathered, 2))
+        _test_chunked_mul!(projected, part.schur, gathered, one(eltype(y)), zero(eltype(y)))
+        _test_chunked_mul!(view(y, correction.rows, :), part.coupling, projected, alpha, one(eltype(y)))
+    end
+    return y
+end
+
+# `mul!` with the rows split over tasks, one BLAS call each: Accelerate barely threads a gemm with
+# 1-3 columns (perf/implicit_micro.jl: B*t 5.4 -> 2.0 ms, W*g 2.9 -> 0.9 ms).
+function _test_chunked_mul!(y, A, x, alpha, beta)
+    parts = collect(Iterators.partition(axes(A, 1), cld(size(A, 1), Threads.nthreads())))
+    Threads.@threads for rows in parts
+        mul!(view(y, rows, :), view(A, rows, :), x, alpha, beta)
     end
     return y
 end
@@ -242,7 +254,13 @@ end
 
 # The Float32 LU input: `matrix` narrowed, plus the correction from single-precision products.
 function _test_narrowed(refined)
-    narrowed = ComplexF32.(refined.matrix)
+    matrix = refined.matrix
+    narrowed = Matrix{ComplexF32}(undef, size(matrix))
+    Threads.@threads for column in axes(matrix, 2)
+        @inbounds for row in axes(matrix, 1)
+            narrowed[row, column] = ComplexF32(matrix[row, column])
+        end
+    end
     isnothing(refined.correction) || _test_scatter_parts!(narrowed, refined.correction, Float32)
     return narrowed
 end
