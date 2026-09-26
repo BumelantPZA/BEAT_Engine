@@ -39,6 +39,16 @@ App env now: `BLAB_TEST_COUPLED_PREFETCH=0`, `BLAB_METAL_REGULAR_KERNEL_MODE=pai
 `BLAB_TEST_COMBINED_BM=1`, `BLAB_TEST_MUMPS_EXPAND=1`, `BLAB_TEST_MASS_THREADS=4`,
 `BLAB_TEST_ELIM_IMPLICIT=1`, `BLAB_TEST_HOST_POOL=1`.
 
+## Exterior-only (waveguide) regression, fixed 2026-09-26 (1477e34)
+The user saw 200-freq waveguide-only prototype2: stock Apple Metal 12.4 s, Metal test 32.7 s.
+`test_env` writes ENV process-wide and never restores it, and `metal_direct_assembly_available()`
+accepted only `pair_gather`, so `pair_tilereduce` sent exterior sweeps to the four-operator path
+without the sweep pipeline (harness 0.668 vs 0.265 s/freq). Fixed: tilereduce accepted (the fused
+assembler ignores the mode), and exterior requests apply `test_env` too. Now 0.238 s/freq (FIELD_FAST
+helps: field 0.10 -> 0.06), maxrel 3.5e-5 vs stock (FIELD_FAST). Test with
+`"request": "proto2.json"` in a job (captured by `scripts/capture_boundary_lab_request.py`).
+Lesson: any new ENV switch must be checked on an exterior-only project too.
+
 ## Per-frequency budget after round 10 (s, 50-freq sweep means, total 0.653 s/freq)
 Each frequency runs a **first half** as two parallel branches, then a serial **second half**.
 
