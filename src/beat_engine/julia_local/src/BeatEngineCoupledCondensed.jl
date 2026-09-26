@@ -1131,10 +1131,27 @@ end
 `M_kk⁻¹ rhs` for a complex right-hand side. The Cholesky path solves the real and imaginary parts
 as one real panel.
 """
+# Panel columns `chunk` (real parts in 1:columns, imaginary parts after) into the complex result.
+function _test_write_mass_chunk!(result::Matrix{ComplexF64}, solved::Matrix{Float64}, chunk, columns::Int)
+    @inbounds for (local_column, column) in enumerate(chunk)
+        if column <= columns
+            for row in axes(result, 1)
+                result[row, column] = complex(solved[row, local_column], imag(result[row, column]))
+            end
+        else
+            target = column - columns
+            for row in axes(result, 1)
+                result[row, target] = complex(real(result[row, target]), solved[row, local_column])
+            end
+        end
+    end
+    return result
+end
+
 function _mass_block_solve(block, rhs::AbstractMatrix)
     if block.kind == :cholmod
         rows, columns = size(rhs)
-        panel = Matrix{Float64}(undef, rows, 2 * columns)
+        panel = _test_take(Float64, rows, 2 * columns)
         @inbounds for column in 1:columns, row in 1:rows
             value = rhs[row, column]
             panel[row, column] = real(value)
@@ -1147,6 +1164,15 @@ function _mass_block_solve(block, rhs::AbstractMatrix)
         solved = if tasks > 1 && size(panel, 2) >= 2 * tasks
             chunks = collect(Iterators.partition(1:size(panel, 2), cld(size(panel, 2), tasks)))
             parts = map(chunk -> Threads.@spawn(block.factor \ panel[:, chunk]), chunks)
+            if _test_host_pool_on()
+                # BLAB_TEST_HOST_POOL: the chunks go straight into the pooled result (same values).
+                result = _test_take(ComplexF64, rows, columns)
+                for (chunk, part) in zip(chunks, parts)
+                    _test_write_mass_chunk!(result, fetch(part), chunk, columns)
+                end
+                _test_give!(panel)
+                return result
+            end
             out = similar(panel)
             for (chunk, part) in zip(chunks, parts)
                 out[:, chunk] = fetch(part)
@@ -1155,7 +1181,8 @@ function _mass_block_solve(block, rhs::AbstractMatrix)
         else
             block.factor \ panel
         end
-        result = Matrix{ComplexF64}(undef, rows, columns)
+        _test_give!(panel)
+        result = _test_take(ComplexF64, rows, columns)
         @inbounds for column in 1:columns, row in 1:rows
             result[row, column] = complex(solved[row, column], solved[row, columns + column])
         end
@@ -1237,8 +1264,21 @@ function _flux_mass_presolve(operator, schur::AbstractMatrix, motion_columns::Ab
         end
     end
     schur_blocks = map(operator.blocks) do block
-        local_schur = _split_timed!(() -> ComplexF64.(schur[block.rows, block.rows]), split, :schur_convert)
-        _split_timed!(() -> _mass_block_solve(block, local_schur), split, :mass_solve)
+        local_schur = _split_timed!(split, :schur_convert) do
+            _test_host_pool_on() || return ComplexF64.(schur[block.rows, block.rows])
+            # BLAB_TEST_HOST_POOL: the same conversion, indexed in place into a pooled array.
+            converted = _test_take(ComplexF64, length(block.rows), length(block.rows))
+            block_rows = block.rows
+            Threads.@threads for column in eachindex(block_rows)
+                @inbounds for row in eachindex(block_rows)
+                    converted[row, column] = ComplexF64(schur[block_rows[row], block_rows[column]])
+                end
+            end
+            converted
+        end
+        solved = _split_timed!(() -> _mass_block_solve(block, local_schur), split, :mass_solve)
+        _test_give!(local_schur)
+        solved
     end
     motion_solution = _split_timed!(() -> _interface_mass_apply(operator, motion_columns), split, :mass_solve)
     return (schur_blocks=schur_blocks, motion_solution=motion_solution, split=split)
@@ -2965,6 +3005,7 @@ function release_condensed_coupled_system!(system)
         isnothing(refined.correction) || _test_give!(refined.correction.block32)
         data = system.interface_elimination_data
         !isnothing(data) && hasproperty(data, :interface_block) && _test_give!(data.interface_block)
+        !isnothing(data) && hasproperty(data, :schur_blocks) && _test_give!(data.schur_blocks...)
     end
     _release_condensation!(system.condensation)
     system.owns_cache && release_condensed_coupled_cache!(system.cache)
