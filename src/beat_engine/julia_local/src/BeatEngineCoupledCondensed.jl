@@ -210,6 +210,94 @@ mutable struct RefinedDenseLU
     fallback_reason::Union{Nothing,String}
     backward_error::Float64
     stale::Bool   # test (BLAB_TEST_STALE_LU): `factor` belongs to an earlier frequency
+    correction::Any   # test (BLAB_TEST_ELIM_IMPLICIT): `B_q W` columns kept out of `matrix`, or nothing
+end
+
+# Test (BLAB_TEST_ELIM_IMPLICIT=1): the flux elimination's `B_q W` columns stay out of the Float64
+# dense matrix. `correction.parts` holds them per block as factors (Float64 `coupling` and `schur`,
+# plus the Float32 `coupling32` the BEM produced); every Float64 product (refinement residuals, stale
+# GMRES) applies them exactly, and only the Float32 LU input gets them explicitly, from one cgemm per
+# block (~4x zgemm). The Float32 accumulation error (2.7e-4 when it was in the Float64 matrix) then
+# only slows the refinement, which still has to reach the Float64 backward error.
+function _test_dense_mul!(y, factorization::RefinedDenseLU, x, alpha, beta)
+    mul!(y, factorization.matrix, x, alpha, beta)
+    correction = factorization.correction
+    isnothing(correction) && return y
+    for part in correction.parts
+        gathered = x[part.columns, :]
+        mul!(view(y, correction.rows, :), part.coupling, part.schur * gathered, alpha, one(eltype(y)))
+    end
+    return y
+end
+
+function _test_scatter_parts!(matrix, correction, precision)
+    for part in correction.parts
+        product = precision === Float32 ? part.coupling32 * ComplexF32.(part.schur) : part.coupling * part.schur
+        for (local_column, column) in enumerate(part.columns)
+            @views matrix[correction.rows, column] .+= product[:, local_column]
+        end
+    end
+    return matrix
+end
+
+# The Float32 LU input: `matrix` narrowed, plus the correction from single-precision products.
+function _test_narrowed(refined)
+    narrowed = ComplexF32.(refined.matrix)
+    isnothing(refined.correction) || _test_scatter_parts!(narrowed, refined.correction, Float32)
+    return narrowed
+end
+
+# Row sums of |matrix| and its largest |entry|, threaded by row blocks (as `_dense_abs_stats`).
+function _test_abs_row_sums(matrix::Matrix{<:Complex})
+    m, n = size(matrix)
+    sums = zeros(Float64, m)
+    blocks = collect(Iterators.partition(1:m, 256))
+    maxima = zeros(Float64, length(blocks))
+    Threads.@threads for b in eachindex(blocks)
+        largest = 0.0
+        @inbounds for j in 1:n, i in blocks[b]
+            a = abs(matrix[i, j])
+            sums[i] += a
+            largest = max(largest, a)
+        end
+        maxima[b] = largest
+    end
+    return sums, maximum(maxima; init=0.0)
+end
+
+# `|B_q| (|W| 1)` summed over the correction's blocks: per row of `correction.rows`, an upper bound on
+# the row sums of |B_q W|, so the matrix norm without the product is bounded from above.
+function _test_correction_row_bound(correction)
+    total = nothing
+    for part in correction.parts
+        weights = vec(sum(abs, part.schur; dims=2))
+        coupling = part.coupling
+        bound = zeros(Float64, size(coupling, 1))
+        blocks = collect(Iterators.partition(axes(coupling, 1), 256))
+        Threads.@threads for b in eachindex(blocks)
+            @inbounds for j in axes(coupling, 2), i in blocks[b]
+                bound[i] += abs(coupling[i, j]) * weights[j]
+            end
+        end
+        total = isnothing(total) ? bound : total .+ bound
+    end
+    return total
+end
+
+function _test_bounded_norm(matrix, correction)
+    sums, max_entry = _test_abs_row_sums(matrix)
+    bound = _test_correction_row_bound(correction)
+    view(sums, correction.rows) .+= bound
+    norm_bound = maximum(sums; init=0.0)
+    return norm_bound, max(max_entry, maximum(bound; init=0.0))
+end
+
+# Adds the correction to `matrix` in Float64 (before a Float64 fallback or a dump).
+function _test_materialize!(refined)
+    isnothing(refined.correction) && return refined
+    _test_scatter_parts!(refined.matrix, refined.correction, Float64)
+    refined.correction = nothing
+    return refined
 end
 
 # Test (BLAB_TEST_STALE_LU=<cap>): the last fresh ComplexF32 factor of this request, reused as a
@@ -241,7 +329,7 @@ end
 # threaded pass. `opnorm` walks the column-major matrix row by row (~95 ms at n = 3116); here each
 # task owns a block of rows and sweeps it column by column, so every row sum adds the same terms
 # in the same order (j = 1..n) as `opnorm` and both values are bit-identical.
-function _dense_abs_stats(matrix::Matrix{ComplexF64})
+function _dense_abs_stats(matrix::Matrix{<:Complex})
     m, n = size(matrix)
     block = 256
     blocks = cld(m, block)
@@ -333,35 +421,61 @@ function _test_lu_solve(factor::LinearAlgebra.LU{T}, rhs::AbstractVecOrMat) wher
     return rhs isa AbstractVector ? vec(B) : B
 end
 
-function RefinedDenseLU(matrix::Matrix{ComplexF64})
+function RefinedDenseLU(matrix::Matrix{ComplexF64}; correction=nothing)
     empty!(_TEST_LU_SPLIT)
     t = time_ns()
     all(isfinite, matrix) || throw(ArgumentError("dense coupled matrix has non-finite entries"))
     _TEST_LU_SPLIT[:isfinite] = (time_ns() - t) / 1.0e9; t = time_ns()
-    matrix_norm, max_entry = get(ENV, "BLAB_TEST_DENSE_STATS", "1") == "1" ?
-                             _dense_abs_stats(matrix) : (opnorm(matrix, Inf), maximum(abs, matrix; init=0.0))
-    _TEST_LU_SPLIT[:stats] = (time_ns() - t) / 1.0e9; t = time_ns()
-    refined = RefinedDenseLU(matrix, matrix_norm, nothing, nothing, 0, nothing, NaN, false)
+    refined = RefinedDenseLU(matrix, 0.0, nothing, nothing, 0, nothing, NaN, false, correction)
     stale = _TEST_STALE
+    reuse_stale = _test_stale_cap() > 0 && !stale.disabled && !isnothing(stale.factor) &&
+                  size(stale.factor.factors) == size(matrix) &&
+                  stale.last_iterations <= something(tryparse(Int, get(ENV, "BLAB_TEST_STALE_REUSE", "8")), 8)
+    if !isnothing(correction) && reuse_stale
+        # No Float32 product for a stale factor: the norm is bounded from above (a looser test by
+        # the bound's overshoot, logged against the true norm on fresh factors).
+        matrix_norm, max_entry = _test_bounded_norm(matrix, correction)
+        refined.matrix_norm = matrix_norm
+        _TEST_LU_SPLIT[:stats] = (time_ns() - t) / 1.0e9
+        if max_entry <= floatmax(Float32)
+            refined.factor = stale.factor
+            refined.stale = true
+            _TEST_LU_SPLIT[:stale] = 1.0
+            return refined
+        end
+    end
+    # With a correction the norm comes from the Float32 LU input (the full matrix to ~1e-7).
+    narrowed = isnothing(correction) ? nothing : _test_narrowed(refined)
+    isnothing(narrowed) || (_TEST_LU_SPLIT[:convert] = (time_ns() - t) / 1.0e9; t = time_ns())
+    stats_matrix = something(narrowed, matrix)
+    matrix_norm, max_entry = get(ENV, "BLAB_TEST_DENSE_STATS", "1") == "1" ?
+                             _dense_abs_stats(stats_matrix) :
+                             (opnorm(stats_matrix, Inf), maximum(abs, stats_matrix; init=0.0))
+    refined.matrix_norm = Float64(matrix_norm)
+    _TEST_LU_SPLIT[:stats] = (time_ns() - t) / 1.0e9; t = time_ns()
+    if !isnothing(correction) && !isempty(get(ENV, "BLAB_TEST_STALE_LOG", ""))
+        _test_stale_log("NORM true $(matrix_norm) bound $(first(_test_bounded_norm(matrix, correction)))")
+        t = time_ns()
+    end
     if max_entry > floatmax(Float32)
         _dense_fall_back!(refined, "an entry is outside the Float32 range")
-    elseif _test_stale_cap() > 0 && !stale.disabled && !isnothing(stale.factor) &&
-           size(stale.factor.factors) == size(matrix) &&
-           stale.last_iterations <= something(tryparse(Int, get(ENV, "BLAB_TEST_STALE_REUSE", "8")), 8)
+    elseif reuse_stale
         refined.factor = stale.factor
         refined.stale = true
         _TEST_LU_SPLIT[:stale] = 1.0
     else
-        _test_fresh_factor!(refined)
+        _test_fresh_factor!(refined, narrowed)
     end
     return refined
 end
 
-function _test_fresh_factor!(refined::RefinedDenseLU)
+function _test_fresh_factor!(refined::RefinedDenseLU, narrowed=nothing)
     t = time_ns()
     begin
-        narrowed = ComplexF32.(refined.matrix)
-        _TEST_LU_SPLIT[:convert] = (time_ns() - t) / 1.0e9; t = time_ns()
+        if isnothing(narrowed)
+            narrowed = _test_narrowed(refined)
+            _TEST_LU_SPLIT[:convert] = (time_ns() - t) / 1.0e9; t = time_ns()
+        end
         blocked_nb = something(tryparse(Int, get(ENV, "BLAB_TEST_BLOCKED_LU", "0")), 0)
         candidate = blocked_nb > 0 ? _test_blocked_lu!(narrowed, blocked_nb) : lu!(narrowed; check=false)
         _TEST_LU_SPLIT[:getrf] = (time_ns() - t) / 1.0e9; t = time_ns()
@@ -385,13 +499,12 @@ end
 # preconditioner solve are batched. Stops when every column meets `RefinedDenseLU`'s Float64
 # backward-error test on the true residual. Returns (solution, iterations, ratio) or nothing.
 function _test_stale_gmres(factorization::RefinedDenseLU, target::Matrix{ComplexF64}, cap::Int)
-    A = factorization.matrix
     M = factorization.factor
     n, k = size(target)
     threshold = factorization.matrix_norm * eps(Float64) * sqrt(n)
     x0 = ComplexF64.(_test_lu_solve(M, ComplexF32.(target)))
     residual = copy(target)
-    mul!(residual, A, x0, -one(ComplexF64), one(ComplexF64))
+    _test_dense_mul!(residual, factorization, x0, -one(ComplexF64), one(ComplexF64))
     ratio = _dense_backward_error_ratio(factorization, residual, x0)
     ratio <= 1 && return (x0, 0, ratio)
     beta = [norm(view(residual, :, c)) for c in 1:k]
@@ -409,7 +522,7 @@ function _test_stale_gmres(factorization::RefinedDenseLU, target::Matrix{Complex
             basis[:, c] .= view(V, :, j, c)
         end
         preconditioned = ComplexF64.(_test_lu_solve(M, ComplexF32.(basis)))
-        mul!(w, A, preconditioned)
+        _test_dense_mul!(w, factorization, preconditioned, one(ComplexF64), zero(ComplexF64))
         estimate_ok = true
         for c in 1:k
             Z[:, j, c] .= view(preconditioned, :, c)
@@ -432,7 +545,7 @@ function _test_stale_gmres(factorization::RefinedDenseLU, target::Matrix{Complex
         end
         estimate_ok || continue
         copyto!(residual, target)
-        mul!(residual, A, trial, -one(ComplexF64), one(ComplexF64))
+        _test_dense_mul!(residual, factorization, trial, -one(ComplexF64), one(ComplexF64))
         ratio = _dense_backward_error_ratio(factorization, residual, trial)
         isfinite(ratio) || return nothing
         ratio <= 1 && return (trial, j, ratio)
@@ -444,6 +557,7 @@ function _dense_fall_back!(factorization::RefinedDenseLU, reason::AbstractString
     factorization.fallback_reason = "Float32 LU with refinement fell back to a Float64 LU: " * reason
     @warn factorization.fallback_reason
     factorization.factor = nothing
+    _test_materialize!(factorization)
     factorization.fallback = lu(factorization.matrix)
     return factorization
 end
@@ -463,7 +577,7 @@ end
 
 function _dense_residual!(residual, factorization::RefinedDenseLU, target, solution)
     copyto!(residual, target)
-    mul!(residual, factorization.matrix, solution, -one(ComplexF64), one(ComplexF64))
+    _test_dense_mul!(residual, factorization, solution, -one(ComplexF64), one(ComplexF64))
     return residual
 end
 
@@ -474,6 +588,7 @@ function Base.:\(factorization::RefinedDenseLU, rhs::AbstractVecOrMat)
     # Test (BLAB_TEST_DUMP_DENSE=<dir>): write each dense system for offline preconditioner studies.
     dump_dir = get(ENV, "BLAB_TEST_DUMP_DENSE", "")
     if !isempty(dump_dir)
+        _test_materialize!(factorization)
         _TEST_DUMP_COUNTER[] += 1
         open(joinpath(dump_dir, "dense_$(_TEST_DUMP_COUNTER[]).bin"), "w") do io
             write(io, Int64(size(factorization.matrix, 1)), Int64(size(rhs, 2)))
@@ -2418,6 +2533,9 @@ function build_condensed_coupled_system(
             elimination_split[Symbol("fem_stage_", key)] = value
         end
     end
+    dense_correction = nothing
+    test_implicit = get(ENV, "BLAB_TEST_ELIM_IMPLICIT", "0") == "1" && eltype(bem_interface_block) === ComplexF32 &&
+                    dense_type === Float64 && T !== Float64 && _dense_refinement_enabled(bem_backend)
     if interface_elimination != :none
         elimination_started = time_ns()
         # The same blocks the unmodified layout writes (at the dense scalar type), promoted for the elimination.
@@ -2469,6 +2587,22 @@ function build_condensed_coupled_system(
                 _flux_block_products!(
                     coupled, bem_range, bem_columns, mass_operator, [ComplexF32.(block) for block in presolve.schur_blocks],
                     bem_interface_block, elimination_split,
+                )
+            elseif test_implicit
+                # Test (BLAB_TEST_ELIM_IMPLICIT=1): no product here; see `_test_dense_mul!`.
+                dense_correction = (
+                    rows=bem_range,
+                    parts=[
+                        (
+                            columns=bem_columns[block.rows],
+                            coupling=block.contiguous ? view(interface_block, :, first(block.dofs):last(block.dofs)) :
+                                     interface_block[:, block.dofs],
+                            coupling32=block.contiguous ?
+                                       view(bem_interface_block, :, first(block.dofs):last(block.dofs)) :
+                                       bem_interface_block[:, block.dofs],
+                            schur=schur_block,
+                        ) for (block, schur_block) in zip(mass_operator.blocks, presolve.schur_blocks)
+                    ],
                 )
             elseif get(ENV, "BLAB_TEST_ELIM_SPLIT", "0") == "1" && eltype(bem_interface_block) === ComplexF32
                 _flux_block_products!(
@@ -2542,7 +2676,7 @@ function build_condensed_coupled_system(
 
     coupled_factorization_started = time_ns()
     factorization = dense_type === Float64 && T !== Float64 && _dense_refinement_enabled(bem_backend) ?
-                    RefinedDenseLU(coupled) : lu!(coupled)
+                    RefinedDenseLU(coupled; correction=dense_correction) : lu!(coupled)
     coupled_factorization_s = (time_ns() - coupled_factorization_started) / 1.0e9
     factorization isa RefinedDenseLU &&
         for (key, value) in _TEST_LU_SPLIT
