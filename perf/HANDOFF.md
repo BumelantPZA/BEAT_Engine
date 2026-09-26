@@ -9,9 +9,10 @@ To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-tes
   "BEAT Engine (Apple Metal test)" solver. In-app, 50 freqs: 141 s (stock) → 58 s (round 3) → 51.2 s
   (round 6) → 37.4 s (rounds 7–10, user-measured).
 - **Round 11: app path (`perf/app_timing.py`, the app's own headless solve, warm, 50 freqs) 37.7 s →
-  26.0 s.** Not yet measured by the user in the GUI. Harness 50-freq sweep 0.655 → 0.477 s/freq.
+  25.1 s.** Not yet measured by the user in the GUI. Harness 50-freq sweep 0.655 → 0.468 s/freq.
   - The in-app gap was a bug: MUMPS ran on OpenBLAS32 in the app (see NOTES round 11). Fixed.
-  - MUMPS without pivoting (`MUMPS_CNTL=1=0`), `FEM_F32_SKIP`, `ZERO_RHS_SKIP`, `FEM_INPLACE`.
+  - MUMPS without pivoting (`MUMPS_CNTL=1=0`), `FEM_F32_SKIP`, `ZERO_RHS_SKIP`, `FEM_INPLACE`,
+    `EXPAND_OVERLAP`. Checked on Vented_Sub (−17%, maxrel 4.1e-8), compression_driver and the waveguide.
   - Pipeline: `COUPLED_PREFETCH=1` + `EARLY_BUILD=1` + `PREFETCH_OPT=1` + `FEM_LANE=2`: build(i+1)
     (FEM stage, then elimination/LU gated behind solve(i)) starts when build(i) returns; GPU(i+1) is
     prefetched with the full round 8/9 GPU switches; field(i) waits for GPU(i+1), GPU(i+2) for field(i).
@@ -24,7 +25,7 @@ To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-tes
 - App side: `../boundary-lab/src/blab/solvers/engine_distribution.py` (`METAL_TEST_SOLVER_OPTIONS`) and
   `coupled_backend.py` (threads). No fork; diffs in `perf/app_patches/`. Restart the app after engine edits.
 
-## Per-frequency picture after round 11 (harness, 50-freq sweep, 0.477 s/freq)
+## Per-frequency picture after round 11 (harness, 50-freq sweep, 0.468 s/freq)
 The critical chain is CPU only: build(i+1) = FEM stage 0.31 (MUMPS 0.25; 0.19 when alone) → gate/
 elimination 0.02 → F32 LU 0.11 fresh (29/50) / ~0 stale. Solve(i) (0.06 fresh, 0.17 stale GMRES) and
 field(i) (GPU 0.08) run beside FEM(i+1). GPU lane: ops 0.25 + field 0.08 per 0.47 cycle (not critical).
@@ -167,9 +168,8 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 | Explicit GC after each frequency (`BLAB_TEST_GC_MODE=young/full`, round 10) | young 2.4 ms but sweep 0.745 → 0.767; full 75 ms. The cost was page faults, not the collection |
 
 ## Next ideas (untested)
-1. Transducer solves in the FEM stage (0.03 s, MUMPS reduce + expand, 6 dense columns): sparse RHS
-   (ICNTL(20)) or forward-only (F_Iᵀ A⁻¹ C_I = (L⁻¹F)ᵀ D⁻¹ (L⁻¹C) needs no backward sweep when the
-   interior solution is not reconstructed).
+1. Transducer reduce in the FEM stage (0.016 s, 6 dense columns; the expand now overlaps the mass
+   presolve): sparse RHS (ICNTL(20)).
 2. Interface-mass presolve in the FEM stage (0.018 s).
 3. One-time costs (~1.1 s per request): overlap request setup / first-frequency caches.
 4. Fresh F32 LU (0.11 s, critical on 29/50 freqs) on the GPU: busy only 0.33 of the 0.47 s cycle, but
