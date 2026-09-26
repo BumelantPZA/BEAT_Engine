@@ -1,12 +1,28 @@
 # Handoff: plan the next SAWMOD speedups (planning only — don't run or change code)
 
-**Task:** read this and the named code, then write `perf/FABLE_PLAN.md`: ranked ideas with
-expected gain, risk and effort, and a test plan for the top 3. Don't run anything.
+**Goal:** shorten the whole solve, meaning the wall time from pressing Solve in Boundary Lab until
+all frequencies are done (SAWMOD, 50 freqs, now ~58 s with a warm worker, which is ~1.16 s/freq).
+Any level is in scope: per-stage maths, algorithm or formulation changes, sweep-level structure
+(work shared or reused across frequencies), CPU/GPU split, data movement, precision, process and
+request overhead. The per-stage table below shows where time goes today; it is not a list of
+things to micro-tune.
+
+**Task:** write `perf/FABLE_PLAN.md`:
+1. Your own diagnosis of what bounds the whole solve.
+2. New optimization ideas, as many distinct ones as you can justify, ranked by expected
+   whole-solve gain. Each gets the mechanism, the expected saving (s/freq or s/sweep), accuracy
+   risk, effort, and the code it touches.
+3. A test plan for the top 3.
+
+Think from first principles about the physics and linear algebra, not only the current code
+structure. Don't propose anything on the "Already tried" list unless you explain what's
+different. Don't run anything.
 
 **Setup:** coupled FEM-BEM acoustic solve, BEAT Engine (Julia 1.12 + Metal.jl), Apple M1 Pro
 (10 CPU cores, 16-core GPU, 16 GB). Model SAWMOD: FEM order 29,665, BEM 3,110 P1 nodes / 6,054
 triangles (xy symmetry, 4 passes), 3 transducers, condensed dense system order 3,116.
-Frequencies are solved one at a time. Now **1.14 s/freq** (in-app 50 freqs: 141 s → ~58 s so far).
+Frequencies are solved one at a time, and the setup (mesh, caches, analysis) is reused across them.
+Now **1.14 s/freq** in the harness (in-app 50 freqs: 141 s at the start → ~58 s now).
 Code: `src/beat_engine/julia_local/`. Per-frequency driver: `coupled_solver.jl`
 (`solve_request`); the build is `build_condensed_coupled_system`
 (`src/BeatEngineCoupledCondensed.jl:1650`).
@@ -43,17 +59,3 @@ The CPU is mostly idle (~2 of 10 cores busy on average).
 - Accuracy: max relative error ≤ ~1e-5 vs the current output (the fast field is 2.2e-5).
 - Anything bit-changing goes behind a test env switch (the `BLAB_TEST_*` pattern).
 - Test harness: `perf/quick.py --revise` (A/B configs, hot reload). See `perf/NOTES.md`.
-
-## Open questions worth a plan
-Ideas we haven't tested:
-- **Condensation (0.46):**
-  - Is re-factorizing MUMPS every frequency necessary? E.g. a frequency-dependent low-rank
-    update, or an iterative method seeded from the previous frequency.
-  - Tuning MUMPS threads and OpenMP.
-- **Dense chain (0.14 + 0.13 + 0.21 + 0.075):**
-  - Avoid forming the full ComplexF64 matrix.
-  - Factor in Float32 directly.
-  - Fuse the block assembly with the elimination.
-  - Use a Schur/block structure instead of one LU.
-- **GPU (0.45):** only helps if the condensation also gets shorter; the two branches are nearly equal.
-- **Overhead (~0.12):** what is in it?
