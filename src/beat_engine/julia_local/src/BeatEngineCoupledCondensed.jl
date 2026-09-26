@@ -238,15 +238,60 @@ function _dense_abs_stats(matrix::Matrix{ComplexF64})
     return maximum(norms; init=0.0), maximum(maxima; init=0.0)
 end
 
+# Test instrumentation: split of the last `RefinedDenseLU` construction (s), copied into the
+# build's elimination split as `lu_<key>`.
+const _TEST_LU_SPLIT = Dict{Symbol,Float64}()
+
+function _test_swap_rows!(A, ipiv, k, ke, columns)
+    Threads.@threads for j in columns
+        @inbounds for i in k:ke
+            r = ipiv[i]
+            r == i && continue
+            A[i, j], A[r, j] = A[r, j], A[i, j]
+        end
+    end
+end
+
+# Test (BLAB_TEST_BLOCKED_LU=<nb>): right-looking blocked LU with partial pivoting whose trailing
+# updates are single large `gemm!` calls. Accelerate's cgetrf reaches ~0.3-0.4 TFLOP/s at n = 3116,
+# its cgemm ~2; this runs at ~0.6 (perf/lu_micro.jl). Pivots can differ from getrf's on near ties,
+# so the factor is not bit-identical; the refinement still has to reach the Float64 backward error.
+function _test_blocked_lu!(A::Matrix{T}, nb::Int) where {T}
+    n = LinearAlgebra.checksquare(A)
+    ipiv = Vector{LinearAlgebra.BlasInt}(undef, n)
+    info = 0
+    for k in 1:nb:n
+        ke = min(k + nb - 1, n)
+        _, panel_pivots, panel_info = LAPACK.getrf!(view(A, k:n, k:ke); check=false)
+        info == 0 && panel_info > 0 && (info = k - 1 + panel_info)
+        ipiv[k:ke] .= panel_pivots .+ (k - 1)
+        _test_swap_rows!(A, ipiv, k, ke, 1:(k-1))
+        ke < n || continue
+        _test_swap_rows!(A, ipiv, k, ke, (ke+1):n)
+        BLAS.trsm!('L', 'L', 'N', 'U', one(T), view(A, k:ke, k:ke), view(A, k:ke, (ke+1):n))
+        BLAS.gemm!('N', 'N', -one(T), view(A, (ke+1):n, k:ke), view(A, k:ke, (ke+1):n), one(T),
+                   view(A, (ke+1):n, (ke+1):n))
+    end
+    return LinearAlgebra.LU(A, ipiv, LinearAlgebra.BlasInt(info))
+end
+
 function RefinedDenseLU(matrix::Matrix{ComplexF64})
+    empty!(_TEST_LU_SPLIT)
+    t = time_ns()
     all(isfinite, matrix) || throw(ArgumentError("dense coupled matrix has non-finite entries"))
+    _TEST_LU_SPLIT[:isfinite] = (time_ns() - t) / 1.0e9; t = time_ns()
     matrix_norm, max_entry = get(ENV, "BLAB_TEST_DENSE_STATS", "1") == "1" ?
                              _dense_abs_stats(matrix) : (opnorm(matrix, Inf), maximum(abs, matrix; init=0.0))
+    _TEST_LU_SPLIT[:stats] = (time_ns() - t) / 1.0e9; t = time_ns()
     refined = RefinedDenseLU(matrix, matrix_norm, nothing, nothing, 0, nothing, NaN)
     if max_entry > floatmax(Float32)
         _dense_fall_back!(refined, "an entry is outside the Float32 range")
     else
-        candidate = lu!(ComplexF32.(matrix); check=false)
+        narrowed = ComplexF32.(matrix)
+        _TEST_LU_SPLIT[:convert] = (time_ns() - t) / 1.0e9; t = time_ns()
+        blocked_nb = something(tryparse(Int, get(ENV, "BLAB_TEST_BLOCKED_LU", "0")), 0)
+        candidate = blocked_nb > 0 ? _test_blocked_lu!(narrowed, blocked_nb) : lu!(narrowed; check=false)
+        _TEST_LU_SPLIT[:getrf] = (time_ns() - t) / 1.0e9; t = time_ns()
         if issuccess(candidate) && all(isfinite, candidate.factors)
             refined.factor = candidate
         else
@@ -2191,6 +2236,10 @@ function build_condensed_coupled_system(
     factorization = dense_type === Float64 && T !== Float64 && _dense_refinement_enabled(bem_backend) ?
                     RefinedDenseLU(coupled) : lu!(coupled)
     coupled_factorization_s = (time_ns() - coupled_factorization_started) / 1.0e9
+    factorization isa RefinedDenseLU &&
+        for (key, value) in _TEST_LU_SPLIT
+            elimination_split[Symbol("lu_", key)] = value
+        end
 
     return (
         fem_mesh=fem_mesh,

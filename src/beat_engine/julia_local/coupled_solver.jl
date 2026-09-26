@@ -2823,11 +2823,20 @@ function solve_request_impl(request; event_mode=false)
     prefetch_operators && !isnothing(prefetch_blas) && BLAS.set_num_threads(prefetch_blas)
     next_operators = nothing
     try
+        # Test instrumentation: the previous frequency's emit/release and whole-iteration wall + GC,
+        # reported one frequency late as `test_prev_*` timings.
+        test_prev_tail = Dict{String,Float64}()
         for (frequency_index, frequency_value) in enumerate(request["frequencies_hz"])
             if cancel_requested()
                 cancelled = true
                 break
             end
+            test_iteration_started = time_ns()
+            # Test: BLAB_TEST_GC_DEFER=1 disables the GC during the frequency; the allocations are
+            # collected once, at the next allocation after the re-enable below.
+            test_gc_defer = get(ENV, "BLAB_TEST_GC_DEFER", "0") == "1"
+            test_gc_defer && GC.enable(false)
+            test_gc_started = Base.gc_num()
             frequency_hz = FloatType(frequency_value)
             println(stderr, "Coupled $(precision_name)/$(bem_backend): assembling $(frequency_hz) Hz")
             assembly_started = time_ns()
@@ -2912,6 +2921,7 @@ function solve_request_impl(request; event_mode=false)
                         ) :
                         solve_coupled_excitations(coupled_system, excitations)
             solve_s = (time_ns() - solve_started) / 1.0e9
+            test_interface_errors_started = time_ns()
             interface_error_sets = [
                 per_interface_errors(
                     solution,
@@ -2931,6 +2941,8 @@ function solve_request_impl(request; event_mode=false)
                 maximum(errors[2][index] for errors in interface_error_sets)
                 for index in eachindex(interfaces)
             ]
+            test_interface_errors_s = (time_ns() - test_interface_errors_started) / 1.0e9
+            test_quantities_started = time_ns()
             field_s = 0.0
             quantities = Dict{String,Any}[]
             rom_options = get(solver_options, "speaker_rom", Dict{String,Any}())
@@ -3436,6 +3448,11 @@ function solve_request_impl(request; event_mode=false)
                     "replay_factorization_s" => coupled_system.timings.replay_factorization_s,
                 )),
             )
+            merge!(diagnostics["timings"], Dict(
+                "test_interface_errors_s" => test_interface_errors_s,
+                "test_quantities_other_s" => (time_ns() - test_quantities_started) / 1.0e9 - field_s,
+                "test_pre_emit_wall_s" => (time_ns() - test_iteration_started) / 1.0e9,
+            ), test_prev_tail)
             if validation_diagnostics
                 diagnostics["relative_residual"] = maximum(solution.relative_residual for solution in solutions)
                 diagnostics["all_bem_replay_error"] = maximum(
@@ -3455,6 +3472,7 @@ function solve_request_impl(request; event_mode=false)
                 "quantities" => quantities,
                 "diagnostics" => diagnostics,
             )
+            test_emit_started = time_ns()
             record_result_provenance!(result, request)
             if event_mode
                 println(JSON.json(Dict("type" => "result", "result" => result)))
@@ -3462,12 +3480,25 @@ function solve_request_impl(request; event_mode=false)
                 println(JSON.json(result))
             end
             flush(stdout)
+            test_release_started = time_ns()
             use_condensed_solver ? release_condensed_coupled_system!(coupled_system) :
             release_coupled_system!(coupled_system)
             coupled_system = nothing
             solved_count = frequency_index
+            test_gc_defer && GC.enable(true)
+            test_gc = Base.GC_Diff(Base.gc_num(), test_gc_started)
+            test_prev_tail = Dict{String,Float64}(
+                "test_prev_emit_s" => (test_release_started - test_emit_started) / 1.0e9,
+                "test_prev_release_s" => (time_ns() - test_release_started) / 1.0e9,
+                "test_prev_iteration_wall_s" => (time_ns() - test_iteration_started) / 1.0e9,
+                "test_prev_gc_s" => test_gc.total_time / 1.0e9,
+                "test_prev_alloc_gb" => test_gc.allocd / 1.0e9,
+                "test_prev_gc_pauses" => Float64(test_gc.pause),
+                "test_prev_gc_full" => Float64(test_gc.full_sweep),
+            )
         end
     finally
+        GC.enable(true)   # BLAB_TEST_GC_DEFER may have left it off on an error
         if next_operators !== nothing
             try
                 BeatEngineCoupledCondensed.release_operator_storage!(fetch(next_operators).operators)
