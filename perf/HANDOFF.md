@@ -4,40 +4,36 @@ To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-tes
 "Read perf/HANDOFF.md and continue with the next idea." Full history is in `perf/NOTES.md`
 (newest round on top).
 
-## Where things stand
+## Where things stand (after round 11, 2026-09-26)
 - Goal: shorten the whole SAWMOD coupled FEM-BEM solve (50 freqs) in Boundary Lab's
-  "BEAT Engine (Apple Metal test)" solver. In-app, 50 freqs: 141 s (stock Apple Metal) → 58 s
-  (round 3) → **51.2 s (round 6, user-measured 2026-09-26)**.
-- Harness (12 freqs, Revise mode): 1.224 → 1.084 s/freq with round 6, maxrel 1.3e-7.
-- Round 7 (in the app, not yet measured in-app): 50-freq harness sweep 0.966 → **0.935 s/freq**
-  from the stale LU on top of FAST_TRS (itself −0.028 s/freq on the 12-freq set).
-  **Estimated in-app 50-freq SAWMOD: ~48 s** (51.2 − 50 × 0.059 s/freq × ~0.94 for Revise mode
-  ≈ 48.4 s; FAST_TRS ≈ −1.3 s, STALE_LU ≈ −1.5 s).
-- Round 8 (in the app, not yet measured in-app, all bit-identical): 50-freq sweep 0.972 → **0.899
-  s/freq**. **Estimated in-app 50-freq SAWMOD: ~45 s** (48.4 − 50 × 0.073 × 0.94).
-- Round 9 (in the app, not yet measured in-app; ideas from the CUDA backend): 50-freq sweep 0.910 →
-  **0.823 s/freq**, maxrel 5.8e-6. **Estimated in-app 50-freq SAWMOD: ~41 s** (45 − 50 × 0.087 × 0.94).
-  Checkpoint before it: tag `checkpoint-before-fused-images`.
-- Round 10 (in the app, not yet measured in-app): `ELIM_IMPLICIT` + `HOST_POOL`, 50-freq sweep
-  0.807 → **0.653 s/freq**, maxrel 1.1e-7. **Estimated in-app 50-freq SAWMOD: ~34 s**
-  (41 − 50 × 0.15 × 0.94). Tag `metal-test-round10`. **Measured in-app (rounds 7–10): 37.4 s.**
+  "BEAT Engine (Apple Metal test)" solver. In-app, 50 freqs: 141 s (stock) → 58 s (round 3) → 51.2 s
+  (round 6) → 37.4 s (rounds 7–10, user-measured).
+- **Round 11: app path (`perf/app_timing.py`, the app's own headless solve, warm, 50 freqs) 37.7 s →
+  26.0 s.** Not yet measured by the user in the GUI. Harness 50-freq sweep 0.655 → 0.477 s/freq.
+  - The in-app gap was a bug: MUMPS ran on OpenBLAS32 in the app (see NOTES round 11). Fixed.
+  - MUMPS without pivoting (`MUMPS_CNTL=1=0`), `FEM_F32_SKIP`, `ZERO_RHS_SKIP`, `FEM_INPLACE`.
+  - Pipeline: `COUPLED_PREFETCH=1` + `EARLY_BUILD=1` + `PREFETCH_OPT=1` + `FEM_LANE=2`: build(i+1)
+    (FEM stage, then elimination/LU gated behind solve(i)) starts when build(i) returns; GPU(i+1) is
+    prefetched with the full round 8/9 GPU switches; field(i) waits for GPU(i+1), GPU(i+2) for field(i).
+  - App patch: the Metal test backend uses `os.cpu_count()` Julia threads (10 vs 8: −4%);
+    `perf/app_patches/coupled_backend.diff`.
 - Code: this checkout, branch `perf/experiments`, pushed to the user's fork
-  (`git push fork perf/experiments`, BumelantPZA/BEAT_Engine). **Never push to `origin`
-  (JWSound).**
-- Restore tags: `metal-test-58s` (round 3), `metal-test-bm-threaded` (round 5),
-  `metal-test-round6`, `metal-test-round7`, `metal-test-round8`, `metal-test-round9`, `metal-test-round10` (current).
-- App side: `../boundary-lab/src/blab/solvers/engine_distribution.py`,
-  `METAL_TEST_SOLVER_OPTIONS["test_env"]`. It has no fork; its diff is kept in
-  `perf/app_patches/engine_distribution.diff`. The app loads Julia at start, so restart it after
-  engine edits.
+  (`git push fork perf/experiments`, BumelantPZA/BEAT_Engine). **Never push to `origin` (JWSound).**
+- Restore tags: `metal-test-58s`, `metal-test-bm-threaded`, `metal-test-round6` … `metal-test-round10`,
+  `metal-test-mumps-blas-fix`, `metal-test-round11` (prefetch opt), `metal-test-round11b` (FEM lane).
+- App side: `../boundary-lab/src/blab/solvers/engine_distribution.py` (`METAL_TEST_SOLVER_OPTIONS`) and
+  `coupled_backend.py` (threads). No fork; diffs in `perf/app_patches/`. Restart the app after engine edits.
 
-App env now: `BLAB_TEST_COUPLED_PREFETCH=0`, `BLAB_METAL_REGULAR_KERNEL_MODE=pair_tilereduce`,
-`BLAB_TEST_BLAS=accelerate`, `BLAB_METAL_FIELD_FAST=3`, `BLAB_TEST_DENSE_STATS=1`,
-`BLAB_TEST_BM_THREADED=1`, `BLAB_TEST_GC_DEFER=1`, `BLAB_TEST_BLOCKED_LU=512`,
-`BLAB_TEST_FAST_TRS=128`, `BLAB_TEST_STALE_LU=15`, `BLAB_TEST_OP_POOL=1`,
-`BLAB_TEST_HOST_ROW_WEIGHTS=1`, `BLAB_TEST_FLUX_SKIP=1`, `BLAB_TEST_IMAGE_ACCUMULATE=1`,
-`BLAB_TEST_COMBINED_BM=1`, `BLAB_TEST_MUMPS_EXPAND=1`, `BLAB_TEST_MASS_THREADS=4`,
-`BLAB_TEST_ELIM_IMPLICIT=1`, `BLAB_TEST_HOST_POOL=1`.
+## Per-frequency picture after round 11 (harness, 50-freq sweep, 0.477 s/freq)
+The critical chain is CPU only: build(i+1) = FEM stage 0.31 (MUMPS 0.25; 0.19 when alone) → gate/
+elimination 0.02 → F32 LU 0.11 fresh (29/50) / ~0 stale. Solve(i) (0.06 fresh, 0.17 stale GMRES) and
+field(i) (GPU 0.08) run beside FEM(i+1). GPU lane: ops 0.25 + field 0.08 per 0.47 cycle (not critical).
+Contention is now the limiter: anything run beside MUMPS slows it (GMRES traffic ≈ +0.03, the LU
+doubles next to MUMPS: FEM_LANE=1 lost). MUMPS_seq cannot run two instances concurrently (crash) and
+has no OpenMP; one FEM component holds 19492 of 24947 vertices, so splitting does not help.
+One-time per request: setup ~0.45 s, first frequency ~1.0 s (vs 0.47 steady).
+**Rule: any new overlap must be measured in the pipelined sweep; standalone micro gains (look-ahead LU
+−15%) vanished inside it.**
 
 ## Exterior-only (waveguide) regression, fixed 2026-09-26 (1477e34)
 The user saw 200-freq waveguide-only prototype2: stock Apple Metal 12.4 s, Metal test 32.7 s.
@@ -162,33 +158,24 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 | MUMPS BLR (`ICNTL(35)=2`, CNTL(7) 1e-12/1e-9) | 0.41–0.43 vs 0.247: fronts too small |
 | MUMPS expansion in the solve-phase back substitution | Not done: transducer condensation changes f_I after the reduction (see `_mumps_back_substitution` docstring) |
 | Thread counts (8 vs 10), kernel group size, gather budget | Within noise or worse (rounds 1–2) |
+| Round 11: `FEM_LANE=1` (build(i+1) at build(i)'s FEM end) | LU(i) doubles next to MUMPS(i+1) (AMX): 0.569 vs 0.549 |
+| Round 11: MUMPS per FEM component / concurrent instances | One component is 227 of 240 ms; two instances concurrently crash (MUMPS_LOAD_INIT) |
+| Round 11: look-ahead LU (panel k+1 factored during trailing gemm) | −15% alone (bit-identical), nothing inside the pipeline |
+| Round 11: stale LU reuse 12/18 or 5/6 (was 8) | 0.490/0.498 and 0.484/0.480 vs 0.487/0.480: GMRES traffic slows MUMPS beside it |
+| Round 11: sleeping Metal wait (Metal.jl spins/yields in `synchronize`) | Spin is ~7% of busy samples; no change |
+| Round 11: user-interactive QoS on all Julia threads | No change |
 | Explicit GC after each frequency (`BLAB_TEST_GC_MODE=young/full`, round 10) | young 2.4 ms but sweep 0.745 → 0.767; full 75 ms. The cost was page faults, not the collection |
 
 ## Next ideas (untested)
-Rounds 7–10 measured in-app: **37.4 s** (user, 2026-09-26; estimate was ~34 s, so the Revise-mode
-scaling of 0.94 overstates in-app gains by ~10%; harness 0.653 s/freq × 50 = 32.7 s + ~4.7 s app overhead).
-
-1. **FEM stage is critical (0.293).**
-   - MUMPS factorization 0.238 is the floor (METIS, Accelerate; BLR/orderings/OpenBLAS slower).
-     Check `INFOG(12)` (delayed pivots) and try `CNTL(1)` via `BLAB_TEST_MUMPS_CNTL`.
-   - Write MUMPS values straight from precomputed K/M/wall index maps instead of building a sparse
-     `fem_system` per frequency (0.011 s and 89 MB of fresh sparse arrays, the biggest unpooled
-     allocation left; `assemble_fem_dynamic_stiffness`).
-   - Start the FEM stage of frequency i+1 while the GPU evaluates frequency i's field (0.084 s, CPU
-     idle). Only a CPU-only stage next to a GPU-only stage; MUMPS i's back substitution must be
-     finished (it is, before the field). Earlier overlaps lost to contention, but those put CPU
-     stages next to CPU stages. Potential ~0.05 s/freq.
-2. **Second half (~0.30).**
-   - Stale GMRES costs ~12 ms per iteration now (F64 matvec + correction + F32 solve). GMRES-IR
-     (inner GMRES on the F32 matrix copy) would halve the matvec bytes and could extend reuse.
-   - F32 LU (0.11 s on 31/50 freqs) on the idle GPU: MPS is real-only (2x embedding lost before), but a
-     hybrid (CPU panel, GPU trailing cgemm as 4 real sgemms) was never tried. M1 Pro GPU ~4.5
-     TFLOP/s F32 vs CPU cgemm ~2; bigger GPUs gain more.
-3. **Remaining allocations** (0.27 GB/freq, 24k faults): CHOLMOD chunk outputs (56 MB), FEM sparse
-   assembly (89 MB), the first narrowed LU input per stale cycle. `BLAB_TEST_ALLOC_PROFILE` lists them.
-4. **Other Macs:** thread counts are tuned for this 10-core M1 Pro (`MASS_THREADS=4`, Julia 10
-   threads, blocked LU nb=512, FAST_TRS nb=128). BLAS runs on the shared AMX units (user CPU is only
-   ~0.8 s per 0.61 s iteration), so core count matters less than AMX count (per cluster).
+1. Transducer solves in the FEM stage (0.03 s, MUMPS reduce + expand, 6 dense columns): sparse RHS
+   (ICNTL(20)) or forward-only (F_Iᵀ A⁻¹ C_I = (L⁻¹F)ᵀ D⁻¹ (L⁻¹C) needs no backward sweep when the
+   interior solution is not reconstructed).
+2. Interface-mass presolve in the FEM stage (0.018 s).
+3. One-time costs (~1.1 s per request): overlap request setup / first-frequency caches.
+4. Fresh F32 LU (0.11 s, critical on 29/50 freqs) on the GPU: busy only 0.33 of the 0.47 s cycle, but
+   GPU work beside the Metal field gave wrong results (round 5); would need its own queue and gating.
+5. Anything that cuts memory traffic beside MUMPS (stale GMRES reads ~0.35 GB per iteration).
+6. Other Macs: the pipeline adapts (threads = core count); MUMPS single-thread speed sets the floor.
 
 Not viable under 1e-5 (Fable's analysis): interior ROM / Craig-Bampton, rational interpolation
 of S(k) over frequency, F32 MUMPS, F32 elimination.
