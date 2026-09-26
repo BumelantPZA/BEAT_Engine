@@ -1,0 +1,70 @@
+diff --git a/src/blab/solvers/coupled_backend.py b/src/blab/solvers/coupled_backend.py
+index ed5cfaf..9d04417 100644
+--- a/src/blab/solvers/coupled_backend.py
++++ b/src/blab/solvers/coupled_backend.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import json
+ import logging
+ import math
++import os
+ import subprocess
+ import tempfile
+ import threading
+@@ -40,6 +41,12 @@ from blab.solvers.beat_engine_runtime import (
+     julia_process_env,
+     normalize_beat_engine_backend,
+ )
++from blab.solvers.engine_distribution import (
++    METAL_TEST_PROJECT,
++    METAL_TEST_SOLVER_OPTIONS,
++    METAL_TEST_SYSTEM_SOLVER,
++    is_metal_test_backend,
++)
+ from blab.system_contract import (
+     SystemFrequencyResult,
+     SystemSolveMetadata,
+@@ -344,6 +351,7 @@ class CoupledSession:
+ 
+ class _CoupledBackend:
+     default_static_condensation = False
++    extra_solver_options: dict = {}
+ 
+     def __init__(
+         self,
+@@ -371,7 +379,7 @@ class _CoupledBackend:
+         self.bem_backend = normalized_bem_backend
+ 
+     def create_system_session(self, request: SystemSolveRequest) -> CoupledSession:
+-        solver_options = dict(request.solver_options)
++        solver_options = {**self.extra_solver_options, **request.solver_options}
+         solver_options.setdefault("phasor_convention", "exp(+i omega t)")
+         has_bounded = any(region.kind == AcousticRegionKind.BOUNDED_AIR for region in request.compiled_system.regions)
+         has_unbounded = any(
+@@ -1020,10 +1028,18 @@ class PhysicalSystemProductionBackend(_CoupledBackend):
+         julia_threads: str | int | None = None,
+         persistent_worker: bool = True,
+     ):
++        test_build = is_metal_test_backend(bem_backend)
+         normalized_bem_backend = normalize_beat_engine_backend(bem_backend)
+         default_threads = 4 if normalized_bem_backend == "cuda" else 8
++        if test_build:
++            # Local experiment: the test solver's pipelined sweep uses every core (M1 Pro SAWMOD, 50
++            # freqs: 10 threads 26.0 s vs 8 threads 27.1 s).
++            default_threads = os.cpu_count() or default_threads
+         resolved_threads = default_threads if julia_threads is None else julia_threads
+         julia_project = default_beat_engine_project(normalized_bem_backend)
++        if test_build:
++            solver_script = METAL_TEST_SYSTEM_SOLVER
++            julia_project = METAL_TEST_PROJECT
+         super().__init__(
+             julia_executable=julia_executable,
+             solver_script=solver_script,
+@@ -1033,6 +1049,8 @@ class PhysicalSystemProductionBackend(_CoupledBackend):
+             precision="float32",
+             bem_backend=normalized_bem_backend,
+         )
++        if test_build:
++            self.extra_solver_options = METAL_TEST_SOLVER_OPTIONS
+ 
+ 
+ CoupledProductionBackend = PhysicalSystemProductionBackend
