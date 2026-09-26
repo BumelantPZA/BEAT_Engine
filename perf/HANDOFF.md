@@ -1,4 +1,4 @@
-# SAWMOD Metal speedups: handoff (2026-09-26, after round 7)
+# SAWMOD Metal speedups: handoff (2026-09-26, after round 8)
 
 To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-test` and say:
 "Read perf/HANDOFF.md and continue with the next idea." Full history is in `perf/NOTES.md`
@@ -13,11 +13,13 @@ To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-tes
   from the stale LU on top of FAST_TRS (itself −0.028 s/freq on the 12-freq set).
   **Estimated in-app 50-freq SAWMOD: ~48 s** (51.2 − 50 × 0.059 s/freq × ~0.94 for Revise mode
   ≈ 48.4 s; FAST_TRS ≈ −1.3 s, STALE_LU ≈ −1.5 s).
+- Round 8 (in the app, not yet measured in-app, all bit-identical): 50-freq sweep 0.972 → **0.899
+  s/freq**. **Estimated in-app 50-freq SAWMOD: ~45 s** (48.4 − 50 × 0.073 × 0.94).
 - Code: this checkout, branch `perf/experiments`, pushed to the user's fork
   (`git push fork perf/experiments`, BumelantPZA/BEAT_Engine). **Never push to `origin`
   (JWSound).**
 - Restore tags: `metal-test-58s` (round 3), `metal-test-bm-threaded` (round 5),
-  `metal-test-round6`, `metal-test-round7` (current).
+  `metal-test-round6`, `metal-test-round7`, `metal-test-round8` (current).
 - App side: `../boundary-lab/src/blab/solvers/engine_distribution.py`,
   `METAL_TEST_SOLVER_OPTIONS["test_env"]`. It has no fork; its diff is kept in
   `perf/app_patches/engine_distribution.diff`. The app loads Julia at start, so restart it after
@@ -26,7 +28,8 @@ To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-tes
 App env now: `BLAB_TEST_COUPLED_PREFETCH=0`, `BLAB_METAL_REGULAR_KERNEL_MODE=pair_tilereduce`,
 `BLAB_TEST_BLAS=accelerate`, `BLAB_METAL_FIELD_FAST=3`, `BLAB_TEST_DENSE_STATS=1`,
 `BLAB_TEST_BM_THREADED=1`, `BLAB_TEST_GC_DEFER=1`, `BLAB_TEST_BLOCKED_LU=512`,
-`BLAB_TEST_FAST_TRS=128`, `BLAB_TEST_STALE_LU=15`.
+`BLAB_TEST_FAST_TRS=128`, `BLAB_TEST_STALE_LU=15`, `BLAB_TEST_OP_POOL=1`,
+`BLAB_TEST_HOST_ROW_WEIGHTS=1`, `BLAB_TEST_FLUX_SKIP=1`.
 
 ## Per-frequency budget now (s, harness medians)
 | Stage | s | Code |
@@ -43,7 +46,12 @@ Two timers are nested, which misled the round-2 Fable plan:
 - `block_assembly_s` **contains** `interface_elimination_s`; pure assembly is ~0.01.
 - `fem_schur_extraction_s` **contains** `fem_transducer_solves_s`.
 
-The first half is a tie: shrinking only the GPU or only the condensation gains nothing.
+**Correction (round 8):** the first half was not a tie. `interface_elim_diag_fem_stage_work_s`
+(the FEM task's own work) is 0.35, while `fem_condensation_s` is the overlapped wall (= the GPU
+branch). The GPU branch (BEM ops + BM combine) was critical by ~0.1; after round 8 it is
+0.36 + 0.04 vs FEM 0.35, so the next GPU cut beyond ~0.05 gains nothing without FEM cuts.
+GPU assembly split (`BLAB_TEST_ASM_TIMING=<file>` + `BLAB_METAL_GATHER_TIMING=1`): pair kernel
+0.27, DLP/HYP gather 0.066, S/K' gather 0.037 (halved by FLUX_SKIP), singular 0.012.
 
 ## How to test
 ```
@@ -78,6 +86,10 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 | 5 | Threaded Burton-Miller combine (`BM_THREADED`), exact | first half 0.54 → 0.47 |
 | 6 | `GC_DEFER`: GC off during a frequency, one collection after (was 1.1 GB/freq, 5 pauses, 0.12–0.16 s), exact | −0.05 s/freq |
 | 6 | (both round-6 rows together: in-app 58 → 51.2 s) | |
+| 8 | `OP_POOL=1`: keep the four Metal operator buffers for the next frequency, zero them on the GPU (alloc 0.02) | −0.036 s/freq |
+| 8 | `HOST_ROW_WEIGHTS=1`: symmetry row weights applied inside the threaded host BM combine instead of four GPU broadcasts + weight upload | −0.024 s/freq |
+| 8 | `FLUX_SKIP=1`: 2964 of 6054 faces carry flux; skip the S/K' reduction pass (pair kernel) and S/K' gather for the others, host combine writes zeros | −0.031 s/freq |
+| 8 | (round 8 together, 50-freq sweep, bit-identical: 0.972 → 0.899) | |
 | 7 | `FAST_TRS=128`: the F32 LU solve as row swaps + blocked trsm with gemm updates (Accelerate getrs barely threads: 15 → 4 ms for 3 RHS), maxrel 6.6e-8 | −0.028 s/freq |
 | 7 | `STALE_LU=15`: previous fresh F32 LU as GMRES preconditioner (3 RHS in lockstep, same Float64 backward-error test), reused while the last stale solve took ≤ 8 iterations (`STALE_REUSE`), fresh LU + no more reuse after a failure at the cap. Used on 17/50 freqs (23 Hz–0.9 kHz, 6–15 iterations, ~8 ms each). maxrel 1.8e-8 | −0.031 s/freq (50-freq sweep) |
 | 6 | `BLOCKED_LU=512`: right-looking blocked LU, Accelerate getrf panel + cgemm trailing update (cgetrf runs at 0.3 TFLOP/s, cgemm at 2.0), maxrel 1.3e-7, refinement 1.5 → 2 steps | −0.085 s/freq |
@@ -97,6 +109,10 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 | Two-level blocked LU (inner blocked panel) | ~130 ms, same as single-level nb=512 (134 ms); not worth it |
 | Stale LU: `STALE_REUSE=12` + `STALE_STOP=12` | 0.942 vs 0.932: the aging factor hits 13 iterations by 60 Hz and reuse stops. Frequent refresh (REUSE=8) is better |
 | Stale LU as plain refinement (no GMRES) | Never converges, even at 40 Hz (‖ΔA‖/‖A‖ ≈ 0.15 per step) |
+| `BLAB_MUMPS_THREADS` 6/8, `BLAB_MUMPS_SOLVE_THREADS=2` (round 8) | 1.003–1.006, no effect, bit-identical |
+| 3M complex GEMM for the elimination product (3 dgemms) | 158 → 143 ms micro; split/combine overhead eats it; one dgemm already runs at ~0.45 TFLOP/s F64 (`perf/gemm3m_micro.jl`) |
+| Prefetch again after round 8 (`COUPLED_PREFETCH=1`) | 0.977 vs 0.899: the GPU assembly slows the CPU stages beside it (elimination 0.15 → 0.19) |
+| Skip S/K' math inside the quadrature fold for rigid trials | Not tried: S is needed for the hypersingular term; saves ~6 of ~40 ops per qpair, and SIMD groups mix two trial rows |
 | Thread counts (8 vs 10), MUMPS 2/6 threads, kernel group size, gather budget | Within noise or worse (rounds 1–2, when GPU-bound; MUMPS threads untested since the tie) |
 
 ## Next ideas (untested, rough order)
@@ -105,7 +121,7 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
    - The GMRES iteration costs ~8 ms: F64 3-column matvec 3.4 ms (~45 GB/s, below the memory
      bandwidth) + blocked F32 solve 4 ms. Halving it extends reuse to ~2 kHz.
    - `STALE_STOP=13` would avoid the one failure at the cap (~0.12 s per sweep); marginal.
-2. **Break the first-half tie: shrink the GPU and the condensation together.**
+2. **First half: now GPU 0.40 vs FEM 0.35 (see correction above).** Remaining items:
    - GPU side (Fable I4): assemble S/K′ only for the DP0 columns that carry flux (interface +
      transducer + prescribed faces); rigid faces multiply zero flux. Expected 0.05–0.15 off the
      GPU branch. Where: `BeatEngineMetalAssembly.jl:235`, tile-reduce kernel column range.

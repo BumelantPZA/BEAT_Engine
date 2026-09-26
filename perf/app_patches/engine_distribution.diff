@@ -1,5 +1,5 @@
 diff --git a/src/blab/solvers/engine_distribution.py b/src/blab/solvers/engine_distribution.py
-index 40299fc..aee4729 100644
+index 40299fc..f74f223 100644
 --- a/src/blab/solvers/engine_distribution.py
 +++ b/src/blab/solvers/engine_distribution.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 40299fc..aee4729 100644
  try:
      import beat_engine
  except ImportError as exc:
-@@ -12,4 +14,48 @@ from beat_engine import backend_catalog as backend_catalog
+@@ -12,4 +14,54 @@ from beat_engine import backend_catalog as backend_catalog
  from beat_engine import backend_info as engine_backend_info
  from beat_engine import engine_paths as engine_paths
  
@@ -46,6 +46,12 @@ index 40299fc..aee4729 100644
 +        # the 50-freq sweep, maxrel 1.8e-8; falls back to a fresh LU above ~1 kHz).
 +        "BLAB_TEST_FAST_TRS": "128",
 +        "BLAB_TEST_STALE_LU": "15",
++        # 2026-09-26 round 8, all bit-identical: pooled Metal operator buffers, symmetry row weights
++        # folded into the host Burton-Miller combine, and no S/K' work for faces without flux
++        # (50-freq sweep 0.972 -> 0.899 s/freq).
++        "BLAB_TEST_OP_POOL": "1",
++        "BLAB_TEST_HOST_ROW_WEIGHTS": "1",
++        "BLAB_TEST_FLUX_SKIP": "1",
 +    }
 +}
 +

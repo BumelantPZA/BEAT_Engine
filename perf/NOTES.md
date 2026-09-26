@@ -1,5 +1,17 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
+## Round 8 (2026-09-26): GPU branch is the critical path; three bit-identical cuts
+FEM stage work is 0.35 vs GPU branch 0.46: the "tie" was a misread of the overlapped timer.
+| Change | Harness (12 freqs) | maxrel |
+|---|---|---|
+| `OP_POOL=1` | 1.057 → 1.021 | 0 |
+| + `HOST_ROW_WEIGHTS=1` | → 0.997 | 0 |
+| + `FLUX_SKIP=1` (S/K' gather + pair-kernel reduction pass) | 1.013 → 0.982 | 0 |
+| 50-freq sweep, round 7 → round 8 | 0.972 → 0.899 | 0 |
+| round 8 + `COUPLED_PREFETCH=1` | 0.977 (worse) | 0 |
+MUMPS threads 6/8 and solve threads 2: no effect. 3M GEMM: ~10% micro, not worth it.
+Estimated in-app 50-freq SAWMOD: ~45 s. All three switches are in the app.
+
 ## Round 7 (2026-09-26): faster F32 LU solve, stale LU as GMRES preconditioner
 | Change | Harness | maxrel |
 |---|---|---|
