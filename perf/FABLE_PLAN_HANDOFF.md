@@ -1,4 +1,4 @@
-# Handoff: plan the next SAWMOD speedups (planning only — don't run or change code)
+# Task: plan the next SAWMOD speedups (planning only — no running, no code changes)
 
 **Goal:** shorten the whole solve, meaning the wall time from pressing Solve in Boundary Lab until
 all frequencies are done (SAWMOD, 50 freqs, now ~58 s with a warm worker, which is ~1.16 s/freq).
@@ -7,7 +7,7 @@ Any level is in scope: per-stage maths, algorithm or formulation changes, sweep-
 request overhead. The per-stage table below shows where time goes today; it is not a list of
 things to micro-tune.
 
-**Task:** write `perf/FABLE_PLAN.md`:
+**Task:** write `fable/PLAN.md` (in this folder):
 1. Your own diagnosis of what bounds the whole solve.
 2. New optimization ideas, as many distinct ones as you can justify, ranked by expected
    whole-solve gain. Each gets the mechanism, the expected saving (s/freq or s/sweep), accuracy
@@ -18,12 +18,25 @@ Think from first principles about the physics and linear algebra, not only the c
 structure. Don't propose anything on the "Already tried" list unless you explain what's
 different. Don't run anything.
 
+## Session limits (read first)
+- Budget: about twice the previous planning session here, which was ~30k output tokens. Aim for
+  one careful pass: read, think, write `fable/PLAN.md` once (≤ ~20 KB), stop. No drafts or
+  rewrites, no subagents, no web searches, no git.
+- Don't run anything (no Julia, tests, solves or benchmarks) and don't change code. Another
+  session implements and benchmarks the plan with its own harness.
+- Read `fable/SOLVE_EXCERPT.jl` with the Read tool (1,392 lines: the whole per-frequency build,
+  condensation, elimination, dense LU, solve and the driver loop, with source line numbers).
+- If the excerpt lacks something you need, you may make up to 4 targeted reads (≤ 150 lines each)
+  in `~/Desktop/Claude/Boundarylab/beat-engine-test/src/beat_engine/julia_local/`, which is the
+  current code. This folder's own `src/` is an older version; don't read it. Don't survey the repo.
+- `fable/round1/` is the previous (GPU kernel) session; ignore it.
+
 **Setup:** coupled FEM-BEM acoustic solve, BEAT Engine (Julia 1.12 + Metal.jl), Apple M1 Pro
 (10 CPU cores, 16-core GPU, 16 GB). Model SAWMOD: FEM order 29,665, BEM 3,110 P1 nodes / 6,054
 triangles (xy symmetry, 4 passes), 3 transducers, condensed dense system order 3,116.
 Frequencies are solved one at a time, and the setup (mesh, caches, analysis) is reused across them.
 Now **1.14 s/freq** in the harness (in-app 50 freqs: 141 s at the start → ~58 s now).
-Code: `src/beat_engine/julia_local/`. Per-frequency driver: `coupled_solver.jl`
+Code (current): `~/Desktop/Claude/Boundarylab/beat-engine-test/src/beat_engine/julia_local/`. Per-frequency driver: `coupled_solver.jl`
 (`solve_request`); the build is `build_condensed_coupled_system`
 (`src/BeatEngineCoupledCondensed.jl:1650`).
 
