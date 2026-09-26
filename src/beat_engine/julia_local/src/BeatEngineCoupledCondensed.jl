@@ -213,6 +213,57 @@ mutable struct RefinedDenseLU
     correction::Any   # test (BLAB_TEST_ELIM_IMPLICIT): `B_q W` columns kept out of `matrix`, or nothing
 end
 
+# Test (BLAB_TEST_HOST_POOL=1): large per-frequency host arrays come from, and go back to, a pool
+# keyed by element type and size, so the next frequency writes pages it already owns. Filling a
+# fresh 155 MB array costs ~57 ms of page faults, a reused one 1.5 ms; SAWMOD allocated ~1.1 GB per
+# frequency (~76k faults, ~0.3 s system time). An array goes back only once nothing references it;
+# the driver empties the pool per request.
+const _TEST_HOST_POOL = Dict{Any,Vector{Any}}()
+const _TEST_HOST_POOL_LOCK = ReentrantLock()
+_test_host_pool_on() = get(ENV, "BLAB_TEST_HOST_POOL", "0") == "1"
+function _test_take(::Type{T}, dims::Vararg{Int,N}) where {T,N}
+    _test_host_pool_on() || return Array{T,N}(undef, dims)
+    found = lock(_TEST_HOST_POOL_LOCK) do
+        list = get(_TEST_HOST_POOL, (T, dims), nothing)
+        isnothing(list) || isempty(list) ? nothing : pop!(list)
+    end
+    return isnothing(found) ? Array{T,N}(undef, dims) : found::Array{T,N}
+end
+function _test_give!(arrays...)
+    _test_host_pool_on() || return nothing
+    lock(_TEST_HOST_POOL_LOCK) do
+        for array in arrays
+            array isa Array || continue
+            list = get!(Vector{Any}, _TEST_HOST_POOL, (eltype(array), size(array)))
+            any(x -> x === array, list) || push!(list, array)
+        end
+    end
+    return nothing
+end
+_test_host_pool_clear!() = lock(() -> empty!(_TEST_HOST_POOL), _TEST_HOST_POOL_LOCK)
+# zeros(T, dims) from the pool, zeroed by column on all threads.
+function _test_take_zeros(::Type{T}, m::Int, n::Int) where {T}
+    _test_host_pool_on() || return zeros(T, m, n)
+    array = _test_take(T, m, n)
+    Threads.@threads for column in 1:n
+        @inbounds for row in 1:m
+            array[row, column] = zero(T)
+        end
+    end
+    return array
+end
+# `convert.(T, source)` into a pooled array, by column on all threads.
+function _test_take_converted(::Type{T}, source::Matrix) where {T}
+    _test_host_pool_on() || return T.(source)
+    array = _test_take(T, size(source)...)
+    Threads.@threads for column in axes(source, 2)
+        @inbounds for row in axes(source, 1)
+            array[row, column] = T(source[row, column])
+        end
+    end
+    return array
+end
+
 # Test (BLAB_TEST_ELIM_IMPLICIT=1): the flux elimination's `B_q W` columns stay out of the Float64
 # dense matrix. `correction.parts` holds them per block as factors (Float64 `coupling` and `schur`,
 # plus the Float32 `coupling32` the BEM produced); every Float64 product (refinement residuals, stale
@@ -255,7 +306,7 @@ end
 # The Float32 LU input: `matrix` narrowed, plus the correction from single-precision products.
 function _test_narrowed(refined)
     matrix = refined.matrix
-    narrowed = Matrix{ComplexF32}(undef, size(matrix))
+    narrowed = _test_take(ComplexF32, size(matrix)...)
     Threads.@threads for column in axes(matrix, 2)
         @inbounds for row in axes(matrix, 1)
             narrowed[row, column] = ComplexF32(matrix[row, column])
@@ -340,6 +391,7 @@ function _test_stale_reset!()
     _TEST_STALE.factor = nothing
     _TEST_STALE.last_iterations = 0
     _TEST_STALE.disabled = false
+    _test_host_pool_clear!()   # BLAB_TEST_HOST_POOL: same per-request lifetime
     return nothing
 end
 
@@ -502,6 +554,9 @@ function _test_fresh_factor!(refined::RefinedDenseLU, narrowed=nothing)
             refined.factor = candidate
             refined.stale = false
             if _test_stale_cap() > 0
+                previous = _TEST_STALE.factor
+                # BLAB_TEST_HOST_POOL: the replaced stale factor is referenced by no system any more.
+                isnothing(previous) || previous === candidate || _test_give!(previous.factors)
                 _TEST_STALE.factor = candidate
                 _TEST_STALE.last_iterations = 0
             end
@@ -2424,7 +2479,16 @@ function build_condensed_coupled_system(
                            "interface=$(size(interface_operators.bem_flux, 2)) transducers=$transducer_count prescribed=$prescribed_bem_count ",
                            "images=$(length(bem_mesh.faces))"), ENV["BLAB_TEST_FLUX_COUNT"], "a")
     end
-    bem_interface_block = -(bem_rhs_operator * Complex{T}.(interface_operators.bem_flux))
+    bem_interface_block = if _test_host_pool_on() && bem_rhs_operator isa Matrix{Complex{T}}
+        # BLAB_TEST_HOST_POOL: the same product (`*` is this `mul!`) into a pooled array, then negated
+        # in place. (alpha = -1 in `mul!` rounds differently.)
+        flux_operator = Complex{T}.(interface_operators.bem_flux)
+        product = mul!(_test_take(Complex{T}, size(bem_rhs_operator, 1), size(flux_operator, 2)), bem_rhs_operator,
+                       flux_operator)
+        product .= .-product
+    else
+        -(bem_rhs_operator * Complex{T}.(interface_operators.bem_flux))
+    end
     bem_motion_block = transducer_count == 0 ? nothing : -(bem_rhs_operator * bem_motion_flux)
     bem_prescribed_rhs = prescribed_bem_count == 0 ?
                          zeros(Complex{T}, length(bem_mesh.vertices), 0) :
@@ -2494,7 +2558,7 @@ function build_condensed_coupled_system(
     ]
     force_factor = T[transducer.bl_n_per_a for transducer in transducers]
 
-    coupled = zeros(Complex{dense_type}, system_count, system_count)
+    coupled = _test_take_zeros(Complex{dense_type}, system_count, system_count)
     interface_elimination_s = 0.0
     elimination = nothing
     # The Schur complement takes the slot the full FEM block occupies in the monolithic
@@ -2598,7 +2662,7 @@ function build_condensed_coupled_system(
             else
                 fem_stage_presolve
             end
-            interface_block = _split_timed!(() -> ComplexF64.(bem_interface_block), elimination_split, :block_convert)
+            interface_block = _split_timed!(() -> _test_take_converted(ComplexF64, bem_interface_block), elimination_split, :block_convert)
             if get(ENV, "BLAB_TEST_ELIM_F32", "0") == "1" && eltype(bem_interface_block) === ComplexF32
                 # Test: the block products in single precision (cgemm, ~4x zgemm). The BEM block is
                 # single precision already; only the per-block W = M⁻¹S is rounded down. Not bit-identical.
@@ -2610,6 +2674,7 @@ function build_condensed_coupled_system(
                 # Test (BLAB_TEST_ELIM_IMPLICIT=1): no product here; see `_test_dense_mul!`.
                 dense_correction = (
                     rows=bem_range,
+                    block32=bem_interface_block,
                     parts=[
                         (
                             columns=bem_columns[block.rows],
@@ -2661,7 +2726,7 @@ function build_condensed_coupled_system(
                 (mass_factorization \ schur_double, mass_factorization \ gamma_mech)
             end
             schur_double = nothing
-            interface_block = _split_timed!(() -> ComplexF64.(bem_interface_block), elimination_split, :block_convert)
+            interface_block = _split_timed!(() -> _test_take_converted(ComplexF64, bem_interface_block), elimination_split, :block_convert)
             schur_coupling, motion_coupling = _split_timed!(elimination_split, :product) do
                 (interface_block * schur_solution, interface_block * motion_solution)
             end
@@ -2701,6 +2766,9 @@ function build_condensed_coupled_system(
             elimination_split[Symbol("lu_", key)] = value
         end
 
+    # BLAB_TEST_HOST_POOL: nothing below references the BEM matrices; the release returns the rest.
+    _test_give!(bem_lhs, bem_rhs_operator)
+    isnothing(dense_correction) && _test_give!(bem_interface_block)
     return (
         fem_mesh=fem_mesh,
         bem_mesh=bem_mesh,
@@ -2787,8 +2855,8 @@ function _test_burton_miller_matrices_threaded(
     half = Complex{T}(0.5)
     D, H = operators.double_layer, operators.hypersingular
     S, Kp = operators.single_layer, operators.adjoint_double_layer
-    lhs = Matrix{Complex{T}}(undef, size(D))
-    rhs = Matrix{Complex{T}}(undef, size(S))
+    lhs = _test_take(Complex{T}, size(D)...)
+    rhs = _test_take(Complex{T}, size(S)...)
     if !isnothing(row_weights)
         # BLAB_TEST_HOST_ROW_WEIGHTS: the GPU skipped `operator .*= w` (row i scaled by w[i]); the
         # same products are formed here, then combined exactly as below.
@@ -2889,6 +2957,15 @@ function _test_asm_timing_write(k)
 end
 
 function release_condensed_coupled_system!(system)
+    if _test_host_pool_on() && hasproperty(system, :factorization) && system.factorization isa RefinedDenseLU
+        refined = system.factorization
+        _test_give!(refined.matrix)
+        factor = refined.factor
+        !isnothing(factor) && factor !== _TEST_STALE.factor && _test_give!(factor.factors)
+        isnothing(refined.correction) || _test_give!(refined.correction.block32)
+        data = system.interface_elimination_data
+        !isnothing(data) && hasproperty(data, :interface_block) && _test_give!(data.interface_block)
+    end
     _release_condensation!(system.condensation)
     system.owns_cache && release_condensed_coupled_cache!(system.cache)
     return nothing

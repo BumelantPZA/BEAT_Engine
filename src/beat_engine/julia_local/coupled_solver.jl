@@ -2432,7 +2432,54 @@ function _condensed_split_timings(system, solutions)
     return timings
 end
 
+# Test (BLAB_TEST_PHASE_LOG=<file>): "<time_ns> <label>" lines for the request's phases.
+function test_phase_log(label, at=time_ns())
+    path = get(ENV, "BLAB_TEST_PHASE_LOG", "")
+    isempty(path) || open(io -> println(io, at, " ", label), path, "a")
+    return nothing
+end
+# Test instrumentation: (user s, system s, minor page faults) of this process, from getrusage.
+function test_rusage()
+    buffer = zeros(UInt8, 256)   # struct rusage is 144 bytes on macOS
+    ccall(:getrusage, Cint, (Cint, Ptr{UInt8}), 0, buffer)
+    words = reinterpret(Int64, buffer[1:144])
+    # ru_utime (sec, usec), ru_stime (sec, usec), then maxrss, ixrss, idrss, isrss, minflt
+    return (words[1] + words[2] / 1.0e6, words[3] + words[4] / 1.0e6, words[9])
+end
+# Test (BLAB_TEST_ALLOC_PROFILE=<file>): every allocation of >= 1 MB during frequency 3, summed by
+# the first engine source line on its stack.
+const TEST_PROFILE_PKG = Base.PkgId(Base.UUID("9abbd945-dff8-562f-b5e8-e1ebf5ef1b79"), "Profile")
+function test_alloc_profile_start()
+    Profile = Base.require(TEST_PROFILE_PKG)
+    Base.invokelatest(Profile.Allocs.clear)
+    Base.invokelatest(Profile.Allocs.start; sample_rate=1.0)
+    return nothing
+end
+function test_alloc_profile_stop(path)
+    Profile = Base.require(TEST_PROFILE_PKG)
+    Base.invokelatest(Profile.Allocs.stop)
+    results = Base.invokelatest(Profile.Allocs.fetch)
+    totals = Dict{String,Tuple{Float64,Int}}()
+    for alloc in results.allocs
+        alloc.size >= 2^20 || continue
+        frame = findfirst(f -> occursin(r"BeatEngine|coupled_solver", string(f.file)), alloc.stacktrace)
+        key = isnothing(frame) ? "?" : (f = alloc.stacktrace[frame]; "$(basename(string(f.file))):$(f.line) $(f.func)")
+        bytes, count = get(totals, key, (0.0, 0))
+        totals[key] = (bytes + alloc.size, count + 1)
+    end
+    open(path, "w") do io
+        for (key, (bytes, count)) in sort(collect(totals); by=x -> -x[2][1])
+            println(io, rpad(string(round(bytes / 1.0e6; digits=1)), 8), " MB  x", rpad(string(count), 4), key)
+        end
+    end
+    Base.invokelatest(Profile.Allocs.clear)
+    return nothing
+end
+const TEST_SUBMISSION_NS = Ref{UInt64}(0)   # worker: before/after reading the request JSON
+const TEST_PARSED_NS = Ref{UInt64}(0)
+
 function solve_request_impl(request; event_mode=false)
+    test_request_ns = time_ns()
     validate_system_request(request)
     BeatEngineContract.BeatEngineProvenance.engine_identity()
     BeatEngineContract.BeatEngineProvenance.runtime_identity()
@@ -2489,6 +2536,10 @@ function solve_request_impl(request; event_mode=false)
     for (key, value) in get(solver_options, "test_env", Dict{String,Any}())
         value === nothing ? delete!(ENV, String(key)) : (ENV[String(key)] = string(value))
     end
+    test_phase_log("submitted", TEST_SUBMISSION_NS[])
+    test_phase_log("parsed", TEST_PARSED_NS[])
+    test_phase_log("request", test_request_ns)
+    test_phase_log("env")
     test_apply_blas!()
     precision_name = lowercase(String(get(solver_options, "precision", "float64")))
     FloatType = if precision_name in ("float32", "complex64")
@@ -2872,11 +2923,15 @@ function solve_request_impl(request; event_mode=false)
                 break
             end
             test_iteration_started = time_ns()
+            test_phase_log("iter $frequency_index")
             # Test: BLAB_TEST_GC_DEFER=1 disables the GC during the frequency; the allocations are
             # collected once, at the next allocation after the re-enable below.
             test_gc_defer = get(ENV, "BLAB_TEST_GC_DEFER", "0") == "1"
             test_gc_defer && GC.enable(false)
             test_gc_started = Base.gc_num()
+            test_rusage_started = test_rusage()
+            test_alloc_profile = frequency_index == 3 ? get(ENV, "BLAB_TEST_ALLOC_PROFILE", "") : ""
+            isempty(test_alloc_profile) || test_alloc_profile_start()
             frequency_hz = FloatType(frequency_value)
             println(stderr, "Coupled $(precision_name)/$(bem_backend): assembling $(frequency_hz) Hz")
             assembly_started = time_ns()
@@ -3566,6 +3621,13 @@ function solve_request_impl(request; event_mode=false)
             solved_count = frequency_index
             test_gc_defer && GC.enable(true)
             test_gc = Base.GC_Diff(Base.gc_num(), test_gc_started)
+            # Test (BLAB_TEST_GC_MODE=young|full): collect the deferred garbage explicitly and time it
+            # (otherwise the next allocation does, outside every timer).
+            test_gc_mode = get(ENV, "BLAB_TEST_GC_MODE", "")
+            test_gc_explicit_started = time_ns()
+            test_gc_mode == "young" && GC.gc(false)
+            test_gc_mode == "full" && GC.gc(true)
+            test_gc_explicit_s = (time_ns() - test_gc_explicit_started) / 1.0e9
             test_prev_tail = Dict{String,Float64}(
                 "test_prev_emit_s" => (test_release_started - test_emit_started) / 1.0e9,
                 "test_prev_release_s" => (time_ns() - test_release_started) / 1.0e9,
@@ -3574,8 +3636,15 @@ function solve_request_impl(request; event_mode=false)
                 "test_prev_alloc_gb" => test_gc.allocd / 1.0e9,
                 "test_prev_gc_pauses" => Float64(test_gc.pause),
                 "test_prev_gc_full" => Float64(test_gc.full_sweep),
+                "test_prev_gc_explicit_s" => test_gc_explicit_s,
+                "test_prev_user_s" => test_rusage()[1] - test_rusage_started[1],
+                "test_prev_system_s" => test_rusage()[2] - test_rusage_started[2],
+                "test_prev_minflt" => Float64(test_rusage()[3] - test_rusage_started[3]),
             )
+            isempty(test_alloc_profile) || test_alloc_profile_stop(test_alloc_profile)
+            test_phase_log("iterend $frequency_index")
         end
+        test_phase_log("loopend")
     finally
         GC.enable(true)   # BLAB_TEST_GC_DEFER may have left it off on an error
         BeatEngineCoupledCondensed._test_stale_reset!()
@@ -3603,6 +3672,7 @@ function solve_request_impl(request; event_mode=false)
         end
     end
     cancelled = cancelled || cancel_requested()
+    test_phase_log("return")
     return (cancelled=cancelled, solved_count=solved_count)
 end
 
@@ -3950,7 +4020,9 @@ function run_worker()
                 continue
             end
             request_path = String(get(submission, "request", ""))
+            TEST_SUBMISSION_NS[] = time_ns()
             request = haskey(submission, "request_inline") ? submission["request_inline"] : JSON.parse(read(request_path, String))
+            TEST_PARSED_NS[] = time_ns()
             operation = String(get(submission, "operation", "solve"))
             options = operation == "solve" ? get(request, "solver_options", Dict()) : request
             get(options, "phasor_convention", NEGATIVE_TIME_PHASOR) ==
@@ -3978,6 +4050,7 @@ function run_worker()
                 # perf/dev_worker.jl: apply source edits, and call through the newest world so they count.
                 isdefined(Main, :BLAB_DEV_WORKER) && Main._dev_revise()
                 outcome = Base.invokelatest(solve_request, request; event_mode=true)
+                test_phase_log("solved")
                 # Preserve historical driver reclamation by default. Campaign
                 # clients may opt into bounded reuse; cancellation, pressure,
                 # periodic cleanup and failures still take the full path.
@@ -4011,6 +4084,7 @@ function run_worker()
                         "seconds" => (time_ns() - cleanup_started) / 1e9)
                 end
                 println(JSON.json(event))
+                test_phase_log("emitted")
             else
                 error("Unsupported coupled worker operation: $operation")
             end

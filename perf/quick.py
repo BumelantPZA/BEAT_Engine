@@ -86,6 +86,9 @@ def run_job(worker, job, out):
                 keys_all = sorted({k for f in flat for k in f})
                 med = {k: statistics.median(f.get(k, 0.0) for f in flat) for k in keys_all}
                 (QUEUE / f"{out.stem}.{name}.r{round_index + 1}.timings.json").write_text(json.dumps(med, indent=1))
+                # Per frequency, plus the request wall: `<job>.<config>.r<n>.rows.json`.
+                (QUEUE / f"{out.stem}.{name}.r{round_index + 1}.rows.json").write_text(
+                    json.dumps({"wall_s": per_freq * len(freqs), "rows": flat}))
             secs[name].append(sections)
             if reference is None:
                 reference = outputs
