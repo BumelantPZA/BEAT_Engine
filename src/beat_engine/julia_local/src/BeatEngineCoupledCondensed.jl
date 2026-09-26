@@ -275,6 +275,38 @@ function _test_blocked_lu!(A::Matrix{T}, nb::Int) where {T}
     return LinearAlgebra.LU(A, ipiv, LinearAlgebra.BlasInt(info))
 end
 
+# Test (BLAB_TEST_FAST_TRS=<nb>): the ComplexF32 LU solve as row swaps plus blocked triangular
+# solves whose off-diagonal updates are `gemm!` calls. Accelerate's getrs barely threads: 15 ms
+# for 3 right-hand sides at n = 3116, this 4 ms. Rounding differs from getrs (F32 level); the
+# refinement still has to reach the Float64 backward error.
+function _test_lu_solve(factor::LinearAlgebra.LU{T}, rhs::AbstractVecOrMat) where {T}
+    nb = something(tryparse(Int, get(ENV, "BLAB_TEST_FAST_TRS", "0")), 0)
+    nb > 0 || return factor \ T.(rhs)
+    B = Matrix{T}(reshape(rhs, size(rhs, 1), :))
+    A = factor.factors
+    n = size(A, 1)
+    @inbounds for i in 1:n
+        r = factor.ipiv[i]
+        r == i && continue
+        for c in axes(B, 2)
+            B[i, c], B[r, c] = B[r, c], B[i, c]
+        end
+    end
+    for k in 1:nb:n
+        ke = min(k + nb - 1, n)
+        BLAS.trsm!('L', 'L', 'N', 'U', one(T), view(A, k:ke, k:ke), view(B, k:ke, :))
+        ke < n && BLAS.gemm!('N', 'N', -one(T), view(A, (ke+1):n, k:ke), view(B, k:ke, :), one(T),
+                             view(B, (ke+1):n, :))
+    end
+    for ke in n:-nb:1
+        k = max(ke - nb + 1, 1)
+        BLAS.trsm!('L', 'U', 'N', 'N', one(T), view(A, k:ke, k:ke), view(B, k:ke, :))
+        k > 1 && BLAS.gemm!('N', 'N', -one(T), view(A, 1:(k-1), k:ke), view(B, k:ke, :), one(T),
+                            view(B, 1:(k-1), :))
+    end
+    return rhs isa AbstractVector ? vec(B) : B
+end
+
 function RefinedDenseLU(matrix::Matrix{ComplexF64})
     empty!(_TEST_LU_SPLIT)
     t = time_ns()
@@ -328,12 +360,24 @@ function _dense_residual!(residual, factorization::RefinedDenseLU, target, solut
     return residual
 end
 
+const _TEST_DUMP_COUNTER = Ref(0)
+
 function Base.:\(factorization::RefinedDenseLU, rhs::AbstractVecOrMat)
     all(isfinite, rhs) || throw(ArgumentError("dense coupled right-hand side has non-finite entries"))
+    # Test (BLAB_TEST_DUMP_DENSE=<dir>): write each dense system for offline preconditioner studies.
+    dump_dir = get(ENV, "BLAB_TEST_DUMP_DENSE", "")
+    if !isempty(dump_dir)
+        _TEST_DUMP_COUNTER[] += 1
+        open(joinpath(dump_dir, "dense_$(_TEST_DUMP_COUNTER[]).bin"), "w") do io
+            write(io, Int64(size(factorization.matrix, 1)), Int64(size(rhs, 2)))
+            write(io, factorization.matrix)
+            write(io, ComplexF64.(rhs))
+        end
+    end
     target = ComplexF64.(rhs)
     residual = similar(target)
     if isnothing(factorization.fallback)
-        solution = ComplexF64.(factorization.factor \ ComplexF32.(target))
+        solution = ComplexF64.(_test_lu_solve(factorization.factor, ComplexF32.(target)))
         previous = Inf
         reason = nothing
         for iteration in 0:DENSE_REFINEMENT_MAX_ITERATIONS
@@ -352,7 +396,7 @@ function Base.:\(factorization::RefinedDenseLU, rhs::AbstractVecOrMat)
                 break
             end
             previous = ratio
-            solution .+= ComplexF64.(factorization.factor \ ComplexF32.(residual))
+            solution .+= ComplexF64.(_test_lu_solve(factorization.factor, ComplexF32.(residual)))
             factorization.iterations = max(factorization.iterations, iteration + 1)
         end
         isnothing(reason) &&
