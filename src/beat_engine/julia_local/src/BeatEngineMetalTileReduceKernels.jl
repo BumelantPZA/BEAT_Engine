@@ -311,6 +311,8 @@ function _metal_tilereduce_pair_kernel!(
     trial_curl_sign_x,
     trial_curl_sign_y,
     trial_curl_sign_z,
+    element_flux_mask,
+    mask_on::Int32,
 ) where {RC,R,TY,SKIP,SIMDBAR}
     tg = MtlThreadGroupArray(Float32, (16, TY, 12))
     tpos = thread_position_in_threadgroup()
@@ -331,9 +333,13 @@ function _metal_tilereduce_pair_kernel!(
     hyp_re = zero(SVector{9,T})
     hyp_im = zero(SVector{9,T})
     # No early return: every thread must reach the barriers below.
+    rigid_trial = false   # test (BLAB_TEST_FLUX_SKIP): its S/K' column is never gathered
     if test_position <= element_count && trial_local <= chunk_count
         @inbounds test_index = Int32(elements[test_position])
         @inbounds trial_index = Int32(elements[chunk_start + trial_local - Int32(1)])
+        if mask_on != Int32(0)
+            @inbounds rigid_trial = element_flux_mask[trial_index] == Int32(0)
+        end
         if !_metal_pair_is_skipped(
             faces,
             face_count,
@@ -354,8 +360,10 @@ function _metal_tilereduce_pair_kernel!(
 
     _metal_tilereduce_put!(tg, tx, ty, slp_re, slp_im, adj_re, adj_im)
     _metal_tilereduce_barrier(barv)
-    _metal_tilereduce_reduce!(blocks4, tg, slot_entry_offsets, slot_entries, slot_first, slot_count,
-        tx, ty, trial_local, chunk_count, slot_total, Int32(0), skipv)
+    if !rigid_trial
+        _metal_tilereduce_reduce!(blocks4, tg, slot_entry_offsets, slot_entries, slot_first, slot_count,
+            tx, ty, trial_local, chunk_count, slot_total, Int32(0), skipv)
+    end
     _metal_tilereduce_barrier(barv)
 
     _metal_tilereduce_put!(tg, tx, ty,
@@ -396,12 +404,17 @@ function _metal_tilereduce_slp_adjoint_kernel!(
     chunk_count::Int32,
     slot_total::Int32,
     p1_count::Int32,
+    flux_mask,
+    mask_on::Int32,
 )
     index = Int32(thread_position_in_grid_1d())
     index > p1_count * chunk_count && return nothing
     row = (index - Int32(1)) % p1_count + Int32(1)
     trial_local = (index - Int32(1)) ÷ p1_count + Int32(1)
     @inbounds trial_index = Int32(elements[chunk_start + trial_local - Int32(1)])
+    if mask_on != Int32(0)
+        @inbounds flux_mask[Int32(element_dp0_dofs[trial_index])] == Int32(0) && return nothing
+    end
     column_base = (trial_local - Int32(1)) * slot_total
     s_re = 0.0f0
     s_im = 0.0f0
@@ -509,6 +522,19 @@ function _launch_metal_tilereduce_pair_kernels!(
     groupsize = _metal_kernel_groupsize()
     p1_count = Int32(cache.p1_dof_count)
     timed = get(ENV, "BLAB_METAL_GATHER_TIMING", "0") == "1"
+    flux_mask = _TEST_FLUX_MASK[]
+    mask_on = isnothing(flux_mask) ? Int32(0) : Int32(1)
+    if isnothing(flux_mask)
+        isnothing(_TEST_FLUX_MASK_DUMMY[]) && (_TEST_FLUX_MASK_DUMMY[] = MtlArray(Int32[1]))
+        flux_mask = _TEST_FLUX_MASK_DUMMY[]
+    end
+    # Per element (face index) for the pair kernel; per DP0 column for the S/K' gather.
+    element_flux_mask = if mask_on == Int32(0)
+        flux_mask
+    else
+        host_mask = Array(flux_mask)
+        MtlArray(host_mask[Array(cache.element_dp0_dofs)])
+    end
     timed && Metal.synchronize()
     stamp = time()
     for chunk in 1:tables.chunk_count
@@ -546,6 +572,8 @@ function _launch_metal_tilereduce_pair_kernels!(
             trial_curl_sign_x,
             trial_curl_sign_y,
             trial_curl_sign_z,
+            element_flux_mask,
+            mask_on,
         )
         stamp = _metal_gather_stage!("pairs", timed, stamp)
         _metal_launch(
@@ -561,7 +589,9 @@ function _launch_metal_tilereduce_pair_kernels!(
             Int32(chunk_start),
             Int32(chunk_count),
             slot_total,
-            p1_count;
+            p1_count,
+            flux_mask,
+            mask_on;
             groupsize=groupsize,
         )
         stamp = _metal_gather_stage!("slp_adjoint", timed, stamp)

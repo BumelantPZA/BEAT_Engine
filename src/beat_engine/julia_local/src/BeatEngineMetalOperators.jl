@@ -33,6 +33,12 @@ end
 # then folds the symmetry row weights into its host Burton-Miller combine instead of a GPU pass.
 const _TEST_DEFER_ROW_WEIGHTS = Ref(false)
 
+# Test (BLAB_TEST_FLUX_SKIP=1): Int32 device mask over DP0 columns, set by the condensed builder
+# around its own assembly. The tile-reduce S/K' gather skips columns whose face carries no flux
+# (the builder only multiplies S/K' by flux matrices whose rows there are zero).
+const _TEST_FLUX_MASK = Ref{Any}(nothing)
+const _TEST_FLUX_MASK_DUMMY = Ref{Any}(nothing)
+
 """
     release_operator_storage!(operators)
 

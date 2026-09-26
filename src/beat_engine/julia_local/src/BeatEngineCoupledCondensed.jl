@@ -2108,6 +2108,19 @@ function build_condensed_coupled_system(
 
     bem_operator_started = time_ns()
     row_weights = nothing   # test (BLAB_TEST_HOST_ROW_WEIGHTS): symmetry weights still to apply on the host
+    # Test (BLAB_TEST_FLUX_SKIP=1, Metal, own assembly only): DP0 columns whose face carries flux in
+    # some right-hand-side block. S/K' are only ever multiplied by those flux matrices, so the GPU
+    # skips the other columns and the host combine writes zeros there.
+    flux_skip = get(ENV, "BLAB_TEST_FLUX_SKIP", "0") == "1" && isnothing(prefetched_operators) &&
+                prepared.bem_backend == :metal
+    flux_columns = if flux_skip
+        used = vec(any(!iszero, interface_operators.bem_flux; dims=2))
+        transducer_count == 0 || (used .|= vec(any(!iszero, bem_motion_flux; dims=2)))
+        prescribed_bem_count == 0 || (used .|= vec(any(!iszero, bem_prescribed_neumann; dims=2)))
+        used
+    else
+        nothing
+    end
     # This solver's own fork of the CPU regular assembly, so it can be optimised without
     # touching the shared path every other backend runs through. Behaviourally identical to
     # `assemble_regular_galerkin_operators(...; backend=:cpu)`, pinned by an equivalence test.
@@ -2124,6 +2137,9 @@ function build_condensed_coupled_system(
                            get(ENV, "BLAB_TEST_BM_THREADED", "0") == "1" &&
                            BeatEngineCore.normalized_symmetry_mode(prepared.symmetry_mode) != :off
         host_row_weights && (BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = true)
+        if flux_skip
+            BeatEngineCore._TEST_FLUX_MASK[] = BeatEngineCore.MtlArray(Int32.(flux_columns))
+        end
         device_operators = try
             assemble_regular_galerkin_operators(
                 bem_mesh,
@@ -2142,6 +2158,7 @@ function build_condensed_coupled_system(
             )
         finally
             BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = false
+            BeatEngineCore._TEST_FLUX_MASK[] = nothing
         end
         host_row_weights && (row_weights = p1_symmetry_orbit_weights(bem_mesh, prepared.symmetry_mode))
         _test_asm_timing_write(wavenumber)
@@ -2170,6 +2187,7 @@ function build_condensed_coupled_system(
     bem_lhs, bem_rhs_operator = if !isnothing(row_weights)
         _test_burton_miller_matrices_threaded(
             operators, prepared.identity_p1_p1, prepared.identity_p1_dp0, wavenumber; row_weights=row_weights,
+            flux_columns=flux_columns,
         )
     else
         (get(ENV, "BLAB_TEST_BM_THREADED", "0") == "1" ?
@@ -2531,7 +2549,7 @@ end
 # thread. The per-entry expressions are the broadcasts' own, in the same order, so the result is
 # bit-identical; the broadcasts run on one thread and took ~0.15 s/freq on the critical path.
 function _test_burton_miller_matrices_threaded(
-    operators, identity_p1_p1, identity_p1_dp0, k::T; row_weights=nothing,
+    operators, identity_p1_p1, identity_p1_dp0, k::T; row_weights=nothing, flux_columns=nothing,
 ) where {T<:AbstractFloat}
     coupling = burton_miller_coupling(k)
     half = Complex{T}(0.5)
@@ -2549,6 +2567,10 @@ function _test_burton_miller_matrices_threaded(
             end
         end
         Threads.@threads for j in axes(rhs, 2)
+            if !isnothing(flux_columns) && !flux_columns[j]
+                @inbounds rhs[:, j] .= zero(Complex{T})
+                continue
+            end
             @inbounds for i in axes(rhs, 1)
                 rhs[i, j] = -(S[i, j] * w[i]) - coupling * (Kp[i, j] * w[i] + half * identity_p1_dp0[i, j])
             end
