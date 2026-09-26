@@ -295,10 +295,18 @@ end
 
 function _test_scatter_parts!(matrix, correction, precision)
     for part in correction.parts
-        product = precision === Float32 ? part.coupling32 * ComplexF32.(part.schur) : part.coupling * part.schur
+        if precision === Float32
+            # BLAB_TEST_HOST_POOL: the same `*` (this `mul!`) into pooled arrays.
+            schur32 = _test_take_converted(ComplexF32, part.schur)
+            product = mul!(_test_take(ComplexF32, size(part.coupling32, 1), size(schur32, 2)), part.coupling32, schur32)
+            _test_give!(schur32)
+        else
+            product = part.coupling * part.schur
+        end
         for (local_column, column) in enumerate(part.columns)
             @views matrix[correction.rows, column] .+= product[:, local_column]
         end
+        precision === Float32 && _test_give!(product)
     end
     return matrix
 end
@@ -392,6 +400,7 @@ function _test_stale_reset!()
     _TEST_STALE.last_iterations = 0
     _TEST_STALE.disabled = false
     _test_host_pool_clear!()   # BLAB_TEST_HOST_POOL: same per-request lifetime
+    BeatEngineMumps._TEST_SCHUR_TAKE[] = _test_take   # a plain allocation while the pool is off
     return nothing
 end
 
@@ -1595,7 +1604,14 @@ function _build_mumps_condensation(
         factorization_s = (time_ns() - factorization_started) / 1.0e9
 
         schur_started = time_ns()
-        schur = schur_float64 ? schur_double : Complex{T}.(schur_double)
+        schur = if schur_float64
+            schur_double
+        else
+            # BLAB_TEST_HOST_POOL: the Float64 copy goes back once converted (both pooled).
+            converted = _test_take_converted(Complex{T}, schur_double)
+            _test_give!(schur_double)
+            converted
+        end
         transducer_condensed = !isnothing(motion_surface)
         transducer_started = time_ns()
         motion_fields = if transducer_condensed
@@ -3006,6 +3022,8 @@ function release_condensed_coupled_system!(system)
         data = system.interface_elimination_data
         !isnothing(data) && hasproperty(data, :interface_block) && _test_give!(data.interface_block)
         !isnothing(data) && hasproperty(data, :schur_blocks) && _test_give!(data.schur_blocks...)
+        condensation = system.condensation
+        !isnothing(condensation) && hasproperty(condensation, :schur) && _test_give!(condensation.schur)
     end
     _release_condensation!(system.condensation)
     system.owns_cache && release_condensed_coupled_cache!(system.cache)

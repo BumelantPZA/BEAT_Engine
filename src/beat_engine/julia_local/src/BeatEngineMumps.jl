@@ -454,6 +454,9 @@ Numeric LDLᵀ of the analysed pattern with `matrix`'s values and return the ful
 transpose entries differ by more than `symmetry_tolerance` relative, since SYM=2 reads only the
 lower triangle.
 """
+# Test hook (BLAB_TEST_HOST_POOL): `(T, m, n) -> Matrix{T}` for the Schur copy, or nothing.
+const _TEST_SCHUR_TAKE = Ref{Any}(nothing)
+
 function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; symmetry_tolerance::Real)
     solver.analysed || error("MUMPS factorization needs an analysis first.")
     values = nonzeros(matrix)
@@ -486,7 +489,10 @@ function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; sym
     solver.factored = true
     solver.factorization_count += 1
     m = length(solver.schur_variables)
-    schur = copy(reshape(solver.schur_buffer, m, m))
+    # Test (BLAB_TEST_HOST_POOL): the parent module's pool supplies the copy's storage.
+    take = _TEST_SCHUR_TAKE[]
+    schur = isnothing(take) ? copy(reshape(solver.schur_buffer, m, m)) :
+            copyto!(take(eltype(solver.schur_buffer), m, m), reshape(solver.schur_buffer, m, m))
     # MUMPS 5.9 returns the full matrix for SYM=2 with ICNTL(19)=3; older releases returned one
     # triangle. Complete it from the lower triangle if the strict upper part came back empty.
     if m > 1 && all(iszero, (schur[i, j] for j in 2:m for i in 1:(j-1))) &&
