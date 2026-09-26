@@ -42,7 +42,7 @@ def decode(packed):
 
 
 def run_config(worker, env, freqs, scratch):
-    request = system_request(PERF / "sawmod.json", "metal", "float32", freqs)
+    request = system_request(PERF / run_config.request, "metal", "float32", freqs)
     request["solver_options"]["test_env"] = env
     wall, rows = submit(worker, request, scratch)
     timings = [r.get("timings") or (r.get("diagnostics") or {}).get("timings") or {} for r in rows]
@@ -54,6 +54,9 @@ def run_config(worker, env, freqs, scratch):
     return wall / len(freqs), sections, {k: decode(v) for k, v in outputs.items()}
 
 
+run_config.request = "sawmod.json"
+
+
 def flatten(prefix, value, out):
     if isinstance(value, dict):
         for k, v in value.items():
@@ -63,6 +66,7 @@ def flatten(prefix, value, out):
 
 
 def run_job(worker, job, out):
+    run_config.request = job.get("request", "sawmod.json")   # a captured request in perf/
     configs = job["configs"]
     freqs = job.get("freqs", DEFAULT_FREQS)
     rounds = job.get("rounds", 2)
