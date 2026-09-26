@@ -20,7 +20,7 @@ To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-tes
   Checkpoint before it: tag `checkpoint-before-fused-images`.
 - Round 10 (in the app, not yet measured in-app): `ELIM_IMPLICIT` + `HOST_POOL`, 50-freq sweep
   0.807 → **0.653 s/freq**, maxrel 1.1e-7. **Estimated in-app 50-freq SAWMOD: ~34 s**
-  (41 − 50 × 0.15 × 0.94). Tag `metal-test-round10`.
+  (41 − 50 × 0.15 × 0.94). Tag `metal-test-round10`. **Measured in-app (rounds 7–10): 37.4 s.**
 - Code: this checkout, branch `perf/experiments`, pushed to the user's fork
   (`git push fork perf/experiments`, BumelantPZA/BEAT_Engine). **Never push to `origin`
   (JWSound).**
@@ -155,7 +155,8 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 | Explicit GC after each frequency (`BLAB_TEST_GC_MODE=young/full`, round 10) | young 2.4 ms but sweep 0.745 → 0.767; full 75 ms. The cost was page faults, not the collection |
 
 ## Next ideas (untested)
-First, **measure rounds 7–10 in the app**: ~34 s is an estimate, 51.2 s is the last measured value.
+Rounds 7–10 measured in-app: **37.4 s** (user, 2026-09-26; estimate was ~34 s, so the Revise-mode
+scaling of 0.94 overstates in-app gains by ~10%; harness 0.653 s/freq × 50 = 32.7 s + ~4.7 s app overhead).
 
 1. **FEM stage is critical (0.293).**
    - MUMPS factorization 0.238 is the floor (METIS, Accelerate; BLR/orderings/OpenBLAS slower).

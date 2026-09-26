@@ -11,6 +11,7 @@ itself is cheap (young collection 2.4 ms); the page faults were the cost. Accele
 thread gemms with 1–3 columns: row-chunk them over tasks (`perf/implicit_micro.jl`). User CPU is only
 ~0.8 s per 0.61 s iteration: BLAS stages are bound by the shared AMX units, not core count.
 Estimated in-app 50-freq SAWMOD: ~34 s (41 − 50 × 0.15 × 0.94). Both switches are in the app.
+**Measured in-app (rounds 7–10 together): 37.4 s** (was 51.2 s after round 6).
 
 ## Round 9 (2026-09-26): ideas from the CUDA backend, FEM stage
 | Change | Harness | maxrel |
