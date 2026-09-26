@@ -26,9 +26,11 @@ print(f"load {t1-t0:.2f} s  prepare {t2-t1:.2f} s  symmetry {project.symmetry}  
 import json
 import blab.solvers.coupled_backend as cb
 RAW = []
+FULL = []
 _orig = cb.system_frequency_result_from_dict
 def _capture(raw):
     RAW.append((time.perf_counter(), raw.get("diagnostics", {}).get("timings", {})))
+    FULL.append(raw)
     return _orig(raw)
 cb.system_frequency_result_from_dict = _capture
 backend = PhysicalSystemProductionBackend(bem_backend=BACKEND, julia_threads=threads)
@@ -49,5 +51,9 @@ for run in range(runs):
           f"steady {steady:.3f} s/freq  after last {done-freq[-1]:.2f} s  n={len(freq)}", flush=True)
     json.dump([{"t": t, **tm} for t, tm in RAW], open(f"/private/tmp/claude-501/-Users-aleksanderspitalniak-boundary-lab/4b9c8f71-9ea4-4b86-b7b8-1b0f0a794056/scratchpad/app_rows{run+1}.json", "w"))
     RAW.clear()
+    if os.environ.get("APP_TIMING_DUMP"):   # raw per-frequency results of the last run, for accuracy checks
+        import pickle
+        pickle.dump(list(FULL), open(os.environ["APP_TIMING_DUMP"], "wb"))
+    FULL.clear()
     for m in marks[:0]:
         if m[1] == "status": print(f"   {m[0]-start:7.2f} status {m[2][:90]}")

@@ -1,5 +1,5 @@
 diff --git a/src/blab/solvers/engine_distribution.py b/src/blab/solvers/engine_distribution.py
-index 40299fc..1401de1 100644
+index 40299fc..bb2e824 100644
 --- a/src/blab/solvers/engine_distribution.py
 +++ b/src/blab/solvers/engine_distribution.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 40299fc..1401de1 100644
  try:
      import beat_engine
  except ImportError as exc:
-@@ -12,4 +14,94 @@ from beat_engine import backend_catalog as backend_catalog
+@@ -12,4 +14,98 @@ from beat_engine import backend_catalog as backend_catalog
  from beat_engine import backend_info as engine_backend_info
  from beat_engine import engine_paths as engine_paths
  
@@ -92,6 +92,10 @@ index 40299fc..1401de1 100644
 +        # Round 11: the transducer interior solve (MUMPS expand, 0.011 s) runs beside the interface-mass
 +        # presolve in the FEM stage (bit-identical, 0.475 -> 0.468 s/freq).
 +        "BLAB_TEST_EXPAND_OVERLAP": "1",
++        # Round 12: MUMPS's factor workspace is a persistent per-solver buffer (WK_USER) instead of a fresh
++        # allocation whose pages fault in on every factorization (12.6k -> 3.0k faults). Bit-identical,
++        # SAWMOD 50-freq 0.467 -> 0.450 s/freq; Vented_Sub and compression_driver neutral.
++        "BLAB_TEST_MUMPS_WK": "1",
 +    }
 +}
 +

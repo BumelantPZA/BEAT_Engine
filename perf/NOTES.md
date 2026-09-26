@@ -359,3 +359,18 @@ upstream. If the app freezes again: `sample <pid> 3` and read the main thread an
   and the freeze fix).
 - This checkout: `git checkout -- src` and delete `perf/` (also removes the BLAB_TEST_BLAS and
   BLAB_TEST_ASM_TIMING hooks).
+
+## Round 12 (2026-09-26): extensive app-path tests, MUMPS workspace
+App path (`app_timing.py`, SAWMOD 50 freqs, warm): test 24.9 s (0.47 s/freq) vs stock Metal 131.4 s
+(2.61 s/freq), 5.3x. Cold first run: test 84.7 s (60.4 s to the first frequency), stock 181.6 s (53.1 s):
+the coupled solver is `include`d from source every worker start (only the exterior `solver.jl` has a
+precompiled bundle), so the first solve after an app start pays ~55-60 s of load and JIT.
+Accuracy test vs stock (complex pressure, 3 excitations x 7322 points): maxrel <= 1.0e-4 per frequency
+(20-100 Hz, stale-LU GMRES range), <= 3e-5 above; max |dB| 0.15 at near-null points at 15 kHz.
+Coil current 2.6e-5, diaphragm velocity 3.4e-6 (`scratchpad/cmp_raw.py`, APP_TIMING_DUMP=<pkl>).
+Per-frequency CPU: 1.2 s user + 0.15 s system per 0.42 s wall, 24k minor faults/freq; MUMPS alone
+faults its ~200 MB factor workspace in anew on every factorization (12.6k faults, 19 ms system).
+`BLAB_TEST_MUMPS_WK=1`: persistent WK_USER buffer per solver (INFO(8) x (1 + ICNTL(14)/100)).
+Micro (`perf/mumps_wk_micro.jl`): 233 -> 218 ms, 12.6k -> 3.0k faults. Harness bit-identical:
+SAWMOD 0.467 -> 0.450 s/freq (2 rounds), Vented_Sub 0.134 vs 0.135 (4 rounds, noise ±0.007),
+compression_driver 1.01x, proto2 (no MUMPS) 0.310 vs 0.308.

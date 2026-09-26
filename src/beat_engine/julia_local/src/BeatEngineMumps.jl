@@ -303,6 +303,7 @@ mutable struct MumpsSchurSolver
     factored::Bool
     analysis_count::Int
     factorization_count::Int
+    test_wk::Vector{ComplexF64}   # BLAB_TEST_MUMPS_WK: persistent WK_USER workspace
 end
 
 function MumpsSchurSolver(library::MumpsLibrary; threads::Int=mumps_threads())
@@ -314,7 +315,7 @@ function MumpsSchurSolver(library::MumpsLibrary; threads::Int=mumps_threads())
     _call!(library, s, -1)
     infog(s, 1) < 0 && error("MUMPS initialization failed: INFOG(1)=$(infog(s, 1)) INFOG(2)=$(infog(s, 2))")
     solver = MumpsSchurSolver(library, s, true, 0, Int[], Int[], Int[], Int[], Int32[], Int32[],
-        ComplexF64[], Int32[], ComplexF64[], threads, false, false, 0, 0)
+        ComplexF64[], Int32[], ComplexF64[], threads, false, false, 0, 0, ComplexF64[])
     _quiet!(s)
     LIVE_SOLVERS[solver] = nothing
     # A solver the owner forgot still returns its factors to the allocator eventually.
@@ -460,6 +461,24 @@ lower triangle.
 # Test hook (BLAB_TEST_HOST_POOL): `(T, m, n) -> Matrix{T}` for the Schur copy, or nothing.
 const _TEST_SCHUR_TAKE = Ref{Any}(nothing)
 
+# Test (BLAB_TEST_MUMPS_WK=1): MUMPS's main workspace S (the factors and the Schur block) is a buffer
+# kept per solver and passed as WK_USER, instead of MUMPS allocating it for every factorization and
+# the kernel faulting its pages in anew (SAWMOD FEM: 12.6k -> 3.0k faults, 233 -> 218 ms). Sized from
+# INFO(8) and ICNTL(14) after each analysis, so the -8/-9 retry below grows it. Freed with the solver.
+
+function _test_bind_wk!(solver::MumpsSchurSolver)
+    get(ENV, "BLAB_TEST_MUMPS_WK", "0") == "1" || return nothing
+    s = solver.struc
+    estimate = s.info[8] >= 0 ? Int(s.info[8]) : -Int(s.info[8]) * 1_000_000
+    need = ceil(Int, estimate * (1 + max(Int(icntl(s, 14)), 0) / 100))
+    need >= typemax(Int32) && (need = cld(need, 1_000_000) * 1_000_000)   # passed in millions
+    length(solver.test_wk) < need && (solver.test_wk = Vector{ComplexF64}(undef, need))
+    wk = solver.test_wk
+    s.wk_user = pointer(wk)
+    s.lwk_user = length(wk) < typemax(Int32) ? Int32(length(wk)) : Int32(-(length(wk) ÷ 1_000_000))
+    return nothing
+end
+
 function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; symmetry_tolerance::Real)
     solver.analysed || error("MUMPS factorization needs an analysis first.")
     values = nonzeros(matrix)
@@ -480,6 +499,7 @@ function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; sym
     attempts = 0
     test_t1 = time_ns()
     while true
+        _test_bind_wk!(solver)
         GC.@preserve solver _call!(solver.library, s, 2)
         status = infog(s, 1)
         # -8/-9: workspace estimate too small; relax it and retry a bounded number of times.
@@ -608,6 +628,9 @@ function mumps_release!(solver::MumpsSchurSolver)
     s.redrhs = C_NULL
     _call!(solver.library, s, -2)
     delete!(LIVE_SOLVERS, solver)
+    s.wk_user = C_NULL
+    s.lwk_user = Int32(0)
+    solver.test_wk = ComplexF64[]
     return nothing
 end
 
