@@ -952,7 +952,21 @@ function _mass_block_solve(block, rhs::AbstractMatrix)
             panel[row, column] = real(value)
             panel[row, columns + column] = imag(value)
         end
-        solved = block.factor \ panel
+        # Test (BLAB_TEST_MASS_THREADS=<n>): the columns in n chunks on parallel tasks. CHOLMOD's
+        # workspace is task-local and the solve only reads the factor; columns are independent,
+        # so the result is bit-identical.
+        tasks = something(tryparse(Int, get(ENV, "BLAB_TEST_MASS_THREADS", "1")), 1)
+        solved = if tasks > 1 && size(panel, 2) >= 2 * tasks
+            chunks = collect(Iterators.partition(1:size(panel, 2), cld(size(panel, 2), tasks)))
+            parts = map(chunk -> Threads.@spawn(block.factor \ panel[:, chunk]), chunks)
+            out = similar(panel)
+            for (chunk, part) in zip(chunks, parts)
+                out[:, chunk] = fetch(part)
+            end
+            out
+        else
+            block.factor \ panel
+        end
         result = Matrix{ComplexF64}(undef, rows, columns)
         @inbounds for column in 1:columns, row in 1:rows
             result[row, column] = complex(solved[row, column], solved[row, columns + column])
