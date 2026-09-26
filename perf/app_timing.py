@@ -16,9 +16,13 @@ if nfreq:
     import dataclasses
     project = dataclasses.replace(project, preferences=dataclasses.replace(project.preferences, freq_count=nfreq))
 t1 = time.perf_counter()
+if os.environ.get("APP_TIMING_SYMMETRY"):
+    import dataclasses
+    project = dataclasses.replace(project, symmetry=os.environ["APP_TIMING_SYMMETRY"])
 prepared = prepare_headless_solve(project, load_headless_solve_spec(None), backend_id=BACKEND)
 t2 = time.perf_counter()
-print(f"load {t1-t0:.2f} s  prepare {t2-t1:.2f} s", flush=True)
+print(f"load {t1-t0:.2f} s  prepare {t2-t1:.2f} s  symmetry {project.symmetry}  meshes",
+      [getattr(m, "file", None) or getattr(m, "name", "") for m in prepared.request.compiled_system.meshes], flush=True)
 import json
 import blab.solvers.coupled_backend as cb
 RAW = []
