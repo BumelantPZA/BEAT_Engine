@@ -374,3 +374,13 @@ faults its ~200 MB factor workspace in anew on every factorization (12.6k faults
 Micro (`perf/mumps_wk_micro.jl`): 233 -> 218 ms, 12.6k -> 3.0k faults. Harness bit-identical:
 SAWMOD 0.467 -> 0.450 s/freq (2 rounds), Vented_Sub 0.134 vs 0.135 (4 rounds, noise ±0.007),
 compression_driver 1.01x, proto2 (no MUMPS) 0.310 vs 0.308.
+
+### Round 13 (2026-09-27): per-step SAWMOD breakdown (harness, 50 freqs, MUMPS_WK on)
+Serial (EARLY_BUILD/FEM_LANE/PREFETCH off) 0.598 s/freq vs pipelined 0.465 (`queue/r13_steps.*`).
+Per step, serial (alone) / pipelined (contended), s: GPU BEM operators 0.246 / hidden; MUMPS
+factorization 0.180 / 0.233 (+30 %); MUMPS reduce 0.015 / 0.021, expand 0.014 / 0.018; Schur
+extraction 0.015 / 0.022; interface-mass solve 0.017 / 0.023; FEM system 0.006 / 0.007; FEM stage
+total 0.266 / 0.295; bem_matrix 0.020 / 0.026; block assembly 0.016 / 0.025; interface elimination
+0.014 / 0.018; dense F32 LU on fresh freqs (29/49) getrf 0.108 / 0.123 + convert 0.018 + stats 0.011 +
+isfinite 0.004; solve fresh 0.041 / 0.056, stale GMRES (20/49) 0.150 / 0.208; field 0.083 / 0.080.
+Pipelined critical chain: FEM stage 0.295 -> elimination ~0.02 -> LU 0.14 on fresh freqs.
