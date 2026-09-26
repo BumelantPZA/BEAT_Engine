@@ -2822,6 +2822,38 @@ function solve_request_impl(request; event_mode=false)
     process_blas_threads = BLAS.get_num_threads()
     prefetch_operators && !isnothing(prefetch_blas) && BLAS.set_num_threads(prefetch_blas)
     next_operators = nothing
+    # Test (BLAB_TEST_EARLY_BUILD=1, with BLAB_TEST_COUPLED_PREFETCH=1): frequency i+1's whole build
+    # (condensation, elimination, dense LU) starts as a task right after frequency i's solve, i.e.
+    # after i's last MUMPS call, and overlaps i's field and output. Its GPU operators were prefetched
+    # during i's host stages; i's field waits for them, and GPU(i+2) waits for i's field, so no GPU
+    # work ever runs next to a field evaluation (Round 5: that gives wrong results).
+    test_early_build = prefetch_operators && get(ENV, "BLAB_TEST_EARLY_BUILD", "0") == "1" && !rom_requested &&
+                       isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing))
+    test_next_build = nothing
+    test_field_done = nothing
+    test_gpu_next = nothing
+    test_build_at = (index, prefetched_ops, on_ready) -> build_condensed_coupled_system(
+        fem_mesh,
+        bem_mesh,
+        interface_map,
+        FloatType(request["frequencies_hz"][index]),
+        sound_speed,
+        density;
+        quadrature_order=quadrature_order,
+        regular_quadrature_order=quadrature_selections[index].order,
+        singular_order=singular_order,
+        cache=coupled_cache,
+        validation_diagnostics=validation_diagnostics,
+        symmetry_mode=symmetry_mode,
+        bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
+        wall_impedances=fem_domains.wall_impedances,
+        transducers=transducers,
+        transducer_operators=transducer_operators,
+        prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
+        allow_transducer_condensation=true,
+        prefetched_operators=prefetched_ops,
+        on_operators_ready=on_ready,
+    )
     try
         # Test instrumentation: the previous frequency's emit/release and whole-iteration wall + GC,
         # reported one frequency late as `test_prev_*` timings.
@@ -2840,8 +2872,11 @@ function solve_request_impl(request; event_mode=false)
             frequency_hz = FloatType(frequency_value)
             println(stderr, "Coupled $(precision_name)/$(bem_backend): assembling $(frequency_hz) Hz")
             assembly_started = time_ns()
+            test_early_system = test_next_build
+            test_next_build = nothing
             prefetched = next_operators
-            next_operators = nothing
+            # Early build: next_operators is GPU(i+2), set by build(i+1)'s callback; keep it.
+            isnothing(test_early_system) && (next_operators = nothing)
             frequencies_all = request["frequencies_hz"]
             spawn_next = if prefetch_operators && frequency_index < length(frequencies_all)
                 next_index = frequency_index + 1
@@ -2852,7 +2887,14 @@ function solve_request_impl(request; event_mode=false)
             else
                 nothing
             end
-            coupled_system = if use_condensed_solver
+            coupled_system = if !isnothing(test_early_system)
+                try
+                    fetch(test_early_system)
+                catch exception
+                    exception isa TaskFailedException || rethrow()
+                    rethrow(exception.task.result)
+                end
+            elseif use_condensed_solver
                 build_condensed_coupled_system(
                     fem_mesh,
                     bem_mesh,
@@ -2921,6 +2963,28 @@ function solve_request_impl(request; event_mode=false)
                         ) :
                         solve_coupled_excitations(coupled_system, excitations)
             solve_s = (time_ns() - solve_started) / 1.0e9
+            test_gpu_next = nothing
+            if test_early_build && frequency_index < length(request["frequencies_hz"]) && !isnothing(next_operators)
+                test_gpu_next = next_operators          # GPU(i+1), spawned while building i
+                next_operators = nothing
+                test_field_done = Base.Event()
+                test_gate = test_field_done
+                test_next_index = frequency_index + 1
+                test_on_ready = if test_next_index < length(request["frequencies_hz"])
+                    () -> (next_operators = Threads.@spawn begin
+                        wait(test_gate)
+                        condensed_metal_operators(
+                            coupled_cache, bem_mesh, FloatType(request["frequencies_hz"][test_next_index + 1]),
+                            sound_speed;
+                            quadrature_order=quadrature_selections[test_next_index + 1].order,
+                            singular_order=singular_order,
+                        )
+                    end)
+                else
+                    nothing
+                end
+                test_next_build = Threads.@spawn test_build_at(test_next_index, test_gpu_next, test_on_ready)
+            end
             test_interface_errors_started = time_ns()
             interface_error_sets = [
                 per_interface_errors(
@@ -2942,6 +3006,12 @@ function solve_request_impl(request; event_mode=false)
                 for index in eachindex(interfaces)
             ]
             test_interface_errors_s = (time_ns() - test_interface_errors_started) / 1.0e9
+            if !isnothing(test_gpu_next)
+                try
+                    wait(test_gpu_next)
+                catch
+                end
+            end
             test_quantities_started = time_ns()
             field_s = 0.0
             quantities = Dict{String,Any}[]
@@ -3453,6 +3523,7 @@ function solve_request_impl(request; event_mode=false)
                 "test_quantities_other_s" => (time_ns() - test_quantities_started) / 1.0e9 - field_s,
                 "test_pre_emit_wall_s" => (time_ns() - test_iteration_started) / 1.0e9,
             ), test_prev_tail)
+            isnothing(test_field_done) || notify(test_field_done)
             if validation_diagnostics
                 diagnostics["relative_residual"] = maximum(solution.relative_residual for solution in solutions)
                 diagnostics["all_bem_replay_error"] = maximum(
@@ -3499,6 +3570,13 @@ function solve_request_impl(request; event_mode=false)
         end
     finally
         GC.enable(true)   # BLAB_TEST_GC_DEFER may have left it off on an error
+        isnothing(test_field_done) || notify(test_field_done)
+        if test_next_build !== nothing
+            try
+                release_condensed_coupled_system!(fetch(test_next_build))
+            catch
+            end
+        end
         if next_operators !== nothing
             try
                 BeatEngineCoupledCondensed.release_operator_storage!(fetch(next_operators).operators)

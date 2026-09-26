@@ -1,5 +1,26 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
+## Round 6 (2026-09-26) — Fable plan (beat-engine-fable/fable/PLAN.md) — START HERE
+Best config so far = app + BLAB_TEST_GC_DEFER=1 + BLAB_TEST_BLOCKED_LU=512:
+**1.224 -> 1.084 s/freq (1.13x)**, 12 freqs, Revise mode, maxrel 1.3e-7. Not yet in the app.
+Timer corrections (the handoff table double-counted): block_assembly_s CONTAINS
+interface_elimination_s (pure assembly ~0.01); fem_schur_extraction_s CONTAINS
+fem_transducer_solves_s. New timers: interface_elim_lu_{isfinite,stats,convert,getrf}_s and
+test_prev_{gc_s,gc_pauses,alloc_gb,iteration_wall_s,emit_s}.
+| idea (Fable)                          | result |
+| I1 implicit dense matrix             | dead: assembly 0.01, LU glue 0.024 (getrf is 0.19 of 0.21) |
+| I3 output stage                      | dead: errors/quantities/emit/release ~1 ms. "Overhead" = per-request setup at freq 1 |
+| GC (found by timers)                 | 1.1 GB/freq, 5 pauses, 0.12-0.16 s. GC_DEFER=1 (GC off during a freq, one collection after): -0.05 s/freq, exact |
+| I7 blocked LU (cgemm trailing update) | BLOCKED_LU=512: getrf 0.19 -> 0.12, refinement 1.5 -> 2 steps, -0.085 s/freq, maxrel 1.3e-7. perf/lu_micro.jl: cgetrf 0.3 TFLOP/s, blocked 0.6, cgemm 2.0. I7(b) LAPACK binding: already $NEWLAPACK |
+| I2 early build (EARLY_BUILD=1 + PREFETCH=1) | exact, no crash, but 1.13 vs 1.085: only takes the field off the path; condensation/elim/LU ~15% slower next to GPU(i+2). Off |
+| I6 split-precision elimination (ELIM_SPLIT=1) | dead: maxrel 2.7e-4 = F32 accumulation (cancellation), not input rounding |
+| I5 MUMPS triangle check              | dead: all(iszero) short-circuits on the first upper entry |
+Budget now (s/freq): first half 0.47 (GPU 0.42+bm 0.05 tied with condensation 0.47) + elim 0.15
++ LU 0.15 + solve 0.08 + field 0.09 + per-request setup ~0.1 (12 freqs; less at 50).
+Still open from the plan: I8 (previous LU as GMRES preconditioner, skips the LU at low f),
+I4 + MUMPS settings (both first-half branches must shrink together), I9 panel LU before S.
+
+
 ## Round 5 (2026-09-26) — START HERE
 Checkpoint: git tag `metal-test-58s` (branch perf/experiments, pushed to the user's fork
 BumelantPZA/BEAT_Engine) = the round-3 code the app ran at 58 s. Later commits build on it.

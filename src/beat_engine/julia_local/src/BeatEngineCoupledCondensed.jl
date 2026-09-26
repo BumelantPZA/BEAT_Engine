@@ -885,7 +885,7 @@ function _flux_block_products!(coupled, rows, columns_of_gamma, operator, schur_
         coupling_columns = block.contiguous ?
                            view(interface_block, :, first(block.dofs):last(block.dofs)) :
                            interface_block[:, block.dofs]
-        block_coupling = _split_timed!(() -> coupling_columns * schur_block, split, :product)
+        block_coupling = _split_timed!(() -> _test_product(coupling_columns, schur_block), split, :product)
         _split_timed!(split, :scatter) do
             for (local_column, column) in enumerate(block.rows)
                 @views coupled[rows, columns_of_gamma[column]] .+= block_coupling[:, local_column]
@@ -893,6 +893,18 @@ function _flux_block_products!(coupled, rows, columns_of_gamma, operator, schur_
         end
     end
     return coupled
+end
+
+# Test (BLAB_TEST_ELIM_SPLIT=1): a ComplexF32 BEM block times a ComplexF64 W as two cgemms,
+# B*W_hi + B*W_lo with W_hi = F32(W), W_lo = F32(W - W_hi). The inputs are then exact to ~1e-14;
+# only the Float32 accumulation error remains. Not bit-identical.
+_test_product(a, b) = a * b
+function _test_product(a::AbstractMatrix{ComplexF32}, b::AbstractMatrix{ComplexF64})
+    high = ComplexF32.(b)
+    low = ComplexF32.(b .- high)
+    result = ComplexF64.(a * high)
+    result .+= ComplexF64.(a * low)
+    return result
 end
 
 """
@@ -2166,6 +2178,11 @@ function build_condensed_coupled_system(
                 _flux_block_products!(
                     coupled, bem_range, bem_columns, mass_operator, [ComplexF32.(block) for block in presolve.schur_blocks],
                     bem_interface_block, elimination_split,
+                )
+            elseif get(ENV, "BLAB_TEST_ELIM_SPLIT", "0") == "1" && eltype(bem_interface_block) === ComplexF32
+                _flux_block_products!(
+                    coupled, bem_range, bem_columns, mass_operator, presolve.schur_blocks, bem_interface_block,
+                    elimination_split,
                 )
             else
                 _flux_block_products!(
