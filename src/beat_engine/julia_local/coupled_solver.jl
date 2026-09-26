@@ -60,6 +60,10 @@ function test_apply_blas!()
     # BLAB_MUMPS_THREADS applies again).
     mode = requested in ("accelerate", "hybrid") ? requested : "openblas"
     mode == TEST_BLAS_MODE[] && return
+    # Load MUMPS first: OpenBLAS32's lazy library forwards itself into libblastrampoline on its first
+    # dlopen, so loaded after the forward below it would put MUMPS's LP64 calls back on OpenBLAS32
+    # (the app hit this, the harness did not: its warmup loads MUMPS before any test_env applies).
+    mode == "openblas" || BeatEngineCoupledCondensed.BeatEngineMumps.mumps_library()
     if isnothing(TEST_BLAS_STARTUP[])
         TEST_BLAS_STARTUP[] = (libs=[l.libname for l in BLAS.get_config().loaded_libs],
                                threads=BLAS.get_num_threads())
