@@ -8,7 +8,7 @@
 | `STALE_REUSE=12` + `STALE_STOP=12` | 0.942 (worse) | |
 Offline GMRES iterations with the previous freq's LU (ratio 1.151): 5–6 at 40–53 Hz, 12–13 at
 0.7–0.9 kHz, 45–59 at 6–8 kHz; two steps stale: 7–8, 17–18, 55+. Both switches are in the app.
-Details in HANDOFF.md.
+Estimated in-app 50-freq SAWMOD: 51.2 → ~48 s (FAST_TRS ≈ −1.3 s, STALE_LU ≈ −1.5 s). Details in HANDOFF.md.
 
 ## Round 6 (2026-09-26) — Fable plan (beat-engine-fable/fable/PLAN.md). Handoff: perf/HANDOFF.md — START HERE
 Best config so far = app + BLAB_TEST_GC_DEFER=1 + BLAB_TEST_BLOCKED_LU=512:
