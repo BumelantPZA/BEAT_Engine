@@ -384,3 +384,23 @@ total 0.266 / 0.295; bem_matrix 0.020 / 0.026; block assembly 0.016 / 0.025; int
 0.014 / 0.018; dense F32 LU on fresh freqs (29/49) getrf 0.108 / 0.123 + convert 0.018 + stats 0.011 +
 isfinite 0.004; solve fresh 0.041 / 0.056, stale GMRES (20/49) 0.150 / 0.208; field 0.083 / 0.080.
 Pipelined critical chain: FEM stage 0.295 -> elimination ~0.02 -> LU 0.14 on fresh freqs.
+
+### Round 13b (2026-09-27): MUMPS study (the FEM stage is the critical chain)
+Micros on the SAWMOD FEM dump (`perf/mumps_param_micro.jl`, `mumps_loop_micro.jl`, `cmumps/`):
+- Profile (`sample`): MUMPS 97 % of the loop; zgemm 41 %, ztrsm 24 % (half in Accelerate's
+  dispatch_apply), front assembly 14 %, stack/copies 8 %. 4.19 GFLOP in 0.18 s = 23 GFLOP/s.
+- Orderings: METIS (auto) 4.19 GFLOP / 0.18 s; AMD, AMF, SCOTCH, PORD, QAMD all 7.77 GFLOP / 0.25 s.
+- BLR (ICNTL(35)=2, CNTL(7) 1e-12..1e-6): 0.27-0.34 s, slower (fronts too small).
+- KEEP(3..6) blocking sweeps: +-2 ms. VECLIB_MAXIMUM_THREADS 2/4/6 = default, 1 slower (0.21).
+- ztrsm and/or zgemm on OpenBLAS32 via lbt_set_forward: 0.196-0.229 s, slower.
+- BLAB_MUMPS_THREADS only sets OpenBLAS's pool: with Accelerate forwarded it does nothing.
+- Contention in the pipeline: MUMPS(i) 0.271 s when frequency i-1 ran a stale-LU GMRES solve beside
+  it (0.19 s, ~9 its), 0.203 s after a fresh solve, 0.183 alone. The GMRES streams the Float64
+  3116^2 matrix (155 MB) per iteration.
+- `BLAB_TEST_MUMPS_SINGLE=1` (cmumps, CMumpsStruc mirror, offsets from perf/cmumps/offsets.c):
+  factorization 0.186 -> 0.100 s, Schur maxrel 2.2e-7 at the dump frequency. Pipeline 0.455 ->
+  0.428 s/freq only (the GPU lane, operators 0.25 + field 0.08, then limits: bem_operator wait
+  0.11 -> 0.22), and outputs maxrel 3e-3 at 20 Hz, 2e-4..9e-4 through 60 Hz-1.2 kHz, < 1e-5 only
+  above 10 kHz (low-frequency cancellation in the Schur complement). Rejected; left off by default.
+Conclusion: MUMPS is at its floor in double precision; the pipeline is now balanced between the CPU
+chain (~0.45) and the GPU lane (~0.33 + interlocks), so the next gain needs the GPU BEM kernel too.

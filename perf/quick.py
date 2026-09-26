@@ -99,6 +99,14 @@ def run_job(worker, job, out):
             err = max(np.linalg.norm(outputs[k] - reference[k]) / max(np.linalg.norm(reference[k]), 1e-30)
                       for k in reference)
             worst[name] = max(worst.get(name, 0.0), err)
+            if job.get("detail") and outputs is not reference:   # the worst outputs, as name@freq
+                per = sorted(((np.linalg.norm(outputs[k] - reference[k]) / max(np.linalg.norm(reference[k]), 1e-30), k)
+                              for k in reference), reverse=True)
+                lines.append(f"  {name} worst: " + "  ".join(f"{k} {e:.1e}" for e, k in per[:8]))
+                by_freq = {}
+                for e, k in per:
+                    by_freq[k.split("@")[1]] = max(by_freq.get(k.split("@")[1], 0.0), e)
+                lines.append(f"  {name} by freq: " + "  ".join(f"{f}:{e:.0e}" for f, e in sorted(by_freq.items(), key=lambda t: float(t[0]))))
             lines.append(f"round {round_index + 1} {name:14s} {per_freq:.3f} s/freq")
             out.write_text("\n".join(lines) + "\n")
     base = statistics.median(walls[next(iter(configs))])

@@ -149,29 +149,57 @@ const C_LAYOUT = (
     instance_number=10916,
 )
 
-function layout_mismatches()
+# Test (BLAB_TEST_MUMPS_SINGLE=1): `CMUMPS_STRUC_C`, the single-precision (complex Float32) twin of the
+# struct above: every Float64 becomes Float32 and every ComplexF64 pointer a ComplexF32 one.
+_single_type(T) = T === Float64 ? Float32 :
+                  T === ComplexF64 ? ComplexF32 :
+                  T <: Ptr ? Ptr{_single_type(eltype(T))} :
+                  T <: Tuple && !isempty(T.parameters) && allequal(T.parameters) ?
+                  NTuple{length(T.parameters),_single_type(T.parameters[1])} : T
+@eval mutable struct CMumpsStruc
+    $([:($(name)::$(_single_type(fieldtype(ZMumpsStruc, name)))) for name in fieldnames(ZMumpsStruc)]...)
+    function CMumpsStruc()
+        s = new()
+        ccall(:memset, Ptr{Cvoid}, (Ptr{Cvoid}, Cint, Csize_t), pointer_from_objref(s), 0, sizeof(CMumpsStruc))
+        return s
+    end
+end
+const MumpsStrucT = Union{ZMumpsStruc,CMumpsStruc}
+# From a C compiler on MUMPS 5.9.1's cmumps_c.h (perf/cmumps/offsets.c).
+const C_LAYOUT_SINGLE = (
+    sizeof=9624,
+    icntl=16, keep=256, cntl=2256, dkeep=2316, keep8=3240, n=4440, nnz=4456, irn=4464, a=4480,
+    colsca_from_mumps=4616, rowind=4640, rhs=4664, nrhs=4760, ld_rhsintr=4820, info=4824,
+    infog=5144, rinfog=5624, nb_singular_values=5808, size_schur=5812, listvar_schur=5816,
+    schur=5824, wk_user=5832, version_number=5840, lwk_user=8176, metis_options=9460,
+    instance_number=9620,
+)
+_real_type(::ZMumpsStruc) = Float64
+_real_type(::CMumpsStruc) = Float32
+_complex_type(s::MumpsStrucT) = Complex{_real_type(s)}
+_test_single() = get(ENV, "BLAB_TEST_MUMPS_SINGLE", "0") == "1"
+
+function layout_mismatches(S::Type=ZMumpsStruc, layout=S === ZMumpsStruc ? C_LAYOUT : C_LAYOUT_SINGLE)
     mismatches = String[]
-    sizeof(ZMumpsStruc) == C_LAYOUT.sizeof ||
-        push!(mismatches, "sizeof $(sizeof(ZMumpsStruc)) != $(C_LAYOUT.sizeof)")
-    for name in keys(C_LAYOUT)
+    sizeof(S) == layout.sizeof || push!(mismatches, "sizeof $(sizeof(S)) != $(layout.sizeof)")
+    for name in keys(layout)
         name == :sizeof && continue
-        offset = fieldoffset(ZMumpsStruc, Base.fieldindex(ZMumpsStruc, name))
-        offset == getfield(C_LAYOUT, name) ||
-            push!(mismatches, "$name at $offset != $(getfield(C_LAYOUT, name))")
+        offset = fieldoffset(S, Base.fieldindex(S, name))
+        offset == getfield(layout, name) || push!(mismatches, "$name at $offset != $(getfield(layout, name))")
     end
     return mismatches
 end
 
-_field_pointer(s::ZMumpsStruc, name::Symbol, ::Type{T}) where {T} =
-    Ptr{T}(pointer_from_objref(s) + fieldoffset(ZMumpsStruc, Base.fieldindex(ZMumpsStruc, name)))
+_field_pointer(s::MumpsStrucT, name::Symbol, ::Type{T}) where {T} =
+    Ptr{T}(pointer_from_objref(s) + fieldoffset(typeof(s), Base.fieldindex(typeof(s), name)))
 
-function set_icntl!(s::ZMumpsStruc, index::Integer, value::Integer)
+function set_icntl!(s::MumpsStrucT, index::Integer, value::Integer)
     GC.@preserve s unsafe_store!(_field_pointer(s, :icntl, Int32), Int32(value), index)
     return s
 end
-icntl(s::ZMumpsStruc, index::Integer) = s.icntl[index]
-infog(s::ZMumpsStruc, index::Integer) = s.infog[index]
-version_string(s::ZMumpsStruc) = String(UInt8[c for c in s.version_number if c != 0x00]) |> strip
+icntl(s::MumpsStrucT, index::Integer) = s.icntl[index]
+infog(s::MumpsStrucT, index::Integer) = s.infog[index]
+version_string(s::MumpsStrucT) = String(UInt8[c for c in s.version_number if c != 0x00]) |> strip
 
 struct MumpsLibrary
     available::Bool
@@ -179,6 +207,7 @@ struct MumpsLibrary
     zmumps_c::Ptr{Cvoid}
     set_blas_threads::Ptr{Cvoid}
     version::String
+    cmumps_c::Ptr{Cvoid}   # BLAB_TEST_MUMPS_SINGLE; C_NULL when absent or its layout check fails
 end
 
 const LIBRARY = Ref{Union{Nothing,MumpsLibrary}}(nothing)
@@ -199,7 +228,7 @@ function mumps_threads()
 end
 
 function _unavailable(reason)
-    return MumpsLibrary(false, reason, C_NULL, C_NULL, "")
+    return MumpsLibrary(false, reason, C_NULL, C_NULL, "", C_NULL)
 end
 
 """
@@ -250,15 +279,20 @@ function _load_library()
     set_threads = Libdl.dlsym_e(openblas_handle, :openblas_set_num_threads)
     mumps_handle = Libdl.dlopen(mumps_path)
     zmumps_c = Libdl.dlsym(mumps_handle, :zmumps_c)
+    cmumps_c = C_NULL
+    if isempty(layout_mismatches(CMumpsStruc))
+        cmumps_path = Base.invokelatest(getproperty, mumps_module, :libcmumps_path)
+        cmumps_c = something(Libdl.dlsym_e(Libdl.dlopen(cmumps_path), :cmumps_c), C_NULL)
+    end
 
-    library = MumpsLibrary(true, "", zmumps_c, set_threads, "")
+    library = MumpsLibrary(true, "", zmumps_c, set_threads, "", cmumps_c)
     version, error_message = _self_test(library)
     isempty(error_message) || return _unavailable("self-test failed: " * error_message)
     if !ATEXIT_REGISTERED[]
         atexit(_release_live_solvers)
         ATEXIT_REGISTERED[] = true
     end
-    return MumpsLibrary(true, "", zmumps_c, set_threads, version)
+    return MumpsLibrary(true, "", zmumps_c, set_threads, version, cmumps_c)
 end
 
 function _release_live_solvers()
@@ -271,9 +305,10 @@ function _release_live_solvers()
     return nothing
 end
 
-function _call!(library::MumpsLibrary, s::ZMumpsStruc, job::Integer)
+function _call!(library::MumpsLibrary, s::MumpsStrucT, job::Integer)
     s.job = Int32(job)
-    GC.@preserve s ccall(library.zmumps_c, Cvoid, (Ptr{ZMumpsStruc},), pointer_from_objref(s))
+    entry = s isa CMumpsStruc ? library.cmumps_c : library.zmumps_c
+    GC.@preserve s ccall(entry, Cvoid, (Ptr{Cvoid},), pointer_from_objref(s))
     return s
 end
 
@@ -286,7 +321,7 @@ the lower-triangle extraction map from the caller's full CSC matrix.
 """
 mutable struct MumpsSchurSolver
     library::MumpsLibrary
-    struc::ZMumpsStruc
+    struc::MumpsStrucT
     initialized::Bool
     n::Int
     colptr::Vector{Int}
@@ -295,20 +330,21 @@ mutable struct MumpsSchurSolver
     mirror_positions::Vector{Int}
     irn::Vector{Int32}
     jcn::Vector{Int32}
-    values::Vector{ComplexF64}
+    values::Union{Vector{ComplexF64},Vector{ComplexF32}}
     schur_variables::Vector{Int32}
-    schur_buffer::Vector{ComplexF64}
+    schur_buffer::Union{Vector{ComplexF64},Vector{ComplexF32}}
     threads::Int
     analysed::Bool
     factored::Bool
     analysis_count::Int
     factorization_count::Int
-    test_wk::Vector{ComplexF64}   # BLAB_TEST_MUMPS_WK: persistent WK_USER workspace
+    test_wk::Union{Vector{ComplexF64},Vector{ComplexF32}}   # BLAB_TEST_MUMPS_WK: persistent WK_USER workspace
 end
 
-function MumpsSchurSolver(library::MumpsLibrary; threads::Int=mumps_threads())
+function MumpsSchurSolver(library::MumpsLibrary; threads::Int=mumps_threads(),
+                          single::Bool=_test_single() && library.cmumps_c != C_NULL)
     library.available || error("MUMPS is unavailable: $(library.reason)")
-    s = ZMumpsStruc()
+    s = single ? CMumpsStruc() : ZMumpsStruc()
     s.sym = 2
     s.par = 1
     s.comm_fortran = USE_COMM_WORLD
@@ -323,7 +359,7 @@ function MumpsSchurSolver(library::MumpsLibrary; threads::Int=mumps_threads())
     return solver
 end
 
-function _quiet!(s::ZMumpsStruc)
+function _quiet!(s::MumpsStrucT)
     set_icntl!(s, 1, -1)   # error messages
     set_icntl!(s, 2, -1)   # diagnostics
     set_icntl!(s, 3, -1)   # global information
@@ -349,11 +385,11 @@ function _quiet!(s::ZMumpsStruc)
     return s
 end
 
-_test_get_cntl(s::ZMumpsStruc, index::Integer) =
-    GC.@preserve s unsafe_load(_field_pointer(s, :cntl, Float64), index)
+_test_get_cntl(s::MumpsStrucT, index::Integer) =
+    GC.@preserve s Float64(unsafe_load(_field_pointer(s, :cntl, _real_type(s)), index))
 
-_test_set_cntl!(s::ZMumpsStruc, index::Integer, value::Real) =
-    GC.@preserve s unsafe_store!(_field_pointer(s, :cntl, Float64), Float64(value), index)
+_test_set_cntl!(s::MumpsStrucT, index::Integer, value::Real) =
+    GC.@preserve s unsafe_store!(_field_pointer(s, :cntl, _real_type(s)), _real_type(s)(value), index)
 
 function _check(solver::MumpsSchurSolver, phase::AbstractString)
     status = infog(solver.struc, 1)
@@ -421,9 +457,9 @@ function mumps_analyse!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC, schur
     solver.mirror_positions = mirror
     solver.irn = irn
     solver.jcn = jcn
-    solver.values = zeros(ComplexF64, length(lower))
+    solver.values = zeros(_complex_type(solver.struc), length(lower))
     solver.schur_variables = variables
-    solver.schur_buffer = zeros(ComplexF64, length(variables)^2)
+    solver.schur_buffer = zeros(_complex_type(solver.struc), length(variables)^2)
     s = solver.struc
     s.n = Int32(n)
     s.nnz = Int64(length(lower))
@@ -472,7 +508,7 @@ function _test_bind_wk!(solver::MumpsSchurSolver)
     estimate = s.info[8] >= 0 ? Int(s.info[8]) : -Int(s.info[8]) * 1_000_000
     need = ceil(Int, estimate * (1 + max(Int(icntl(s, 14)), 0) / 100))
     need >= typemax(Int32) && (need = cld(need, 1_000_000) * 1_000_000)   # passed in millions
-    length(solver.test_wk) < need && (solver.test_wk = Vector{ComplexF64}(undef, need))
+    length(solver.test_wk) < need && (solver.test_wk = Vector{_complex_type(s)}(undef, need))
     wk = solver.test_wk
     s.wk_user = pointer(wk)
     s.lwk_user = length(wk) < typemax(Int32) ? Int32(length(wk)) : Int32(-(length(wk) ÷ 1_000_000))
@@ -489,10 +525,10 @@ function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; sym
             abs(value - mirror) <= symmetry_tolerance * max(abs(value), abs(mirror)) ||
                 error("MUMPS SYM=2 needs a complex-symmetric matrix; entry ($(solver.irn[index]), $(solver.jcn[index])) differs from its transpose.")
         end
-        solver.values[index] = ComplexF64(value)
+        solver.values[index] = value
     end
     test_t0 = time_ns()
-    fill!(solver.schur_buffer, zero(ComplexF64))
+    fill!(solver.schur_buffer, zero(eltype(solver.schur_buffer)))
     s = solver.struc
     _bind_arrays!(solver)
     _set_blas_threads(solver)
@@ -533,8 +569,9 @@ function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; sym
     m = length(solver.schur_variables)
     # Test (BLAB_TEST_HOST_POOL): the parent module's pool supplies the copy's storage.
     take = _TEST_SCHUR_TAKE[]
-    schur = isnothing(take) ? copy(reshape(solver.schur_buffer, m, m)) :
-            copyto!(take(eltype(solver.schur_buffer), m, m), reshape(solver.schur_buffer, m, m))
+    # Always a ComplexF64 copy (BLAB_TEST_MUMPS_SINGLE widens the Float32 Schur here).
+    schur = isnothing(take) ? Matrix{ComplexF64}(reshape(solver.schur_buffer, m, m)) :
+            copyto!(take(ComplexF64, m, m), reshape(solver.schur_buffer, m, m))
     # MUMPS 5.9 returns the full matrix for SYM=2 with ICNTL(19)=3; older releases returned one
     # triangle. Complete it from the lower triangle if the strict upper part came back empty.
     if m > 1 && all(iszero, (schur[i, j] for j in 2:m for i in 1:(j-1))) &&
@@ -559,12 +596,20 @@ function _solve_phase!(solver::MumpsSchurSolver, rhs::Matrix{ComplexF64}, reduce
     s.lredrhs = Int32(length(solver.schur_variables))
     set_icntl!(s, 26, mode)
     _set_blas_threads(solver, mumps_solve_threads())
-    GC.@preserve solver rhs reduced begin
-        s.rhs = pointer(rhs)
-        s.redrhs = pointer(reduced)
+    # BLAB_TEST_MUMPS_SINGLE: the single-precision library solves Float32 copies.
+    single = s isa CMumpsStruc
+    rhs_c = single ? ComplexF32.(rhs) : rhs
+    reduced_c = single ? ComplexF32.(reduced) : reduced
+    GC.@preserve solver rhs_c reduced_c begin
+        s.rhs = pointer(rhs_c)
+        s.redrhs = pointer(reduced_c)
         _call!(solver.library, s, 3)
         s.rhs = C_NULL
         s.redrhs = C_NULL
+    end
+    if single
+        rhs .= rhs_c
+        reduced .= reduced_c
     end
     set_icntl!(s, 26, 0)
     _check(solver, "solve (ICNTL(26)=$mode)")
