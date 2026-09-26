@@ -209,6 +209,32 @@ mutable struct RefinedDenseLU
     iterations::Int
     fallback_reason::Union{Nothing,String}
     backward_error::Float64
+    stale::Bool   # test (BLAB_TEST_STALE_LU): `factor` belongs to an earlier frequency
+end
+
+# Test (BLAB_TEST_STALE_LU=<cap>): the last fresh ComplexF32 factor of this request, reused as a
+# GMRES preconditioner for later frequencies while the previous stale solve needed at most
+# BLAB_TEST_STALE_REUSE (default 8) iterations. A stale solve that has not reached the Float64
+# backward error after `cap` iterations factors afresh and disables reuse for the rest of the
+# request (the sweep ascends; iterations grow with frequency). The driver resets it per request.
+mutable struct _TestStaleState
+    factor::Union{Nothing,LinearAlgebra.LU{ComplexF32,Matrix{ComplexF32},Vector{LinearAlgebra.BlasInt}}}
+    last_iterations::Int
+    disabled::Bool
+end
+const _TEST_STALE = _TestStaleState(nothing, 0, false)
+_test_stale_cap() = something(tryparse(Int, get(ENV, "BLAB_TEST_STALE_LU", "0")), 0)
+# BLAB_TEST_STALE_LOG=<file>: one line per stale/fresh decision.
+function _test_stale_log(message)
+    path = get(ENV, "BLAB_TEST_STALE_LOG", "")
+    isempty(path) || open(io -> println(io, message), path, "a")
+    return nothing
+end
+function _test_stale_reset!()
+    _TEST_STALE.factor = nothing
+    _TEST_STALE.last_iterations = 0
+    _TEST_STALE.disabled = false
+    return nothing
 end
 
 # Test (BLAB_TEST_DENSE_STATS, default on): `opnorm(matrix, Inf)` and `maximum(abs, matrix)` in one
@@ -315,22 +341,103 @@ function RefinedDenseLU(matrix::Matrix{ComplexF64})
     matrix_norm, max_entry = get(ENV, "BLAB_TEST_DENSE_STATS", "1") == "1" ?
                              _dense_abs_stats(matrix) : (opnorm(matrix, Inf), maximum(abs, matrix; init=0.0))
     _TEST_LU_SPLIT[:stats] = (time_ns() - t) / 1.0e9; t = time_ns()
-    refined = RefinedDenseLU(matrix, matrix_norm, nothing, nothing, 0, nothing, NaN)
+    refined = RefinedDenseLU(matrix, matrix_norm, nothing, nothing, 0, nothing, NaN, false)
+    stale = _TEST_STALE
     if max_entry > floatmax(Float32)
         _dense_fall_back!(refined, "an entry is outside the Float32 range")
+    elseif _test_stale_cap() > 0 && !stale.disabled && !isnothing(stale.factor) &&
+           size(stale.factor.factors) == size(matrix) &&
+           stale.last_iterations <= something(tryparse(Int, get(ENV, "BLAB_TEST_STALE_REUSE", "8")), 8)
+        refined.factor = stale.factor
+        refined.stale = true
+        _TEST_LU_SPLIT[:stale] = 1.0
     else
-        narrowed = ComplexF32.(matrix)
+        _test_fresh_factor!(refined)
+    end
+    return refined
+end
+
+function _test_fresh_factor!(refined::RefinedDenseLU)
+    t = time_ns()
+    begin
+        narrowed = ComplexF32.(refined.matrix)
         _TEST_LU_SPLIT[:convert] = (time_ns() - t) / 1.0e9; t = time_ns()
         blocked_nb = something(tryparse(Int, get(ENV, "BLAB_TEST_BLOCKED_LU", "0")), 0)
         candidate = blocked_nb > 0 ? _test_blocked_lu!(narrowed, blocked_nb) : lu!(narrowed; check=false)
         _TEST_LU_SPLIT[:getrf] = (time_ns() - t) / 1.0e9; t = time_ns()
+        _test_stale_log("STALE fresh")
         if issuccess(candidate) && all(isfinite, candidate.factors)
             refined.factor = candidate
+            refined.stale = false
+            if _test_stale_cap() > 0
+                _TEST_STALE.factor = candidate
+                _TEST_STALE.last_iterations = 0
+            end
         else
             _dense_fall_back!(refined, "the Float32 factorization is singular or not finite")
         end
     end
     return refined
+end
+
+# Test (BLAB_TEST_STALE_LU): right-preconditioned GMRES (modified Gram-Schmidt, no restart) with
+# the stale ComplexF32 factor, all right-hand sides in lockstep so the matvec and the
+# preconditioner solve are batched. Stops when every column meets `RefinedDenseLU`'s Float64
+# backward-error test on the true residual. Returns (solution, iterations, ratio) or nothing.
+function _test_stale_gmres(factorization::RefinedDenseLU, target::Matrix{ComplexF64}, cap::Int)
+    A = factorization.matrix
+    M = factorization.factor
+    n, k = size(target)
+    threshold = factorization.matrix_norm * eps(Float64) * sqrt(n)
+    x0 = ComplexF64.(_test_lu_solve(M, ComplexF32.(target)))
+    residual = copy(target)
+    mul!(residual, A, x0, -one(ComplexF64), one(ComplexF64))
+    ratio = _dense_backward_error_ratio(factorization, residual, x0)
+    ratio <= 1 && return (x0, 0, ratio)
+    beta = [norm(view(residual, :, c)) for c in 1:k]
+    V = zeros(ComplexF64, n, cap + 1, k)
+    Z = zeros(ComplexF64, n, cap, k)
+    H = zeros(ComplexF64, cap + 1, cap, k)
+    for c in 1:k
+        beta[c] > 0 && (V[:, 1, c] .= view(residual, :, c) ./ beta[c])
+    end
+    basis = Matrix{ComplexF64}(undef, n, k)
+    w = similar(target)
+    trial = copy(x0)
+    for j in 1:cap
+        for c in 1:k
+            basis[:, c] .= view(V, :, j, c)
+        end
+        preconditioned = ComplexF64.(_test_lu_solve(M, ComplexF32.(basis)))
+        mul!(w, A, preconditioned)
+        estimate_ok = true
+        for c in 1:k
+            Z[:, j, c] .= view(preconditioned, :, c)
+            beta[c] > 0 || continue
+            wc = view(w, :, c)
+            for i in 1:j
+                h = dot(view(V, :, i, c), wc)
+                H[i, j, c] = h
+                wc .-= h .* view(V, :, i, c)
+            end
+            h = norm(wc)
+            H[j+1, j, c] = h
+            h > 0 && (V[:, j+1, c] .= wc ./ h)
+            rhs = zeros(ComplexF64, j + 1)
+            rhs[1] = beta[c]
+            Hj = H[1:(j+1), 1:j, c]
+            y = Hj \ rhs
+            trial[:, c] .= view(x0, :, c) .+ view(Z, :, 1:j, c) * y
+            norm(rhs - Hj * y) <= threshold * norm(view(trial, :, c), Inf) || (estimate_ok = false)
+        end
+        estimate_ok || continue
+        copyto!(residual, target)
+        mul!(residual, A, trial, -one(ComplexF64), one(ComplexF64))
+        ratio = _dense_backward_error_ratio(factorization, residual, trial)
+        isfinite(ratio) || return nothing
+        ratio <= 1 && return (trial, j, ratio)
+    end
+    return nothing
 end
 
 function _dense_fall_back!(factorization::RefinedDenseLU, reason::AbstractString)
@@ -376,6 +483,24 @@ function Base.:\(factorization::RefinedDenseLU, rhs::AbstractVecOrMat)
     end
     target = ComplexF64.(rhs)
     residual = similar(target)
+    if isnothing(factorization.fallback) && factorization.stale
+        result = _test_stale_gmres(factorization, Matrix(reshape(target, size(target, 1), :)), _test_stale_cap())
+        if !isnothing(result)
+            solution, iterations, ratio = result
+            _TEST_STALE.last_iterations = iterations
+            # BLAB_TEST_STALE_STOP=<m>: a stale solve needing more than m iterations ends reuse for
+            # the request, before a later one runs into the cap.
+            iterations > something(tryparse(Int, get(ENV, "BLAB_TEST_STALE_STOP", "")), typemax(Int)) &&
+                (_TEST_STALE.disabled = true)
+            _test_stale_log("STALE ok $iterations")
+            factorization.iterations = max(factorization.iterations, iterations)
+            factorization.backward_error = ratio
+            return rhs isa AbstractVector ? vec(solution) : solution
+        end
+        _TEST_STALE.disabled = true
+        _test_stale_log("STALE fail")
+        _test_fresh_factor!(factorization)
+    end
     if isnothing(factorization.fallback)
         solution = ComplexF64.(_test_lu_solve(factorization.factor, ComplexF32.(target)))
         previous = Inf

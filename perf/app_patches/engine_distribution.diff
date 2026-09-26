@@ -1,5 +1,5 @@
 diff --git a/src/blab/solvers/engine_distribution.py b/src/blab/solvers/engine_distribution.py
-index 40299fc..bde543f 100644
+index 40299fc..aee4729 100644
 --- a/src/blab/solvers/engine_distribution.py
 +++ b/src/blab/solvers/engine_distribution.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 40299fc..bde543f 100644
  try:
      import beat_engine
  except ImportError as exc:
-@@ -12,4 +14,43 @@ from beat_engine import backend_catalog as backend_catalog
+@@ -12,4 +14,48 @@ from beat_engine import backend_catalog as backend_catalog
  from beat_engine import backend_info as engine_backend_info
  from beat_engine import engine_paths as engine_paths
  
@@ -41,6 +41,11 @@ index 40299fc..bde543f 100644
 +        # maxrel 1.3e-7). Harness: 1.224 -> 1.084 s/freq.
 +        "BLAB_TEST_GC_DEFER": "1",
 +        "BLAB_TEST_BLOCKED_LU": "512",
++        # 2026-09-26 round 7: blocked gemm-based F32 LU solve (-0.028 s/freq, maxrel 6.6e-8) and the
++        # previous frequency's F32 LU as a GMRES preconditioner at low frequencies (-0.031 s/freq on
++        # the 50-freq sweep, maxrel 1.8e-8; falls back to a fresh LU above ~1 kHz).
++        "BLAB_TEST_FAST_TRS": "128",
++        "BLAB_TEST_STALE_LU": "15",
 +    }
 +}
 +

@@ -1,5 +1,15 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
+## Round 7 (2026-09-26): faster F32 LU solve, stale LU as GMRES preconditioner
+| Change | Harness | maxrel |
+|---|---|---|
+| `FAST_TRS=128` (blocked trsm + gemm LU solve, getrs 15 → 4 ms) | 1.104 → 1.076 s/freq (12 freqs) | 6.6e-8 |
+| `STALE_LU=15` on top (50 log freqs, 20 Hz–20 kHz) | 0.966 → 0.935 s/freq | 1.8e-8 |
+| `STALE_REUSE=12` + `STALE_STOP=12` | 0.942 (worse) | |
+Offline GMRES iterations with the previous freq's LU (ratio 1.151): 5–6 at 40–53 Hz, 12–13 at
+0.7–0.9 kHz, 45–59 at 6–8 kHz; two steps stale: 7–8, 17–18, 55+. Both switches are in the app.
+Details in HANDOFF.md.
+
 ## Round 6 (2026-09-26) — Fable plan (beat-engine-fable/fable/PLAN.md). Handoff: perf/HANDOFF.md — START HERE
 Best config so far = app + BLAB_TEST_GC_DEFER=1 + BLAB_TEST_BLOCKED_LU=512:
 **1.224 -> 1.084 s/freq (1.13x)**, 12 freqs, Revise mode, maxrel 1.3e-7. In the app: 50-freq SAWMOD 58 -> 51.2 s (user, 2026-09-26).

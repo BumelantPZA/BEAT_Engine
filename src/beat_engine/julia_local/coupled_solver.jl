@@ -2858,6 +2858,7 @@ function solve_request_impl(request; event_mode=false)
         # Test instrumentation: the previous frequency's emit/release and whole-iteration wall + GC,
         # reported one frequency late as `test_prev_*` timings.
         test_prev_tail = Dict{String,Float64}()
+        BeatEngineCoupledCondensed._test_stale_reset!()   # BLAB_TEST_STALE_LU: no factor from another request
         for (frequency_index, frequency_value) in enumerate(request["frequencies_hz"])
             if cancel_requested()
                 cancelled = true
@@ -3570,6 +3571,7 @@ function solve_request_impl(request; event_mode=false)
         end
     finally
         GC.enable(true)   # BLAB_TEST_GC_DEFER may have left it off on an error
+        BeatEngineCoupledCondensed._test_stale_reset!()
         isnothing(test_field_done) || notify(test_field_done)
         if test_next_build !== nothing
             try

@@ -1,4 +1,4 @@
-# SAWMOD Metal speedups: handoff (2026-09-26, after round 6)
+# SAWMOD Metal speedups: handoff (2026-09-26, after round 7)
 
 To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-test` and say:
 "Read perf/HANDOFF.md and continue with the next idea." Full history is in `perf/NOTES.md`
@@ -8,12 +8,14 @@ To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-tes
 - Goal: shorten the whole SAWMOD coupled FEM-BEM solve (50 freqs) in Boundary Lab's
   "BEAT Engine (Apple Metal test)" solver. In-app, 50 freqs: 141 s (stock Apple Metal) → 58 s
   (round 3) → **51.2 s (round 6, user-measured 2026-09-26)**.
-- Harness (12 freqs, Revise mode): 1.224 → **1.084 s/freq** with round 6, maxrel 1.3e-7.
+- Harness (12 freqs, Revise mode): 1.224 → 1.084 s/freq with round 6, maxrel 1.3e-7.
+- Round 7 (in the app, not yet measured in-app): 50-freq harness sweep 0.966 → **0.935 s/freq**
+  from the stale LU on top of FAST_TRS (itself −0.028 s/freq on the 12-freq set).
 - Code: this checkout, branch `perf/experiments`, pushed to the user's fork
   (`git push fork perf/experiments`, BumelantPZA/BEAT_Engine). **Never push to `origin`
   (JWSound).**
 - Restore tags: `metal-test-58s` (round 3), `metal-test-bm-threaded` (round 5),
-  `metal-test-round6` (current).
+  `metal-test-round6`, `metal-test-round7` (current).
 - App side: `../boundary-lab/src/blab/solvers/engine_distribution.py`,
   `METAL_TEST_SOLVER_OPTIONS["test_env"]`. It has no fork; its diff is kept in
   `perf/app_patches/engine_distribution.diff`. The app loads Julia at start, so restart it after
@@ -21,7 +23,8 @@ To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-tes
 
 App env now: `BLAB_TEST_COUPLED_PREFETCH=0`, `BLAB_METAL_REGULAR_KERNEL_MODE=pair_tilereduce`,
 `BLAB_TEST_BLAS=accelerate`, `BLAB_METAL_FIELD_FAST=3`, `BLAB_TEST_DENSE_STATS=1`,
-`BLAB_TEST_BM_THREADED=1`, `BLAB_TEST_GC_DEFER=1`, `BLAB_TEST_BLOCKED_LU=512`.
+`BLAB_TEST_BM_THREADED=1`, `BLAB_TEST_GC_DEFER=1`, `BLAB_TEST_BLOCKED_LU=512`,
+`BLAB_TEST_FAST_TRS=128`, `BLAB_TEST_STALE_LU=15`.
 
 ## Per-frequency budget now (s, harness medians)
 | Stage | s | Code |
@@ -73,6 +76,8 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 | 5 | Threaded Burton-Miller combine (`BM_THREADED`), exact | first half 0.54 → 0.47 |
 | 6 | `GC_DEFER`: GC off during a frequency, one collection after (was 1.1 GB/freq, 5 pauses, 0.12–0.16 s), exact | −0.05 s/freq |
 | 6 | (both round-6 rows together: in-app 58 → 51.2 s) | |
+| 7 | `FAST_TRS=128`: the F32 LU solve as row swaps + blocked trsm with gemm updates (Accelerate getrs barely threads: 15 → 4 ms for 3 RHS), maxrel 6.6e-8 | −0.028 s/freq |
+| 7 | `STALE_LU=15`: previous fresh F32 LU as GMRES preconditioner (3 RHS in lockstep, same Float64 backward-error test), reused while the last stale solve took ≤ 8 iterations (`STALE_REUSE`), fresh LU + no more reuse after a failure at the cap. Used on 17/50 freqs (23 Hz–0.9 kHz, 6–15 iterations, ~8 ms each). maxrel 1.8e-8 | −0.031 s/freq (50-freq sweep) |
 | 6 | `BLOCKED_LU=512`: right-looking blocked LU, Accelerate getrf panel + cgemm trailing update (cgetrf runs at 0.3 TFLOP/s, cgemm at 2.0), maxrel 1.3e-7, refinement 1.5 → 2 steps | −0.085 s/freq |
 
 ## What didn't work — don't retry without a new reason
@@ -88,17 +93,16 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 | Fable I5: MUMPS Schur triangle check | Short-circuits on the first entry; free already |
 | Fable I7b: LAPACK binding | Already `$NEWLAPACK$ILP64` |
 | Two-level blocked LU (inner blocked panel) | ~130 ms, same as single-level nb=512 (134 ms); not worth it |
+| Stale LU: `STALE_REUSE=12` + `STALE_STOP=12` | 0.942 vs 0.932: the aging factor hits 13 iterations by 60 Hz and reuse stops. Frequent refresh (REUSE=8) is better |
+| Stale LU as plain refinement (no GMRES) | Never converges, even at 40 Hz (‖ΔA‖/‖A‖ ≈ 0.15 per step) |
 | Thread counts (8 vs 10), MUMPS 2/6 threads, kernel group size, gather budget | Within noise or worse (rounds 1–2, when GPU-bound; MUMPS threads untested since the tie) |
 
 ## Next ideas (untested, rough order)
-1. **Previous frequency's LU as a GMRES preconditioner** (Fable I8).
-   - Mechanism: at low f the operators change little between points, so skip the LU (0.12)
-     and run preconditioned GMRES to the same Float64 backward-error test. Fall back to a fresh
-     LU above an iteration cap.
-   - Expected saving: ~0.12 s on maybe half the freqs.
-   - Where: `RefinedDenseLU` (preconditioner field + GMRES `\`); the driver carries the
-     previous factor.
-   - Watch FEM resonances (iteration spikes).
+1. Stale-LU follow-ups (done in round 7; `perf/precond_micro.jl` measures GMRES iterations
+   offline from `BLAB_TEST_DUMP_DENSE=<dir>` dumps; `BLAB_TEST_STALE_LOG=<file>` logs decisions):
+   - The GMRES iteration costs ~8 ms: F64 3-column matvec 3.4 ms (~45 GB/s, below the memory
+     bandwidth) + blocked F32 solve 4 ms. Halving it extends reuse to ~2 kHz.
+   - `STALE_STOP=13` would avoid the one failure at the cap (~0.12 s per sweep); marginal.
 2. **Break the first-half tie: shrink the GPU and the condensation together.**
    - GPU side (Fable I4): assemble S/K′ only for the DP0 columns that carry flux (interface +
      transducer + prescribed faces); rigid faces multiply zero flux. Expected 0.05–0.15 off the
