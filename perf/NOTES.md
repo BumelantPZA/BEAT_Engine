@@ -21,7 +21,27 @@ Findings (12 freqs x 2, big3.out; app config 1.19 s/freq):
 - App (2026-09-26): BLAB_TEST_BM_THREADED=1 added to boundary-lab's METAL_TEST_SOLVER_OPTIONS
   (engine_distribution.py). boundary-lab has no user fork, so the app-side diff is kept here:
   perf/app_patches/engine_distribution.diff (git -C ../boundary-lab apply it to restore).
-- Next (user approved, not started): pipeline crash bisection. Re-add the round-4 pipeline
+- Pipeline bisection DONE (2026-09-26): the pipeline is dead — slower even when correct. Code:
+  perf/attic/pipeline_bisect.round5.diff (pipeline without locks + BLAB_TEST_PIPE_SERIALIZE=
+  solve,dense,gpu test locks); sources restored to the checkpoint. Results (12 freqs, Revise mode):
+  | config                              | s/freq | maxrel vs app | notes
+  | app                                 | 1.14-1.18 | 0          |
+  | pipeline, no locks (24 freqs)       | crash  |            | segfault in MUMPS load module, freq 2
+  | serialize solve                     | 1.75   | 2.1e-1     | no crash (24 + 2x12 freqs), WRONG
+  | serialize solve,gpu                 | 1.65   | 0          |
+  | serialize solve,dense               | 2.19   | 2.4e-1     | WRONG
+  | serialize solve,dense,gpu           | 2.14   | 0          |
+  | two instances, no overlap (SERIAL)  | 1.24   | 0          |
+  Causes: (1) crash = i's MUMPS solve calls (JOB=3, instance A) running concurrently with i+1's
+  factorization (JOB=2, instance B): MUMPS keeps process-global Fortran module state (MUMPS_LOAD);
+  the round-4 per-call lock was not enough because i+1's whole condensation must not overlap i's
+  solve. A.fact -> B.fact -> A.solve ordering itself is fine (exact). (2) wrong results = i+1's GPU
+  operator assembly concurrent with i's Metal field evaluation (shared GPU state, not found; no
+  obvious module global). Latent: any future GPU overlap (e.g. prefetch overlapping the field)
+  must serialize against field evaluation. (3) speed: every stage runs ~2x slower when two
+  frequencies share the 10 cores (MUMPS/OpenMP + Accelerate + Julia threads), and the solve waits
+  for i+1's condensation. Old round-4 crash reports: ~/Library/Logs/DiagnosticReports/julia-*.ips.
+- (was) Next: pipeline crash bisection. Re-add the round-4 pipeline
   (perf/attic) WITHOUT the locks, reproduce with ~24 freqs, then serialize one overlap pairing at a
   time with a shared test lock: i+1 condensation vs i's elimination+LU (BLAS), vs i's solve
   (MUMPS/CHOLMOD), and i+1 GPU assembly vs i's field (GPU). Report after the bisection; max 2 fixes.

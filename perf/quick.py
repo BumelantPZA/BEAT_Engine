@@ -152,6 +152,8 @@ def main():
                 run_job(worker, json.loads(job_path.read_text()), out)
             except BaseException as exc:  # keep serving after a bad job
                 out.write_text(f"FAILED: {exc!r}\n")
+                # A crashed worker's backtrace (segfault handler output) is only on its stderr.
+                out.with_suffix(".stderr").write_text("\n".join(getattr(worker, "_stderr_lines", [])) + "\n")
                 if isinstance(exc, (KeyboardInterrupt, SystemExit)):   # SIGTERM arrives as SystemExit
                     raise
             job_path.rename(job_path.with_suffix(".done"))

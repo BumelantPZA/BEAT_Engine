@@ -1,0 +1,239 @@
+diff --git a/src/beat_engine/julia_local/coupled_solver.jl b/src/beat_engine/julia_local/coupled_solver.jl
+index 363dc20..3898c88 100644
+--- a/src/beat_engine/julia_local/coupled_solver.jl
++++ b/src/beat_engine/julia_local/coupled_solver.jl
+@@ -74,6 +74,11 @@ function test_apply_blas!()
+     TEST_BLAS_MODE[] = mode
+     return
+ end
++
++# Test pipeline bisection (BLAB_TEST_PIPE_SERIALIZE=gpu): frequency i's field evaluation under the
++# lock frequency i+1's GPU operator assembly takes.
++_test_pipe_field_metal(args...) =
++    BeatEngineCoupledCondensed._test_pipe_section(() -> evaluate_galerkin_field_metal(args...), :gpu)
+ """
+ Coupled outputs computed from BEM pressure and flux, interface pressure and flux, diaphragm
+ velocity and voice-coil current only, never from interior FEM pressure. The only ones for which
+@@ -2815,12 +2820,66 @@ function solve_request_impl(request; event_mode=false)
+         String(output["quantity"]) in SPEAKER_ROM_QUANTITIES for output in outputs
+     )
+     coupled_system = nothing
++    # Test pipeline: frequency i+1's first half (GPU operators, BEM matrices, FEM condensation) runs
++    # while frequency i does its dense stage, solve and outputs. Two MUMPS stores alternate by
++    # frequency so i+1's factorization never touches the solver i's solve still reads.
++    pipeline = use_condensed_solver && bem_backend == :metal && Threads.nthreads() > 1 &&
++               get(ENV, "BLAB_TEST_COUPLED_PIPELINE", "0") == "1"
+     # Test prefetch: assemble frequency i+1's Metal BEM operators while frequency i's host stages run.
+-    prefetch_operators = use_condensed_solver && bem_backend == :metal && Threads.nthreads() > 1 &&
++    prefetch_operators = !pipeline && use_condensed_solver && bem_backend == :metal && Threads.nthreads() > 1 &&
+                          get(ENV, "BLAB_TEST_COUPLED_PREFETCH", "0") == "1"
+     prefetch_blas = tryparse(Int, get(ENV, "BLAB_TEST_PREFETCH_BLAS_THREADS", ""))
+     process_blas_threads = BLAS.get_num_threads()
+     prefetch_operators && !isnothing(prefetch_blas) && BLAS.set_num_threads(prefetch_blas)
++    pipeline_caches = pipeline ? (coupled_cache, merge(coupled_cache, (mumps_store=Dict{Symbol,Any}(),))) : nothing
++    pending_build = nothing
++    start_pipeline_build = function (index)
++        ready = Channel{Nothing}(1)
++        gate_open = Channel{Nothing}(1)
++        # BLAB_TEST_PIPE_SERIALIZE=dense: after its gate the build holds the dense lock to the end
++        # (lock and unlock both in this task).
++        dense_lock = "dense" in split(get(ENV, "BLAB_TEST_PIPE_SERIALIZE", ""), ',') ?
++                     BeatEngineCoupledCondensed._TEST_PIPE_LOCKS[:dense] : nothing
++        dense_held = Ref(false)
++        task = Threads.@spawn try build_condensed_coupled_system(
++            fem_mesh,
++            bem_mesh,
++            interface_map,
++            FloatType(request["frequencies_hz"][index]),
++            sound_speed,
++            density;
++            quadrature_order=quadrature_order,
++            regular_quadrature_order=quadrature_selections[index].order,
++            singular_order=singular_order,
++            cache=pipeline_caches[isodd(index) ? 1 : 2],
++            validation_diagnostics=validation_diagnostics,
++            symmetry_mode=symmetry_mode,
++            bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
++            wall_impedances=fem_domains.wall_impedances,
++            transducers=transducers,
++            transducer_operators=transducer_operators,
++            prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
++            allow_transducer_condensation=!rom_requested &&
++                isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing)),
++            stage_gate=() -> begin
++                put!(ready, nothing)
++                take!(gate_open)
++                isnothing(dense_lock) || (lock(dense_lock); dense_held[] = true)
++            end,
++        ) finally
++            dense_held[] && unlock(dense_lock)
++        end
++        bind(ready, task)
++        return (task=task, ready=ready, gate_open=gate_open)
++    end
++    fetch_build = function (build)
++        try
++            fetch(build.task)
++        catch exception
++            exception isa TaskFailedException || rethrow()
++            rethrow(exception.task.result)
++        end
++    end
+     next_operators = nothing
+     try
+         for (frequency_index, frequency_value) in enumerate(request["frequencies_hz"])
+@@ -2843,7 +2902,21 @@ function solve_request_impl(request; event_mode=false)
+             else
+                 nothing
+             end
+-            coupled_system = if use_condensed_solver
++            coupled_system = if pipeline
++                current_build = something(pending_build, start_pipeline_build(frequency_index))
++                pending_build = nothing
++                try
++                    take!(current_build.ready)   # this frequency's first half is done
++                catch
++                    fetch_build(current_build)   # surfaces the build's own error
++                    rethrow()
++                end
++                if frequency_index < length(frequencies_all) && get(ENV, "BLAB_TEST_PIPELINE_SERIAL", "0") != "1"
++                    pending_build = start_pipeline_build(frequency_index + 1)
++                end
++                put!(current_build.gate_open, nothing)
++                fetch_build(current_build)
++            elseif use_condensed_solver
+                 build_condensed_coupled_system(
+                     fem_mesh,
+                     bem_mesh,
+@@ -2905,11 +2978,13 @@ function solve_request_impl(request; event_mode=false)
+             )
+             solve_started = time_ns()
+             solutions = use_condensed_solver ?
+-                        solve_condensed_coupled_excitations(
+-                            coupled_system,
+-                            excitations;
+-                            reconstruct_interior=reconstruct_interior,
+-                        ) :
++                        BeatEngineCoupledCondensed._test_pipe_section(:solve) do
++                            solve_condensed_coupled_excitations(
++                                coupled_system,
++                                excitations;
++                                reconstruct_interior=reconstruct_interior,
++                            )
++                        end :
+                         solve_coupled_excitations(coupled_system, excitations)
+             solve_s = (time_ns() - solve_started) / 1.0e9
+             interface_error_sets = [
+@@ -3134,7 +3209,7 @@ function solve_request_impl(request; event_mode=false)
+                                     coupled_system.field_cache,
+                                 )
+                             elseif bem_backend == :metal
+-                                evaluate_galerkin_field_metal(
++                                _test_pipe_field_metal(
+                                     points,
+                                     bem_mesh,
+                                     solution.bem_pressure,
+@@ -3201,7 +3276,7 @@ function solve_request_impl(request; event_mode=false)
+                                 coupled_system.field_cache,
+                             )
+                         elseif bem_backend == :metal
+-                            evaluate_galerkin_field_metal(
++                            _test_pipe_field_metal(
+                                 points,
+                                 bem_mesh,
+                                 combined_pressure,
+@@ -3468,6 +3543,18 @@ function solve_request_impl(request; event_mode=false)
+             solved_count = frequency_index
+         end
+     finally
++        if pending_build !== nothing
++            try
++                put!(pending_build.gate_open, nothing)
++                release_condensed_coupled_system!(fetch_build(pending_build))
++            catch
++            end
++        end
++        if pipeline_caches !== nothing
++            solver = get(pipeline_caches[2].mumps_store, :solver, nothing)
++            isnothing(solver) || BeatEngineCoupledCondensed.BeatEngineMumps.mumps_release!(solver)
++            empty!(pipeline_caches[2].mumps_store)
++        end
+         if next_operators !== nothing
+             try
+                 BeatEngineCoupledCondensed.release_operator_storage!(fetch(next_operators).operators)
+diff --git a/src/beat_engine/julia_local/src/BeatEngineCoupledCondensed.jl b/src/beat_engine/julia_local/src/BeatEngineCoupledCondensed.jl
+index 978ee86..d20f3cd 100644
+--- a/src/beat_engine/julia_local/src/BeatEngineCoupledCondensed.jl
++++ b/src/beat_engine/julia_local/src/BeatEngineCoupledCondensed.jl
+@@ -1670,6 +1670,7 @@ function build_condensed_coupled_system(
+     allow_transducer_condensation::Bool=true,
+     prefetched_operators=nothing,
+     on_operators_ready=nothing,
++    stage_gate=nothing,
+ ) where {T<:AbstractFloat}
+     # `relative_residual` needs the monolithic coupled matrix, which this formulation never
+     # forms. `fem_interior_residual` on each solution is the condensed-appropriate check.
+@@ -1858,7 +1859,7 @@ function build_condensed_coupled_system(
+         mass_in_fem_stage = _interface_mass_overlap_enabled(bem_backend)
+     end
+     fem_stage_work = Ref(0.0)   # test diagnostic: the stage's own work, without the overlap wait
+-    fem_stage = () -> begin
++    fem_stage = () -> _test_pipe_section(:fem) do
+         fem_stage_work_started = time_ns()
+         stage_condensation = _build_condensation(
+             fem_system,
+@@ -1893,7 +1894,8 @@ function build_condensed_coupled_system(
+     elseif prepared.bem_backend == :metal
+         # Metal assembles the four operators on the GPU; the condensed algebra
+         # below is CPU-only, so bring them down and free the device copies.
+-        device_operators = assemble_regular_galerkin_operators(
++        device_operators = _test_pipe_section(:gpu) do
++            assemble_regular_galerkin_operators(
+             bem_mesh,
+             prepared.p1,
+             prepared.dp0,
+@@ -1908,6 +1910,7 @@ function build_condensed_coupled_system(
+             symmetry_mode=prepared.symmetry_mode,
+             timing=_test_asm_timing(),
+         )
++        end
+         _test_asm_timing_write(wavenumber)
+         # Wraps shared device storage in place (copies it when the storage mode
+         # is private); either way the host tuple owns the device buffers, so
+@@ -1966,6 +1969,10 @@ function build_condensed_coupled_system(
+     end
+     fem_condensation_s = (time_ns() - condensation_started) / 1.0e9
+     elimination_split[:diag_fem_stage_work] = fem_stage_work[]
++    # Test pipeline (BLAB_TEST_COUPLED_PIPELINE): the GPU operators, the BEM matrices and the FEM
++    # condensation are done; wait here until the previous frequency has finished its dense stage,
++    # solve and outputs, so only this first half overlaps it.
++    isnothing(stage_gate) || stage_gate()
+ 
+     block_assembly_started = time_ns()
+     fem_count = length(fem_mesh.vertices)
+@@ -2268,6 +2275,25 @@ function build_condensed_coupled_system(
+     )
+ end
+ 
++# Test pipeline bisection (BLAB_TEST_PIPE_SERIALIZE=solve,dense,gpu): each named pairing between
++# frequency i+1's first half and frequency i's later stages shares one lock, so it cannot overlap.
++#   solve: i+1's FEM condensation (MUMPS factorization) vs i's solve (MUMPS reduce/back substitution)
++#   dense: i+1's FEM condensation vs i's dense stage (block assembly, elimination, dense LU)
++#   gpu:   i+1's GPU operator assembly vs i's field evaluation
++const _TEST_PIPE_LOCKS = Dict(:solve => ReentrantLock(), :dense => ReentrantLock(), :gpu => ReentrantLock())
++const _TEST_PIPE_SECTION_GROUPS = Dict(:fem => (:solve, :dense), :solve => (:solve,), :dense => (:dense,), :gpu => (:gpu,))
++
++function _test_pipe_section(f, section::Symbol)
++    selected = split(get(ENV, "BLAB_TEST_PIPE_SERIALIZE", ""), ',')
++    groups = [g for g in _TEST_PIPE_SECTION_GROUPS[section] if String(g) in selected]
++    return _test_pipe_locked(f, groups)
++end
++
++function _test_pipe_locked(f, groups)
++    isempty(groups) && return f()
++    return lock(() -> _test_pipe_locked(f, groups[2:end]), _TEST_PIPE_LOCKS[groups[1]])
++end
++
+ # Test (BLAB_TEST_BM_THREADED=1): `burton_miller_neumann_matrices` with each output column on its own
+ # thread. The per-entry expressions are the broadcasts' own, in the same order, so the result is
+ # bit-identical; the broadcasts run on one thread and took ~0.15 s/freq on the critical path.
