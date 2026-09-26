@@ -1,5 +1,19 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
+## Round 11 (2026-09-26): in-app BLAS bug, MUMPS pivoting, early build with optimized prefetch
+In-app path (`perf/app_timing.py`, the app's headless solve on the SAWMOD project, 50 freqs, warm,
+8 threads): **37.7 s → 33.9 s (BLAS fix) → 29.4 s (round 11)**. The user measured 37.4 s in-app.
+| Change | Harness (50-freq sweep) | maxrel |
+|---|---|---|
+| Fix: MUMPS loaded before the Accelerate forward (`test_apply_blas!`). OpenBLAS32's lazy JLL library forwards itself into libblastrampoline on first dlopen; the app applied `BLAB_TEST_BLAS` first, so MUMPS ran on OpenBLAS32 in-app (FEM stage 0.35 vs 0.29, 2.5 s user CPU/freq from spinning OpenBLAS threads). The harness warmup loaded MUMPS first and never saw it | in-app 0.725 → 0.649 steady | 0 |
+| `MUMPS_CNTL=1=0`: no numerical pivoting (never a delayed pivot; the search cost 0.04 of 0.232 s). Failed factorization retries with CNTL(1)=0.01 | 0.642 → 0.623 | 4.4e-8 |
+| `FEM_F32_SKIP=1`: no Float32 FEM system built only to be replaced by the Float64 one | 0.624 → 0.618 | 0 |
+| `PREFETCH_OPT=1` + `EARLY_BUILD=1` + `COUPLED_PREFETCH=1`: prefetched GPU operators now use the round 8/9 switches (shared `_test_metal_operators`); build(i+1) overlaps field(i) | 0.625 → 0.571 | 0 |
+Didn't help: a sleeping Metal wait (Metal.jl `synchronize` spins/yields; only ~7% of busy samples),
+EARLY_BUILD with the old prefetch path (0.584–0.611, noisy). MUMPS stats (`BLAB_TEST_MUMPS_STATS`):
+n=24947, Schur 1602, 4.2 GFLOP in 0.19 s (18 GFLOP/s: not BLAS-bound), no delayed pivots.
+One-time per request: setup 0.55 s + first frequency +0.3 s (analysis, FEM matrices, caches).
+
 ## Round 10 (2026-09-26): implicit elimination product, host array pool
 | Change | Harness (50-freq sweep) | maxrel |
 |---|---|---|
