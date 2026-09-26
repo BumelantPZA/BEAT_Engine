@@ -2108,6 +2108,7 @@ function build_condensed_coupled_system(
 
     bem_operator_started = time_ns()
     row_weights = nothing   # test (BLAB_TEST_HOST_ROW_WEIGHTS): symmetry weights still to apply on the host
+    combined_bm = false     # test (BLAB_TEST_COMBINED_BM): operators hold A and C
     # Test (BLAB_TEST_FLUX_SKIP=1, Metal, own assembly only): DP0 columns whose face carries flux in
     # some right-hand-side block. S/K' are only ever multiplied by those flux matrices, so the GPU
     # skips the other columns and the host combine writes zeros there.
@@ -2137,6 +2138,10 @@ function build_condensed_coupled_system(
                            get(ENV, "BLAB_TEST_BM_THREADED", "0") == "1" &&
                            BeatEngineCore.normalized_symmetry_mode(prepared.symmetry_mode) != :off
         host_row_weights && (BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = true)
+        # Test (BLAB_TEST_COMBINED_BM=1, with HOST_ROW_WEIGHTS): the GPU writes A = -D + βH and
+        # C = -S - βK' directly (see BeatEngineCore._TEST_COMBINED_BM).
+        combined_bm = host_row_weights && get(ENV, "BLAB_TEST_COMBINED_BM", "0") == "1"
+        combined_bm && (BeatEngineCore._TEST_COMBINED_BM[] = Complex{Float32}(burton_miller_coupling(wavenumber)))
         if flux_skip
             BeatEngineCore._TEST_FLUX_MASK[] = BeatEngineCore.MtlArray(Int32.(flux_columns))
         end
@@ -2158,6 +2163,7 @@ function build_condensed_coupled_system(
             )
         finally
             BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = false
+            BeatEngineCore._TEST_COMBINED_BM[] = nothing
             BeatEngineCore._TEST_FLUX_MASK[] = nothing
         end
         host_row_weights && (row_weights = p1_symmetry_orbit_weights(bem_mesh, prepared.symmetry_mode))
@@ -2187,7 +2193,7 @@ function build_condensed_coupled_system(
     bem_lhs, bem_rhs_operator = if !isnothing(row_weights)
         _test_burton_miller_matrices_threaded(
             operators, prepared.identity_p1_p1, prepared.identity_p1_dp0, wavenumber; row_weights=row_weights,
-            flux_columns=flux_columns,
+            flux_columns=flux_columns, combined=combined_bm,
         )
     else
         (get(ENV, "BLAB_TEST_BM_THREADED", "0") == "1" ?
@@ -2199,6 +2205,62 @@ function build_condensed_coupled_system(
         )
     end
     elimination_split[:diag_bm_matrices] = (time_ns() - bem_matrix_started) / 1.0e9
+    if combined_bm && !isempty(get(ENV, "BLAB_TEST_COMBINED_CHECK", ""))
+        # Debug: the same operators assembled the stock way, combined on the host, compared.
+        BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = true
+        reference_ops = try
+            metal_host_operators(assemble_regular_galerkin_operators(
+                bem_mesh, prepared.p1, prepared.dp0, wavenumber, prepared.rule;
+                skip_singular=false, singular_order=singular_order, backend=:metal,
+                device_cache=prepared.device_cache, singular_cache=prepared.singular_cache,
+                device_singular_cache=prepared.device_singular_cache, symmetry_mode=prepared.symmetry_mode,
+            ))
+        finally
+            BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = false
+        end
+        ref_lhs, ref_rhs = _test_burton_miller_matrices_threaded(
+            reference_ops, prepared.identity_p1_p1, prepared.identity_p1_dp0, wavenumber; row_weights=row_weights,
+        )
+        coupling = burton_miller_coupling(wavenumber)
+        A_ref = -reference_ops.double_layer .+ coupling .* reference_ops.hypersingular
+        C_ref = -reference_ops.single_layer .- coupling .* reference_ops.adjoint_double_layer
+        rel(x, y) = maximum(abs, x .- y) / maximum(abs, y)
+        cols = isnothing(flux_columns) ? Colon() : findall(flux_columns)
+        worst = argmax(abs.(bem_lhs .- ref_lhs))
+        open(ENV["BLAB_TEST_COMBINED_CHECK"], "a") do io
+            println(io, "k=$(wavenumber) lhs=$(rel(bem_lhs, ref_lhs)) rhs=$(rel(bem_rhs_operator[:, cols], ref_rhs[:, cols])) ",
+                    "A=$(rel(operators.double_layer, A_ref)) C=$(rel(operators.single_layer[:, cols], C_ref[:, cols])) ",
+                    "worst_lhs=$(Tuple(worst)) got=$(bem_lhs[worst]) want=$(ref_lhs[worst]) ",
+                    "A_got=$(operators.double_layer[worst]) A_ref=$(A_ref[worst]) D=$(reference_ops.double_layer[worst]) H=$(reference_ops.hypersingular[worst]) w=$(row_weights[worst[1]])")
+        end
+        release_operator_storage!(reference_ops)
+        # Regular part only (no singular corrections), both ways.
+        regular_only(beta) = begin
+            BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = true
+            BeatEngineCore._TEST_COMBINED_BM[] = beta
+            try
+                metal_host_operators(assemble_regular_galerkin_operators(
+                    bem_mesh, prepared.p1, prepared.dp0, wavenumber, prepared.rule;
+                    skip_singular=true, singular_order=singular_order, backend=:metal,
+                    device_cache=prepared.device_cache, singular_cache=prepared.singular_cache,
+                    device_singular_cache=prepared.device_singular_cache, symmetry_mode=prepared.symmetry_mode,
+                ))
+            finally
+                BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = false
+                BeatEngineCore._TEST_COMBINED_BM[] = nothing
+            end
+        end
+        stock = regular_only(nothing)
+        A_reg_ref = -stock.double_layer .+ coupling .* stock.hypersingular
+        C_reg_ref = -stock.single_layer .- coupling .* stock.adjoint_double_layer
+        A_reg_ref = copy(A_reg_ref); C_reg_ref = copy(C_reg_ref)
+        release_operator_storage!(stock)
+        comb = regular_only(Complex{Float32}(coupling))
+        open(ENV["BLAB_TEST_COMBINED_CHECK"], "a") do io
+            println(io, "  regular only: A=$(rel(comb.double_layer, A_reg_ref)) C=$(rel(comb.single_layer, C_reg_ref))")
+        end
+        release_operator_storage!(comb)
+    end
     # `operators` is dead from here on and the matrices above are freshly
     # allocated host arrays, so free the Metal buffers now rather than leaking
     # one operator set per condensed frequency.
@@ -2549,7 +2611,7 @@ end
 # thread. The per-entry expressions are the broadcasts' own, in the same order, so the result is
 # bit-identical; the broadcasts run on one thread and took ~0.15 s/freq on the critical path.
 function _test_burton_miller_matrices_threaded(
-    operators, identity_p1_p1, identity_p1_dp0, k::T; row_weights=nothing, flux_columns=nothing,
+    operators, identity_p1_p1, identity_p1_dp0, k::T; row_weights=nothing, flux_columns=nothing, combined=false,
 ) where {T<:AbstractFloat}
     coupling = burton_miller_coupling(k)
     half = Complex{T}(0.5)
@@ -2561,6 +2623,24 @@ function _test_burton_miller_matrices_threaded(
         # BLAB_TEST_HOST_ROW_WEIGHTS: the GPU skipped `operator .*= w` (row i scaled by w[i]); the
         # same products are formed here, then combined exactly as below.
         w = Complex{T}.(row_weights)
+        if combined
+            # BLAB_TEST_COMBINED_BM: D holds A = -D + βH and S holds C = -S - βK'.
+            Threads.@threads for j in axes(lhs, 2)
+                @inbounds for i in axes(lhs, 1)
+                    lhs[i, j] = half * identity_p1_p1[i, j] + D[i, j] * w[i]
+                end
+            end
+            Threads.@threads for j in axes(rhs, 2)
+                if !isnothing(flux_columns) && !flux_columns[j]
+                    @inbounds rhs[:, j] .= zero(Complex{T})
+                    continue
+                end
+                @inbounds for i in axes(rhs, 1)
+                    rhs[i, j] = S[i, j] * w[i] - coupling * (half * identity_p1_dp0[i, j])
+                end
+            end
+            return lhs, rhs
+        end
         Threads.@threads for j in axes(lhs, 2)
             @inbounds for i in axes(lhs, 1)
                 lhs[i, j] = half * identity_p1_p1[i, j] - D[i, j] * w[i] + coupling * (H[i, j] * w[i])

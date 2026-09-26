@@ -39,6 +39,13 @@ const _TEST_DEFER_ROW_WEIGHTS = Ref(false)
 const _TEST_FLUX_MASK = Ref{Any}(nothing)
 const _TEST_FLUX_MASK_DUMMY = Ref{Any}(nothing)
 
+# Test (BLAB_TEST_COMBINED_BM=1): the Burton-Miller coupling β (Complex{Float32}), set by the
+# condensed builder around its own assembly. The tile-reduce kernels and the singular gather then
+# write A = -D + βH into `double_layer` and C = -S - βK' into `single_layer` (CUDA's combined
+# assembly); `adjoint_double_layer` and `hypersingular` stay zero. Row weights and identity terms
+# are the builder's.
+const _TEST_COMBINED_BM = Ref{Any}(nothing)
+
 """
     release_operator_storage!(operators)
 

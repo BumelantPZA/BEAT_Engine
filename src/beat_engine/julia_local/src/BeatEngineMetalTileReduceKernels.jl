@@ -323,7 +323,10 @@ function _metal_tilereduce_pair_kernel!(
     element_flux_mask,
     mask_on::Int32,
     accumulate::Int32,
-) where {RC,R,TY,SKIP,SIMDBAR}
+    combv::Val{COMB},
+    beta_re,
+    beta_im,
+) where {RC,R,TY,SKIP,SIMDBAR,COMB}
     tg = MtlThreadGroupArray(Float32, (16, TY, 12))
     tpos = thread_position_in_threadgroup()
     gpos = threadgroup_position_in_grid()
@@ -367,6 +370,28 @@ function _metal_tilereduce_pair_kernel!(
     end
     @inbounds slot_first = Int32(tile_slot_offsets[tile])
     @inbounds slot_count = Int32(tile_slot_offsets[tile + Int32(1)]) - slot_first
+
+    if COMB
+        # BLAB_TEST_COMBINED_BM: C = -S - βK' (3 test rows) and A = -D + βH (3 x 3) in two passes.
+        # Phase 0: (C re, C im, A re/im of trial basis 1); phase 1: A re/im of trial bases 2, 3.
+        c_re = -slp_re - (beta_re * adj_re - beta_im * adj_im)
+        c_im = -slp_im - (beta_re * adj_im + beta_im * adj_re)
+        a_re = -dlp_re + (beta_re * hyp_re - beta_im * hyp_im)
+        a_im = -dlp_im + (beta_re * hyp_im + beta_im * hyp_re)
+        _metal_tilereduce_put!(tg, tx, ty, c_re, c_im,
+            SVector(a_re[1], a_re[2], a_re[3]), SVector(a_im[1], a_im[2], a_im[3]))
+        _metal_tilereduce_barrier(barv)
+        _metal_tilereduce_reduce!(blocks4, tg, slot_entry_offsets, slot_entries, slot_first, slot_count,
+            tx, ty, trial_local, chunk_count, slot_total, Int32(0), skipv, accumulate)
+        _metal_tilereduce_barrier(barv)
+        _metal_tilereduce_put!(tg, tx, ty,
+            SVector(a_re[4], a_re[5], a_re[6]), SVector(a_im[4], a_im[5], a_im[6]),
+            SVector(a_re[7], a_re[8], a_re[9]), SVector(a_im[7], a_im[8], a_im[9]))
+        _metal_tilereduce_barrier(barv)
+        _metal_tilereduce_reduce!(blocks4, tg, slot_entry_offsets, slot_entries, slot_first, slot_count,
+            tx, ty, trial_local, chunk_count, slot_total, group_stride, skipv, accumulate)
+        return nothing
+    end
 
     _metal_tilereduce_put!(tg, tx, ty, slp_re, slp_im, adj_re, adj_im)
     _metal_tilereduce_barrier(barv)
@@ -499,6 +524,97 @@ function _metal_tilereduce_dlp_hyp_kernel!(
     return nothing
 end
 
+# BLAB_TEST_COMBINED_BM: C gather, one thread per (P1 row, trial element of the chunk).
+function _test_tilereduce_c_kernel!(
+    combined_c,
+    blocks4,
+    elements,
+    row_slot_offsets,
+    row_slots,
+    element_dp0_dofs,
+    chunk_start::Int32,
+    chunk_count::Int32,
+    slot_total::Int32,
+    p1_count::Int32,
+    flux_mask,
+    mask_on::Int32,
+)
+    index = Int32(thread_position_in_grid_1d())
+    index > p1_count * chunk_count && return nothing
+    row = (index - Int32(1)) % p1_count + Int32(1)
+    trial_local = (index - Int32(1)) ÷ p1_count + Int32(1)
+    @inbounds trial_index = Int32(elements[chunk_start + trial_local - Int32(1)])
+    @inbounds dp0_column = Int32(element_dp0_dofs[trial_index])
+    if mask_on != Int32(0)
+        @inbounds flux_mask[dp0_column] == Int32(0) && return nothing
+    end
+    column_base = (trial_local - Int32(1)) * slot_total
+    c_re = 0.0f0
+    c_im = 0.0f0
+    @inbounds position = Int32(row_slot_offsets[row])
+    @inbounds stop = Int32(row_slot_offsets[row + Int32(1)]) - Int32(1)
+    while position <= stop
+        @inbounds v = blocks4[column_base + Int32(row_slots[position])]
+        c_re += v[1].value
+        c_im += v[2].value
+        position += Int32(1)
+    end
+    @inbounds combined_c[row + (dp0_column - Int32(1)) * p1_count] += Complex(c_re, c_im)
+    return nothing
+end
+
+# BLAB_TEST_COMBINED_BM: A gather, one thread per (P1 row, P1 node touched by the chunk).
+# Trial basis 1 is phase 0 channels 3-4, bases 2 and 3 are phase 1 channels 1-2 and 3-4.
+function _test_tilereduce_a_kernel!(
+    combined_a,
+    blocks4,
+    row_slot_offsets,
+    row_slots,
+    chunk_nodes,
+    inc_offsets,
+    inc_packed,
+    node_start::Int32,
+    node_count::Int32,
+    slot_total::Int32,
+    group_stride::Int32,
+    p1_count::Int32,
+)
+    index = Int32(thread_position_in_grid_1d())
+    index > p1_count * node_count && return nothing
+    row = (index - Int32(1)) % p1_count + Int32(1)
+    node_local = (index - Int32(1)) ÷ p1_count + Int32(1)
+    node_position = node_start + node_local - Int32(1)
+    @inbounds column = Int32(chunk_nodes[node_position])
+    @inbounds chunk_first = Int32(inc_offsets[node_position])
+    @inbounds chunk_stop = Int32(inc_offsets[node_position + Int32(1)]) - Int32(1)
+    a_re = 0.0f0
+    a_im = 0.0f0
+    @inbounds position = Int32(row_slot_offsets[row])
+    @inbounds stop = Int32(row_slot_offsets[row + Int32(1)]) - Int32(1)
+    while position <= stop
+        @inbounds global_slot = Int32(row_slots[position])
+        chunk_position = chunk_first
+        while chunk_position <= chunk_stop
+            @inbounds packed = Int32(inc_packed[chunk_position])
+            trial_local = (packed >> 2) + Int32(1)
+            local_column = packed & Int32(3)
+            phase = local_column == Int32(1) ? Int32(0) : Int32(1)   # local_column is 1-based
+            @inbounds v = blocks4[phase * group_stride + (trial_local - Int32(1)) * slot_total + global_slot]
+            if local_column == Int32(2)
+                a_re += v[1].value
+                a_im += v[2].value
+            else
+                a_re += v[3].value
+                a_im += v[4].value
+            end
+            chunk_position += Int32(1)
+        end
+        position += Int32(1)
+    end
+    @inbounds combined_a[row + (column - Int32(1)) * p1_count] += Complex(a_re, a_im)
+    return nothing
+end
+
 function _metal_tilereduce_ty()
     ty = parse(Int, get(ENV, "BLAB_METAL_TILEREDUCE_TY", "16"))
     ty in (2, 4, 8, 16) || error("BLAB_METAL_TILEREDUCE_TY must be 2, 4, 8 or 16; got $(ty).")
@@ -554,6 +670,9 @@ function _launch_metal_tilereduce_transforms!(operators, cache::MetalRegularAsse
         host_mask = Array(flux_mask)
         MtlArray(host_mask[Array(cache.element_dp0_dofs)])
     end
+    combined = _TEST_COMBINED_BM[]
+    beta_re = isnothing(combined) ? zero(k) : Float32(real(combined))
+    beta_im = isnothing(combined) ? zero(k) : Float32(imag(combined))
     timed && Metal.synchronize()
     stamp = time()
     for chunk in 1:tables.chunk_count
@@ -597,9 +716,53 @@ function _launch_metal_tilereduce_transforms!(operators, cache::MetalRegularAsse
                 element_flux_mask,
                 mask_on,
                 transform_index == 1 ? Int32(0) : Int32(1),
+            Val(!isnothing(combined)),
+            beta_re,
+            beta_im,
             )
         end
         stamp = _metal_gather_stage!("pairs", timed, stamp)
+        if !isnothing(combined)
+            _metal_launch(
+                _test_tilereduce_c_kernel!,
+                cache.p1_dof_count * chunk_count,
+                operators.single_layer,
+                tables.blocks4,
+                tables.elements,
+                tables.row_slot_offsets,
+                tables.row_slots,
+                cache.element_dp0_dofs,
+                Int32(chunk_start),
+                Int32(chunk_count),
+                slot_total,
+                p1_count,
+                flux_mask,
+                mask_on;
+                groupsize=groupsize,
+            )
+            stamp = _metal_gather_stage!("slp_adjoint", timed, stamp)
+            node_start = tables.chunk_node_offsets[chunk]
+            node_count = tables.chunk_node_offsets[chunk + 1] - node_start
+            _metal_launch(
+                _test_tilereduce_a_kernel!,
+                cache.p1_dof_count * node_count,
+                operators.double_layer,
+                tables.blocks4,
+                tables.row_slot_offsets,
+                tables.row_slots,
+                tables.chunk_nodes,
+                tables.inc_offsets,
+                tables.inc_packed,
+                Int32(node_start),
+                Int32(node_count),
+                slot_total,
+                group_stride,
+                p1_count;
+                groupsize=groupsize,
+            )
+            stamp = _metal_gather_stage!("dlp_hyp", timed, stamp)
+            continue
+        end
         _metal_launch(
             _metal_tilereduce_slp_adjoint_kernel!,
             cache.p1_dof_count * chunk_count,
