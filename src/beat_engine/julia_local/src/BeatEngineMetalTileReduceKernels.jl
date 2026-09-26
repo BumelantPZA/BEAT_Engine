@@ -248,7 +248,7 @@ end
 @inline function _metal_tilereduce_reduce!(
     blocks4, tg, slot_entry_offsets, slot_entries, slot_first::Int32, slot_count::Int32,
     tx::Int32, ty::Int32, trial_local::Int32, chunk_count::Int32, slot_total::Int32,
-    phase_offset::Int32, ::Val{SKIP},
+    phase_offset::Int32, ::Val{SKIP}, accumulate::Int32=Int32(0),
 ) where {SKIP}
     SKIP && return nothing
     slot_local = tx - Int32(1)
@@ -271,8 +271,17 @@ end
             entry += Int32(1)
         end
         if trial_local <= chunk_count
-            @inbounds blocks4[phase_offset + (trial_local - Int32(1)) * slot_total + global_slot] =
-                _metal_float4(a1, a2, a3, a4)
+            block_index = phase_offset + (trial_local - Int32(1)) * slot_total + global_slot
+            if accumulate != Int32(0)
+                # Test (BLAB_TEST_IMAGE_ACCUMULATE): later symmetry transforms add to the block;
+                # this thread is the only writer of the entry.
+                @inbounds old = blocks4[block_index]
+                a1 += old[1].value
+                a2 += old[2].value
+                a3 += old[3].value
+                a4 += old[4].value
+            end
+            @inbounds blocks4[block_index] = _metal_float4(a1, a2, a3, a4)
         end
         slot_local += Int32(16)
     end
@@ -313,6 +322,7 @@ function _metal_tilereduce_pair_kernel!(
     trial_curl_sign_z,
     element_flux_mask,
     mask_on::Int32,
+    accumulate::Int32,
 ) where {RC,R,TY,SKIP,SIMDBAR}
     tg = MtlThreadGroupArray(Float32, (16, TY, 12))
     tpos = thread_position_in_threadgroup()
@@ -362,7 +372,7 @@ function _metal_tilereduce_pair_kernel!(
     _metal_tilereduce_barrier(barv)
     if !rigid_trial
         _metal_tilereduce_reduce!(blocks4, tg, slot_entry_offsets, slot_entries, slot_first, slot_count,
-            tx, ty, trial_local, chunk_count, slot_total, Int32(0), skipv)
+            tx, ty, trial_local, chunk_count, slot_total, Int32(0), skipv, accumulate)
     end
     _metal_tilereduce_barrier(barv)
 
@@ -371,7 +381,7 @@ function _metal_tilereduce_pair_kernel!(
         SVector(hyp_re[1], hyp_re[2], hyp_re[3]), SVector(hyp_im[1], hyp_im[2], hyp_im[3]))
     _metal_tilereduce_barrier(barv)
     _metal_tilereduce_reduce!(blocks4, tg, slot_entry_offsets, slot_entries, slot_first, slot_count,
-        tx, ty, trial_local, chunk_count, slot_total, group_stride, skipv)
+        tx, ty, trial_local, chunk_count, slot_total, group_stride, skipv, accumulate)
     _metal_tilereduce_barrier(barv)
 
     _metal_tilereduce_put!(tg, tx, ty,
@@ -379,7 +389,7 @@ function _metal_tilereduce_pair_kernel!(
         SVector(hyp_re[4], hyp_re[5], hyp_re[6]), SVector(hyp_im[4], hyp_im[5], hyp_im[6]))
     _metal_tilereduce_barrier(barv)
     _metal_tilereduce_reduce!(blocks4, tg, slot_entry_offsets, slot_entries, slot_first, slot_count,
-        tx, ty, trial_local, chunk_count, slot_total, Int32(2) * group_stride, skipv)
+        tx, ty, trial_local, chunk_count, slot_total, Int32(2) * group_stride, skipv, accumulate)
     _metal_tilereduce_barrier(barv)
 
     _metal_tilereduce_put!(tg, tx, ty,
@@ -387,7 +397,7 @@ function _metal_tilereduce_pair_kernel!(
         SVector(hyp_re[7], hyp_re[8], hyp_re[9]), SVector(hyp_im[7], hyp_im[8], hyp_im[9]))
     _metal_tilereduce_barrier(barv)
     _metal_tilereduce_reduce!(blocks4, tg, slot_entry_offsets, slot_entries, slot_first, slot_count,
-        tx, ty, trial_local, chunk_count, slot_total, Int32(3) * group_stride, skipv)
+        tx, ty, trial_local, chunk_count, slot_total, Int32(3) * group_stride, skipv, accumulate)
     return nothing
 end
 
@@ -509,6 +519,15 @@ function _launch_metal_tilereduce_pair_kernels!(
     trial_curl_sign_y,
     trial_curl_sign_z,
 )
+    return _launch_metal_tilereduce_transforms!(operators, cache, k, [(
+        pair_offsets, singular_trial_indices, skip_mode,
+        trial_sign_x, trial_sign_y, trial_sign_z, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
+    )])
+end
+
+# Every transform's pair kernel for one chunk writes (first) or adds (later) into the same blocks,
+# then the S/K' and D/H gathers run once for the chunk. With one transform this is the stock path.
+function _launch_metal_tilereduce_transforms!(operators, cache::MetalRegularAssemblyCache, k, transforms)
     element_count = length(cache.element_indices)
     element_count == 0 && return nothing
     k isa Float32 || error("pair_tilereduce supports Float32 only.")
@@ -540,41 +559,46 @@ function _launch_metal_tilereduce_pair_kernels!(
     for chunk in 1:tables.chunk_count
         chunk_start = (chunk - 1) * chunk_size + 1
         chunk_count = min(chunk_size, element_count - chunk_start + 1)
-        Metal.@metal threads=(_METAL_TILEREDUCE_TX, ty) groups=(tables.tile_count, cld(chunk_count, ty)) _metal_tilereduce_pair_kernel!(
-            tables.blocks4,
-            packed.points4,
-            packed.normals4,
-            cache.areas,
-            packed.curls4,
-            cache.faces,
-            tables.elements,
-            tables.tile_slot_offsets,
-            tables.slot_entry_offsets,
-            tables.slot_entries,
-            Int32(element_count),
-            Int32(chunk_start),
-            Int32(chunk_count),
-            slot_total,
-            group_stride,
-            k,
-            Int32(cache.face_count),
-            Val(packed.rule),
-            Val(rule_count),
-            Val(ty),
-            Val(get(ENV, "BLAB_TEST_TR_SKIP_REDUCE", "0") == "1"),
-            Val(get(ENV, "BLAB_METAL_TILEREDUCE_BARRIER", "threadgroup") == "simd"),
-            pair_offsets,
-            singular_trial_indices,
-            skip_mode,
-            trial_sign_x,
-            trial_sign_y,
-            trial_sign_z,
-            trial_curl_sign_x,
-            trial_curl_sign_y,
-            trial_curl_sign_z,
-            element_flux_mask,
-            mask_on,
-        )
+        for (transform_index, transform) in enumerate(transforms)
+            (pair_offsets, singular_trial_indices, skip_mode, trial_sign_x, trial_sign_y, trial_sign_z,
+             trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z) = transform
+            Metal.@metal threads=(_METAL_TILEREDUCE_TX, ty) groups=(tables.tile_count, cld(chunk_count, ty)) _metal_tilereduce_pair_kernel!(
+                tables.blocks4,
+                packed.points4,
+                packed.normals4,
+                cache.areas,
+                packed.curls4,
+                cache.faces,
+                tables.elements,
+                tables.tile_slot_offsets,
+                tables.slot_entry_offsets,
+                tables.slot_entries,
+                Int32(element_count),
+                Int32(chunk_start),
+                Int32(chunk_count),
+                slot_total,
+                group_stride,
+                k,
+                Int32(cache.face_count),
+                Val(packed.rule),
+                Val(rule_count),
+                Val(ty),
+                Val(get(ENV, "BLAB_TEST_TR_SKIP_REDUCE", "0") == "1"),
+                Val(get(ENV, "BLAB_METAL_TILEREDUCE_BARRIER", "threadgroup") == "simd"),
+                pair_offsets,
+                singular_trial_indices,
+                skip_mode,
+                trial_sign_x,
+                trial_sign_y,
+                trial_sign_z,
+                trial_curl_sign_x,
+                trial_curl_sign_y,
+                trial_curl_sign_z,
+                element_flux_mask,
+                mask_on,
+                transform_index == 1 ? Int32(0) : Int32(1),
+            )
+        end
         stamp = _metal_gather_stage!("pairs", timed, stamp)
         _metal_launch(
             _metal_tilereduce_slp_adjoint_kernel!,
@@ -657,4 +681,21 @@ function _launch_metal_symmetry_regular_tilereduce_kernels!(
         sx, sy, sz,
         csx, csy, csz,
     )
+end
+
+# Test (BLAB_TEST_IMAGE_ACCUMULATE=1): the identity and every symmetry image through one chunk loop,
+# summing in the pair blocks, so the gathers run once per chunk instead of once per transform.
+function _launch_metal_accumulated_tilereduce_kernels!(operators, cache::MetalRegularAssemblyCache, k, skip_image_singular::Bool)
+    transforms = Any[(cache.vertex_offsets, cache.incident_elements, Int32(0),
+                      one(k), one(k), one(k), one(k), one(k), one(k))]
+    for (transform, image_cache) in zip(cache.image_transforms, cache.image_singular_caches)
+        T = typeof(k)
+        push!(transforms, (image_cache.pair_offsets, image_cache.trial_indices,
+                           skip_image_singular ? Int32(1) : Int32(2),
+                           T(transform.signs[1]), T(transform.signs[2]), T(transform.signs[3]),
+                           T(transform.determinant * transform.signs[1]),
+                           T(transform.determinant * transform.signs[2]),
+                           T(transform.determinant * transform.signs[3])))
+    end
+    return _launch_metal_tilereduce_transforms!(operators, cache, k, transforms)
 end

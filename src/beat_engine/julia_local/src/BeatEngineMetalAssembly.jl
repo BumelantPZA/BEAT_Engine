@@ -65,6 +65,9 @@ function _assemble_regular_galerkin_operators_metal_native(
     # correction is a Duffy-minus-regular delta. In native mode they skip the
     # image-singular pairs (skip_mode 1) and the gather kernel adds Duffy.
     skip_image_singular = !skip_singular && singular_mode == :native
+    # Test (BLAB_TEST_IMAGE_ACCUMULATE=1): identity + images summed in the tile-reduce blocks.
+    accumulate_images = regular_kernel_mode == :pair_tilereduce &&
+                        get(ENV, "BLAB_TEST_IMAGE_ACCUMULATE", "0") == "1" && !isempty(native_cache.image_transforms)
     empty!(_metal_gather_stage_timing)
     kernel_elapsed = @elapsed begin
         if regular_kernel_mode == :pair_owned
@@ -75,12 +78,15 @@ function _assemble_regular_galerkin_operators_metal_native(
             _launch_metal_regular_gather_kernels!(operators, native_cache, k)
         elseif regular_kernel_mode == :pair_gather_v4
             _launch_metal_regular_gather_v4_kernels!(operators, native_cache, k)
+        elseif regular_kernel_mode == :pair_tilereduce && accumulate_images
+            _launch_metal_accumulated_tilereduce_kernels!(operators, native_cache, k, skip_image_singular)
         elseif regular_kernel_mode == :pair_tilereduce
             _launch_metal_regular_tilereduce_kernels!(operators, native_cache, k)
         else
             _launch_metal_regular_entry_kernels!(operators, native_cache, k)
         end
         for (transform, image_cache) in zip(native_cache.image_transforms, native_cache.image_singular_caches)
+            accumulate_images && break   # already summed in the pair blocks
             if regular_kernel_mode == :pair_owned
                 _launch_metal_symmetry_regular_pair_kernels!(
                     operators,
