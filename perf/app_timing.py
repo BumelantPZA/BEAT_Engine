@@ -2,7 +2,8 @@
 N times on one persistent worker, with a timestamp per frequency.
 Usage (from ../boundary-lab): .venv/bin/python ../beat-engine-test/perf/app_timing.py <project.blab.json> [runs=2] [threads=8] [freq_count]
 """
-import sys, time, tempfile
+import os, sys, time, tempfile
+BACKEND = os.environ.get("APP_TIMING_BACKEND", "beat_metal_test")
 from blab.headless import load_headless_solve_spec, HeadlessSolveSpec, load_headless_project, prepare_headless_solve, run_headless_solve
 from blab.solvers.coupled_backend import PhysicalSystemProductionBackend
 
@@ -15,7 +16,7 @@ if nfreq:
     import dataclasses
     project = dataclasses.replace(project, preferences=dataclasses.replace(project.preferences, freq_count=nfreq))
 t1 = time.perf_counter()
-prepared = prepare_headless_solve(project, load_headless_solve_spec(None), backend_id="beat_metal_test")
+prepared = prepare_headless_solve(project, load_headless_solve_spec(None), backend_id=BACKEND)
 t2 = time.perf_counter()
 print(f"load {t1-t0:.2f} s  prepare {t2-t1:.2f} s", flush=True)
 import json
@@ -26,7 +27,7 @@ def _capture(raw):
     RAW.append((time.perf_counter(), raw.get("diagnostics", {}).get("timings", {})))
     return _orig(raw)
 cb.system_frequency_result_from_dict = _capture
-backend = PhysicalSystemProductionBackend(bem_backend="beat_metal_test", julia_threads=threads)
+backend = PhysicalSystemProductionBackend(bem_backend=BACKEND, julia_threads=threads)
 for run in range(runs):
     marks = []
     def emit(e, marks=marks):
@@ -34,7 +35,7 @@ for run in range(runs):
     start = time.perf_counter()
     with tempfile.TemporaryDirectory() as tmp:
         out = tmp + "/out"
-        run_headless_solve(project, prepared, output_dir=out, backend_id="beat_metal_test",
+        run_headless_solve(project, prepared, output_dir=out, backend_id=BACKEND,
                            public_request={}, backend=backend, event_callback=emit)
         done = time.perf_counter()
     freq = [m[0] for m in marks if m[1] == "frequency_completed"]
