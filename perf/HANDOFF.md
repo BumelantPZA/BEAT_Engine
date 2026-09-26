@@ -35,32 +35,32 @@ App env now: `BLAB_TEST_COUPLED_PREFETCH=0`, `BLAB_METAL_REGULAR_KERNEL_MODE=pai
 `BLAB_TEST_HOST_ROW_WEIGHTS=1`, `BLAB_TEST_FLUX_SKIP=1`, `BLAB_TEST_IMAGE_ACCUMULATE=1`,
 `BLAB_TEST_COMBINED_BM=1`, `BLAB_TEST_MUMPS_EXPAND=1`, `BLAB_TEST_MASS_THREADS=4`.
 
-**After round 9 the first half is balanced:** GPU branch ~0.30 (BEM ops 0.26 + BM combine 0.04)
-vs FEM stage ~0.325 (MUMPS factorization 0.247, transducer solves 0.034, mass solve 0.022,
-FEM system 0.011). On Macs with a faster CPU the GPU branch is critical again, on Macs with a
-bigger GPU the FEM stage is: both sides are worth cutting.
+## Per-frequency budget after round 9 (s, 50-freq harness medians, total 0.823 s/freq)
+Each frequency runs a **first half** as two parallel branches, then a serial **second half**.
 
-## Per-frequency budget now (s, harness medians)
 | Stage | s | Code |
 |---|---|---|
-| First half: GPU BEM ops 0.42 + BM combine 0.05 **tied with** FEM condensation 0.47 | 0.47 | `build_condensed_coupled_system`, `src/BeatEngineCoupledCondensed.jl` |
-| … condensation parts: FEM system 0.03, MUMPS LDLᵀ+Schur 0.28, transducer solves 0.05, mass solve 0.05 | | `_build_mumps_condensation`, `BeatEngineMumps.jl` |
-| Interface elimination (ComplexF64 GEMM 0.12) | 0.15 | `_flux_block_products!` |
-| Dense LU (blocked ComplexF32, getrf 0.12) + checks | 0.15 | `RefinedDenseLU`, `_test_blocked_lu!` |
-| Solve (dense refinement 0.058 + MUMPS back substitution) | 0.08 | `solve_condensed_coupled_excitations` |
-| Field (GPU) | 0.09 | `BeatEngineMetalFieldFast.jl` |
-| Per-request setup (frequency 1 only, spread over the sweep) | ~0.1 at 12 freqs | `coupled_solver.jl` |
+| **First half = max(GPU branch, FEM stage) ≈ 0.33** | | `build_condensed_coupled_system`, `src/BeatEngineCoupledCondensed.jl` |
+| GPU branch: BEM operators (combined A/C) 0.26 + host BM combine/products 0.04 | ~0.30 | `BeatEngineMetalAssembly.jl`, `BeatEngineMetalTileReduceKernels.jl` |
+| FEM stage (task, own work): MUMPS LDLᵀ+Schur 0.247, transducer solves 0.034, mass solve 0.022, FEM system 0.011 | ~0.325 | `_build_mumps_condensation`, `BeatEngineMumps.jl` |
+| Interface elimination: ComplexF64 GEMM B_q·W (3110×1602·1602×1602) 0.116 + glue | 0.15 | `_flux_block_products!` |
+| Dense LU: blocked ComplexF32 getrf 0.11, or stale-LU GMRES below ~1 kHz | 0.09–0.11 | `RefinedDenseLU`, `_test_blocked_lu!`, `_test_stale_gmres` |
+| Solve: dense refinement + MUMPS back substitution | ~0.06 | `solve_condensed_coupled_excitations` |
+| Field (GPU) | 0.08 | `BeatEngineMetalFieldFast.jl` |
+| Output, release, deferred GC, other | ~0.1 | `coupled_solver.jl` |
 
-Two timers are nested, which misled the round-2 Fable plan:
-- `block_assembly_s` **contains** `interface_elimination_s`; pure assembly is ~0.01.
-- `fem_schur_extraction_s` **contains** `fem_transducer_solves_s`.
+**The first half is balanced now:** the GPU branch is ~0.30 and the FEM stage ~0.325. On a Mac with a
+faster CPU the GPU branch becomes critical again; on a Mac with a bigger GPU the FEM stage does.
+Both sides are worth cutting, and the serial second half (~0.45) is now the largest block.
 
-**Correction (round 8):** the first half was not a tie. `interface_elim_diag_fem_stage_work_s`
-(the FEM task's own work) is 0.35, while `fem_condensation_s` is the overlapped wall (= the GPU
-branch). The GPU branch (BEM ops + BM combine) was critical by ~0.1; after round 8 it is
-0.36 + 0.04 vs FEM 0.35, so the next GPU cut beyond ~0.05 gains nothing without FEM cuts.
-GPU assembly split (`BLAB_TEST_ASM_TIMING=<file>` + `BLAB_METAL_GATHER_TIMING=1`): pair kernel
-0.27, DLP/HYP gather 0.066, S/K' gather 0.037 (halved by FLUX_SKIP), singular 0.012.
+How to read the timers (these misled earlier rounds):
+- `fem_condensation_s` is the **overlapped wall** of the first half, not the FEM work. The FEM
+  task's own time is `interface_elim_diag_fem_stage_work_s`.
+- `block_assembly_s` contains `interface_elimination_s`; pure assembly is ~0.01.
+- `fem_schur_extraction_s` contains `fem_transducer_solves_s`.
+- GPU split: set `BLAB_TEST_ASM_TIMING=<file>` + `BLAB_METAL_GATHER_TIMING=1`. The stages are
+  `metal_native_gather_{pairs,slp_adjoint,dlp_hyp}`, `regular_kernel`, `singular_kernel`.
+  Round 9: regular kernel ~0.24, singular 0.012.
 
 ## How to test
 ```
@@ -75,7 +75,11 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
   `interface_elim_lu_*_s` and `test_prev_{gc_s,gc_pauses,alloc_gb,iteration_wall_s}`.
 - Revise mode is ~6% slower than plain; compare configs within one job (the GPU varies ~15%
   when the machine is shared).
-- Micro-benchmarks: `julia --threads=10 perf/lu_micro.jl`, `perf/blas_micro.jl`.
+- Micro-benchmarks: `julia --threads=10 perf/lu_micro.jl`, `perf/blas_micro.jl`,
+  `perf/gemm3m_micro.jl`, `perf/precond_micro.jl <dump dir> <prev>:<next> ...`.
+- For anything frequency-dependent (stale LU), test on the real 50-point sweep
+  `20*1000**(i/49)`; the 12-freq set has ratio 1.87 between points.
+- Before a risky change, push a checkpoint tag to the fork (the user asks for this).
 
 ## Rules the user set
 - Short test cycles (quick.py), never two benchmarks at once, don't kill the user's app
@@ -86,6 +90,7 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 - Commit and push to the fork at each step.
 - Ask before installing or upgrading anything in the app checkout.
 - Keep tokens low.
+- Goal is speed on other Macs too (stronger CPU or GPU moves the bottleneck).
 
 ## What worked (all in the app)
 | Round | Change | Gain |
@@ -113,7 +118,7 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 |---|---|
 | Pipeline: i+1's first half overlapping i's second half (round 4/5) | MUMPS crash when i's solve overlaps i+1's factorization (process-global Fortran state). GPU assembly next to the Metal field gives wrong results (maxrel 0.2). Even the correct variant is 1.65 vs 1.15 s/freq (contention). Code in `perf/attic/` |
 | `EARLY_BUILD=1` (+`PREFETCH=1`): build(i+1) as a task after i's solve, GPU(i+2) gated behind i's field | Exact, no crash, but 1.13 vs 1.085: only the field leaves the path; condensation, elimination and LU run ~15% slower next to the GPU assembly. **Lesson: the machine is saturated during BLAS/MUMPS stages even when few cores look busy; any CPU-stage overlap loses.** |
-| Prefetch of next-frequency GPU ops (`COUPLED_PREFETCH=1`) | No gain: the first half is tied with the condensation, and it contends |
+| Prefetch of next-frequency GPU ops (`COUPLED_PREFETCH=1`) | No gain: it contends with the CPU stages beside it |
 | GPU LU via MPS | Real-only; the 2n embedding is 2x slower than the CPU |
 | ComplexF32 elimination (`ELIM_F32`) and split hi/lo (`ELIM_SPLIT`) | maxrel 2.7e-4 both: the error is F32 **accumulation** (cancellation), so no F32 variant of that GEMM can meet 1e-5 |
 | Fable I1: never materialize the F64 dense matrix | Pure assembly 0.01 and LU glue (isfinite/stats/convert) 0.024: nothing to gain |
@@ -132,38 +137,52 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 | MUMPS orderings (`BLAB_TEST_MUMPS_ICNTL=7=…`) | METIS (auto) 0.246; SCOTCH/PORD/AMF/QAMD/AMD all 0.375 (likely not built in, fallback) |
 | MUMPS BLR (`ICNTL(35)=2`, CNTL(7) 1e-12/1e-9) | 0.41–0.43 vs 0.247: fronts too small |
 | MUMPS expansion in the solve-phase back substitution | Not done: transducer condensation changes f_I after the reduction (see `_mumps_back_substitution` docstring) |
-| Thread counts (8 vs 10), MUMPS 2/6 threads, kernel group size, gather budget | Within noise or worse (rounds 1–2, when GPU-bound; MUMPS threads untested since the tie) |
+| Thread counts (8 vs 10), kernel group size, gather budget | Within noise or worse (rounds 1–2) |
 
-## Next ideas (untested, rough order)
-1. Stale-LU follow-ups (done in round 7; `perf/precond_micro.jl` measures GMRES iterations
-   offline from `BLAB_TEST_DUMP_DENSE=<dir>` dumps; `BLAB_TEST_STALE_LOG=<file>` logs decisions):
-   - The GMRES iteration costs ~8 ms: F64 3-column matvec 3.4 ms (~45 GB/s, below the memory
-     bandwidth) + blocked F32 solve 4 ms. Halving it extends reuse to ~2 kHz.
-   - `STALE_STOP=13` would avoid the one failure at the cap (~0.12 s per sweep); marginal.
-2. **First half (balanced after round 9, see above).** Not transferable from CUDA: cuDSS (GPU
-   sparse direct with Schur) and cuSOLVER dense LU have no Metal equivalent. Remaining items:
-   - GPU: CUDA also projects C onto the interface flux on the GPU (`build_cuda_combined_bem_blocks`),
-     which would move the host products (~0.02) off the CPU; allocate only A and C when combined
-     (K', H buffers are zero-filled but unused).
-   - FEM: MUMPS factorization 0.247 is the floor with current settings.
-   - GPU side (Fable I4): assemble S/K′ only for the DP0 columns that carry flux (interface +
-     transducer + prescribed faces); rigid faces multiply zero flux. Expected 0.05–0.15 off the
-     GPU branch. Where: `BeatEngineMetalAssembly.jl:235`, tile-reduce kernel column range.
-   - Condensation side:
-     - `BLAB_MUMPS_THREADS` 6/8 (untested since the tie).
-     - `BLAB_MUMPS_SOLVE_THREADS=2` for the transducer solves (0.05).
-     - Write MUMPS values straight from precomputed K/M/wall index maps instead of building a
-       new sparse `fem_system` per frequency (0.03).
-     - MUMPS pivot threshold `CNTL(1)`: check `INFOG(12)` (delayed pivots) first.
-3. **LU panel before the Schur arrives** (Fable I9): factor the ~1,560 BEM-only columns as
-   soon as the BEM block exists, and finish once S lands. This only helps after idea 2 makes
-   the GPU branch finish first.
-4. **Cut the remaining GC entirely:** keep sweep-persistent buffers for the big per-frequency
-   arrays (dense matrix 155 MB, F32 copy 78, bem_lhs/rhs 77+77, interface block 75, …) so the
-   deferred collection has nothing to do. Worth ≤0.05; measure `test_prev_gc_s` after
-   re-enabling first.
-5. Faster blocked LU: nb tuning with the real matrix, or a recursive LU. The micro-benchmark
-   floor is ~cgemm time (120 ms for n³), so at most ~0.03 more.
+## Next ideas (untested)
+First, **measure rounds 7–9 in the app**: the ~41 s is an estimate, 51.2 s is the last measured value.
+
+Known leftovers, small:
+1. GPU branch (~0.30):
+   - Allocate only A and C when `COMBINED_BM` is on. K′ and H are zero-filled but unused (~0.005).
+   - Project C onto the interface flux on the GPU (CUDA's `build_cuda_combined_bem_blocks`,
+     one owner per output entry). This moves the host products (~0.02) off the CPU.
+2. FEM stage (~0.325):
+   - Write MUMPS values straight from precomputed K/M/wall index maps instead of building a new
+     sparse `fem_system` per frequency (0.011).
+   - MUMPS pivot threshold `CNTL(1)` (via `BLAB_TEST_MUMPS_CNTL`): check `INFOG(12)` (delayed
+     pivots) first.
+   - `MASS_THREADS` 8 was not better than 4 here; re-test on a Mac with more cores.
+3. Stale LU (`perf/precond_micro.jl` measures GMRES iterations offline from
+   `BLAB_TEST_DUMP_DENSE=<dir>` dumps; `BLAB_TEST_STALE_LOG=<file>` logs decisions):
+   - A GMRES iteration costs ~8 ms: F64 3-column matvec 3.4 ms (~45 GB/s) + F32 solve 4 ms.
+   - GMRES-IR (Carson–Higham) would run the inner GMRES with the F32 matrix copy (half the
+     bytes) and keep the F64 residual only in the outer refinement. That would extend reuse
+     toward ~2 kHz.
+   - `STALE_STOP=13` would avoid the one failure at the cap (~0.12 s per sweep).
+4. Cut the remaining GC: keep sweep-persistent buffers for the big per-frequency arrays (dense
+   155 MB, F32 copy 78, bem_lhs/rhs 77+77, interface block 75). Measure `test_prev_gc_s` first.
+
+Fresh directions for a new search (larger, unexplored):
+- **Second half, now the largest block (~0.45 s serial).**
+  - The elimination GEMM (0.116) can't be F32 (accumulation error 2.7e-4).
+  - An **Ozaki-scheme GEMM** could work: split F64 into F32 or integer slices, multiply exactly
+    on the GPU with MPS, then sum. That gives F64 accuracy at GPU F32 speed. It would also use the
+    idle GPU in the second half. Same idea for the LU trailing updates.
+- **The GPU is idle in the second half** (~0.45 s) and the CPU is idle during parts of the GPU
+  kernel. Earlier overlap attempts lost to CPU contention (see table). An overlap using only
+  GPU work in the second half (for example the next frequency's pair kernel, without CPU
+  stages) might not contend the same way, but GPU assembly next to the Metal field once gave
+  wrong results. Check buffer sharing first (`perf/attic/`).
+- **Pair kernel (~0.24):** the far-field quadrature order per frequency
+  (`quadrature_selections`). The kernel cost is ∝ R² quadrature points. Check whether low
+  frequencies use more points than their accuracy needs, keeping maxrel ≤ 1e-5.
+- **Other Macs:** thread counts are tuned for this 10-core machine (`MASS_THREADS=4`, Julia 10
+  threads, blocked LU nb=512, FAST_TRS nb=128). A per-core-count default or a quick
+  auto-tune at startup would help other hardware.
+- **MUMPS factorization 0.247** is the FEM floor with current settings. METIS is best; BLR,
+  other orderings and OpenBLAS are slower. The only CUDA-side answer (cuDSS on the GPU) has no
+  Metal equivalent.
 
 Not viable under 1e-5 (Fable's analysis): interior ROM / Craig-Bampton, rational interpolation
 of S(k) over frequency, F32 MUMPS, F32 elimination.
