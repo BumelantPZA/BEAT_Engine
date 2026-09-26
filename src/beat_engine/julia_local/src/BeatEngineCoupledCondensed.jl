@@ -790,6 +790,52 @@ widened copy of `fem_mesh`.
   they depend on (vertex coordinates, tetrahedra, per-vertex bulk-loss factors, wall matrices), so
   a mesh or loss change made in place is picked up.
 """
+# Position of each stored entry of `part` in `whole`'s nonzeros, or `nothing` if `part` has an entry
+# outside `whole`'s pattern (or the stiffness and mass patterns differ, checked by the caller).
+function _test_pattern_map(part::SparseMatrixCSC, whole::SparseMatrixCSC)
+    size(part) == size(whole) || return nothing
+    map = Vector{Int}(undef, nnz(part))
+    rows = rowvals(whole)
+    for column in axes(part, 2)
+        range = nzrange(whole, column)
+        for entry in nzrange(part, column)
+            local_index = searchsortedfirst(view(rows, range), rowvals(part)[entry])
+            (local_index <= length(range) && rows[range[local_index]] == rowvals(part)[entry]) || return nothing
+            map[entry] = range[local_index]
+        end
+    end
+    return map
+end
+
+function _test_fem_system_inplace(matrices, maps, prepared, omega, frequency_hz, sound_speed, density)
+    stiffness, mass = matrices.stiffness, matrices.mass
+    squared_wavenumber = (omega / Float64(sound_speed))^2
+    values = Vector{ComplexF64}(undef, nnz(stiffness))
+    @inbounds for j in eachindex(values)
+        values[j] = Complex{Float64}(nonzeros(stiffness)[j]) - squared_wavenumber * nonzeros(mass)[j]
+    end
+    bulk_scale = Complex{Float64}(0, propagation_sign() * squared_wavenumber)
+    bulk_values = nonzeros(matrices.bulk_loss_mass)
+    @inbounds for (entry, j) in enumerate(maps.bulk)
+        values[j] -= bulk_scale * bulk_values[entry]
+    end
+    for (operator, matrix, map) in zip(prepared.wall_impedance_operators, matrices.walls, maps.walls)
+        admittance = miki_rigid_backed_surface_admittance(
+            Float64(frequency_hz),
+            Float64(sound_speed),
+            Float64(density),
+            Float64(operator.thickness_m),
+            Float64(operator.flow_resistivity_pa_s_per_m2),
+        )
+        scale = neumann_scale(Float64(density), omega) * admittance
+        wall_values = nonzeros(matrix)
+        @inbounds for (entry, j) in enumerate(map)
+            values[j] -= scale * wall_values[entry]
+        end
+    end
+    return SparseMatrixCSC(size(stiffness)..., stiffness.colptr, stiffness.rowval, values)
+end
+
 function _fem_system_float64(store, fem_mesh::VolumeMesh, prepared, frequency_hz, sound_speed, density)
     walls = [operator.matrix for operator in prepared.wall_impedance_operators]
     cached = !isnothing(store) && haskey(store, :matrices) &&
@@ -827,6 +873,20 @@ function _fem_system_float64(store, fem_mesh::VolumeMesh, prepared, frequency_hz
         end
     end
     omega = 2pi * Float64(frequency_hz)
+    # Test (BLAB_TEST_FEM_INPLACE=1): the values written straight into the stiffness pattern, entry by
+    # entry in the same order of operations as the sparse expressions below (each of which allocated
+    # and merged a 330k-entry matrix).
+    if get(ENV, "BLAB_TEST_FEM_INPLACE", "0") == "1"
+        maps = isnothing(store) ? nothing : get(store, :test_maps, nothing)
+        if isnothing(maps)
+            maps = (bulk=_test_pattern_map(matrices.bulk_loss_mass, matrices.stiffness),
+                    walls=[_test_pattern_map(matrix, matrices.stiffness) for matrix in matrices.walls])
+            isnothing(store) || (store[:test_maps] = maps)
+        end
+        if !isnothing(maps.bulk) && all(!isnothing, maps.walls)
+            return _test_fem_system_inplace(matrices, maps, prepared, omega, frequency_hz, sound_speed, density)
+        end
+    end
     system = assemble_fem_dynamic_stiffness(
         matrices.stiffness,
         matrices.mass,
