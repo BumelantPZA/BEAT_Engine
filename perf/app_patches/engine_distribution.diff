@@ -1,5 +1,5 @@
 diff --git a/src/blab/solvers/engine_distribution.py b/src/blab/solvers/engine_distribution.py
-index 40299fc..f74f223 100644
+index 40299fc..50486e5 100644
 --- a/src/blab/solvers/engine_distribution.py
 +++ b/src/blab/solvers/engine_distribution.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 40299fc..f74f223 100644
  try:
      import beat_engine
  except ImportError as exc:
-@@ -12,4 +14,54 @@ from beat_engine import backend_catalog as backend_catalog
+@@ -12,4 +14,61 @@ from beat_engine import backend_catalog as backend_catalog
  from beat_engine import backend_info as engine_backend_info
  from beat_engine import engine_paths as engine_paths
  
@@ -52,6 +52,13 @@ index 40299fc..f74f223 100644
 +        "BLAB_TEST_OP_POOL": "1",
 +        "BLAB_TEST_HOST_ROW_WEIGHTS": "1",
 +        "BLAB_TEST_FLUX_SKIP": "1",
++        # 2026-09-26 round 9 (ideas from the CUDA backend): symmetry images summed before the gathers,
++        # combined Burton-Miller assembly on the GPU (maxrel 5.8e-6), MUMPS expansion for the
++        # transducer solves, and the interface-mass solve on 4 tasks (50-freq 0.910 -> 0.823 s/freq).
++        "BLAB_TEST_IMAGE_ACCUMULATE": "1",
++        "BLAB_TEST_COMBINED_BM": "1",
++        "BLAB_TEST_MUMPS_EXPAND": "1",
++        "BLAB_TEST_MASS_THREADS": "4",
 +    }
 +}
 +

@@ -1,5 +1,16 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
+## Round 9 (2026-09-26): ideas from the CUDA backend, FEM stage
+| Change | Harness | maxrel |
+|---|---|---|
+| `IMAGE_ACCUMULATE=1` | 1.007 → 0.984 (12 freqs) | 4e-7 |
+| + `COMBINED_BM=1` | 0.955 → 0.927 | 5.4e-6 |
+| + `MUMPS_EXPAND=1` | 0.934 → 0.923 | 0 |
+| + `MASS_THREADS=4` | 0.923 → 0.910 | 5e-12 |
+| 50-freq sweep, round 8 → round 9 | 0.910 → 0.823 | 5.8e-6 |
+Fused image kernel (CUDA style): slower on Metal. MUMPS on OpenBLAS, other orderings, BLR: slower.
+Estimated in-app 50-freq SAWMOD: ~41 s. All four switches are in the app. Details in HANDOFF.md.
+
 ## Round 8 (2026-09-26): GPU branch is the critical path; three bit-identical cuts
 FEM stage work is 0.35 vs GPU branch 0.46: the "tie" was a misread of the overlapped timer.
 | Change | Harness (12 freqs) | maxrel |

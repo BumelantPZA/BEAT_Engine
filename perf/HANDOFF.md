@@ -1,4 +1,4 @@
-# SAWMOD Metal speedups: handoff (2026-09-26, after round 8)
+# SAWMOD Metal speedups: handoff (2026-09-26, after round 9)
 
 To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-test` and say:
 "Read perf/HANDOFF.md and continue with the next idea." Full history is in `perf/NOTES.md`
@@ -15,11 +15,14 @@ To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-tes
   ≈ 48.4 s; FAST_TRS ≈ −1.3 s, STALE_LU ≈ −1.5 s).
 - Round 8 (in the app, not yet measured in-app, all bit-identical): 50-freq sweep 0.972 → **0.899
   s/freq**. **Estimated in-app 50-freq SAWMOD: ~45 s** (48.4 − 50 × 0.073 × 0.94).
+- Round 9 (in the app, not yet measured in-app; ideas from the CUDA backend): 50-freq sweep 0.910 →
+  **0.823 s/freq**, maxrel 5.8e-6. **Estimated in-app 50-freq SAWMOD: ~41 s** (45 − 50 × 0.087 × 0.94).
+  Checkpoint before it: tag `checkpoint-before-fused-images`.
 - Code: this checkout, branch `perf/experiments`, pushed to the user's fork
   (`git push fork perf/experiments`, BumelantPZA/BEAT_Engine). **Never push to `origin`
   (JWSound).**
 - Restore tags: `metal-test-58s` (round 3), `metal-test-bm-threaded` (round 5),
-  `metal-test-round6`, `metal-test-round7`, `metal-test-round8` (current).
+  `metal-test-round6`, `metal-test-round7`, `metal-test-round8`, `metal-test-round9` (current).
 - App side: `../boundary-lab/src/blab/solvers/engine_distribution.py`,
   `METAL_TEST_SOLVER_OPTIONS["test_env"]`. It has no fork; its diff is kept in
   `perf/app_patches/engine_distribution.diff`. The app loads Julia at start, so restart it after
@@ -29,7 +32,13 @@ App env now: `BLAB_TEST_COUPLED_PREFETCH=0`, `BLAB_METAL_REGULAR_KERNEL_MODE=pai
 `BLAB_TEST_BLAS=accelerate`, `BLAB_METAL_FIELD_FAST=3`, `BLAB_TEST_DENSE_STATS=1`,
 `BLAB_TEST_BM_THREADED=1`, `BLAB_TEST_GC_DEFER=1`, `BLAB_TEST_BLOCKED_LU=512`,
 `BLAB_TEST_FAST_TRS=128`, `BLAB_TEST_STALE_LU=15`, `BLAB_TEST_OP_POOL=1`,
-`BLAB_TEST_HOST_ROW_WEIGHTS=1`, `BLAB_TEST_FLUX_SKIP=1`.
+`BLAB_TEST_HOST_ROW_WEIGHTS=1`, `BLAB_TEST_FLUX_SKIP=1`, `BLAB_TEST_IMAGE_ACCUMULATE=1`,
+`BLAB_TEST_COMBINED_BM=1`, `BLAB_TEST_MUMPS_EXPAND=1`, `BLAB_TEST_MASS_THREADS=4`.
+
+**After round 9 the first half is balanced:** GPU branch ~0.30 (BEM ops 0.26 + BM combine 0.04)
+vs FEM stage ~0.325 (MUMPS factorization 0.247, transducer solves 0.034, mass solve 0.022,
+FEM system 0.011). On Macs with a faster CPU the GPU branch is critical again, on Macs with a
+bigger GPU the FEM stage is: both sides are worth cutting.
 
 ## Per-frequency budget now (s, harness medians)
 | Stage | s | Code |
@@ -86,6 +95,11 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 | 5 | Threaded Burton-Miller combine (`BM_THREADED`), exact | first half 0.54 → 0.47 |
 | 6 | `GC_DEFER`: GC off during a frequency, one collection after (was 1.1 GB/freq, 5 pauses, 0.12–0.16 s), exact | −0.05 s/freq |
 | 6 | (both round-6 rows together: in-app 58 → 51.2 s) | |
+| 9 | `IMAGE_ACCUMULATE=1`: xy symmetry = identity + 3 images; chunk loop outside, transforms inside, later transforms add into the pair blocks, gathers once per chunk | −0.023 s/freq, maxrel 4e-7 |
+| 9 | `COMBINED_BM=1` (CUDA's combined assembly): pair kernel writes A = −D + βH and C = −S − βK′ (2 reduction passes instead of 4, one gather each), singular gather combines too; host adds only row weights and identity. Needs HOST_ROW_WEIGHTS + singular write-back `gather`. `BLAB_TEST_COMBINED_CHECK=<file>` compares operators with the stock path (~1e-7) | BEM ops 0.344 → 0.258; −0.028 s/freq, maxrel 5.4e-6 |
+| 9 | `MUMPS_EXPAND=1`: transducer interior solve as the expansion (ICNTL(26)=2, x_Γ=0) of the preceding reduction, one forward sweep saved | −0.011 s/freq, bit-identical |
+| 9 | `MASS_THREADS=4`: CHOLMOD interface-mass solve in 4 column chunks on parallel tasks (common is task-local) | mass 0.043 → 0.022; −0.013 s/freq, maxrel 5e-12 |
+| 9 | (round 9 together, 50-freq sweep: 0.910 → 0.823, maxrel 5.8e-6) | |
 | 8 | `OP_POOL=1`: keep the four Metal operator buffers for the next frequency, zero them on the GPU (alloc 0.02) | −0.036 s/freq |
 | 8 | `HOST_ROW_WEIGHTS=1`: symmetry row weights applied inside the threaded host BM combine instead of four GPU broadcasts + weight upload | −0.024 s/freq |
 | 8 | `FLUX_SKIP=1`: 2964 of 6054 faces carry flux; skip the S/K' reduction pass (pair kernel) and S/K' gather for the others, host combine writes zeros | −0.031 s/freq |
@@ -113,6 +127,11 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 | 3M complex GEMM for the elimination product (3 dgemms) | 158 → 143 ms micro; split/combine overhead eats it; one dgemm already runs at ~0.45 TFLOP/s F64 (`perf/gemm3m_micro.jl`) |
 | Prefetch again after round 8 (`COUPLED_PREFETCH=1`) | 0.977 vs 0.899: the GPU assembly slows the CPU stages beside it (elimination 0.15 → 0.19) |
 | Skip S/K' math inside the quadrature fold for rigid trials | Not tried: S is needed for the hypersingular term; saves ~6 of ~40 ops per qpair, and SIMD groups mix two trial rows |
+| Fused image kernel (all 4 transforms per thread, CUDA `fused=true`) | Gathers 0.095 → 0.026 but pair kernel 0.27 → 0.45 (Metal compiler; also with one inlined body and running sums). Reverted; IMAGE_ACCUMULATE gets the gather saving without it |
+| MUMPS on OpenBLAS32 (`BLAB_TEST_BLAS=hybrid`, MUMPS threads 4/8) | factorization 0.30/0.26 vs 0.247 on Accelerate |
+| MUMPS orderings (`BLAB_TEST_MUMPS_ICNTL=7=…`) | METIS (auto) 0.246; SCOTCH/PORD/AMF/QAMD/AMD all 0.375 (likely not built in, fallback) |
+| MUMPS BLR (`ICNTL(35)=2`, CNTL(7) 1e-12/1e-9) | 0.41–0.43 vs 0.247: fronts too small |
+| MUMPS expansion in the solve-phase back substitution | Not done: transducer condensation changes f_I after the reduction (see `_mumps_back_substitution` docstring) |
 | Thread counts (8 vs 10), MUMPS 2/6 threads, kernel group size, gather budget | Within noise or worse (rounds 1–2, when GPU-bound; MUMPS threads untested since the tie) |
 
 ## Next ideas (untested, rough order)
@@ -121,7 +140,12 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
    - The GMRES iteration costs ~8 ms: F64 3-column matvec 3.4 ms (~45 GB/s, below the memory
      bandwidth) + blocked F32 solve 4 ms. Halving it extends reuse to ~2 kHz.
    - `STALE_STOP=13` would avoid the one failure at the cap (~0.12 s per sweep); marginal.
-2. **First half: now GPU 0.40 vs FEM 0.35 (see correction above).** Remaining items:
+2. **First half (balanced after round 9, see above).** Not transferable from CUDA: cuDSS (GPU
+   sparse direct with Schur) and cuSOLVER dense LU have no Metal equivalent. Remaining items:
+   - GPU: CUDA also projects C onto the interface flux on the GPU (`build_cuda_combined_bem_blocks`),
+     which would move the host products (~0.02) off the CPU; allocate only A and C when combined
+     (K', H buffers are zero-filled but unused).
+   - FEM: MUMPS factorization 0.247 is the floor with current settings.
    - GPU side (Fable I4): assemble S/K′ only for the DP0 columns that carry flux (interface +
      transducer + prescribed faces); rigid faces multiply zero flux. Expected 0.05–0.15 off the
      GPU branch. Where: `BeatEngineMetalAssembly.jl:235`, tile-reduce kernel column range.
