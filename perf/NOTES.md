@@ -1,5 +1,17 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
+## Round 10 (2026-09-26): implicit elimination product, host array pool
+| Change | Harness (50-freq sweep) | maxrel |
+|---|---|---|
+| `ELIM_IMPLICIT=1`: B_q·W kept out of the F64 dense matrix, applied in every F64 residual; F32 LU input gets it from a cgemm | 0.807 → 0.745 | 1.1e-7 |
+| + `HOST_POOL=1`: big per-frequency host arrays reused (dense, BM outputs, interface blocks, LU input, mass solve, MUMPS Schur copy) | 0.734 → 0.653 | 0 |
+Findings: a fresh 155 MB array costs ~57 ms of page faults to fill, a reused one 1.5 ms. SAWMOD
+allocated 1.13 GB/freq (76k faults, 0.30 s system time); now 0.27 GB (24k, 0.10 s). The deferred GC
+itself is cheap (young collection 2.4 ms); the page faults were the cost. Accelerate does not
+thread gemms with 1–3 columns: row-chunk them over tasks (`perf/implicit_micro.jl`). User CPU is only
+~0.8 s per 0.61 s iteration: BLAS stages are bound by the shared AMX units, not core count.
+Estimated in-app 50-freq SAWMOD: ~34 s (41 − 50 × 0.15 × 0.94). Both switches are in the app.
+
 ## Round 9 (2026-09-26): ideas from the CUDA backend, FEM stage
 | Change | Harness | maxrel |
 |---|---|---|
