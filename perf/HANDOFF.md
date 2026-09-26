@@ -25,6 +25,32 @@ To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-tes
 - App side: `../boundary-lab/src/blab/solvers/engine_distribution.py` (`METAL_TEST_SOLVER_OPTIONS`) and
   `coupled_backend.py` (threads). No fork; diffs in `perf/app_patches/`. Restart the app after engine edits.
 
+## Next session: extensive tests of prototype and SAWMOD solves (user request, 2026-09-26)
+State: everything committed and pushed (last `7ffde50`); harness stopped; the user has not yet pushed
+the app patches (`perf/app_patches/engine_distribution.diff`, `coupled_backend.diff`) nor restarted
+the app. App-path tool (the app's own headless solve, persistent worker, run 2 = warm):
+```
+cd ../boundary-lab
+.venv/bin/python ../beat-engine-test/perf/app_timing.py examples/Multi_region_SAWMOD/Multi_region_SAWMOD.blab.json 2 "" 50
+APP_TIMING_BACKEND=beat_metal .venv/bin/python ../beat-engine-test/perf/app_timing.py ../beat-engine-test/perf/proto2_quarter.blab.json 2 ""
+```
+Args: project, runs, threads ("" = backend default, now os.cpu_count() for the test backend), freq
+count override. Env: `APP_TIMING_BACKEND` (beat_metal_test default | beat_metal = stock),
+`APP_TIMING_SYMMETRY`. Per-frequency Julia timers of the last run land in the scratchpad
+`app_rows<run>.json` (path hard-coded in app_timing.py; change it for a new session).
+Baselines (M1 Pro, warm):
+| Project | Test solver | Stock Metal |
+|---|---|---|
+| SAWMOD 50 freqs | 25.1 s (0.47 s/freq) | not measured this session (in-app 141 s originally) |
+| prototype2 quarter mesh + xy symmetry, 200 freqs (`proto2_quarter.blab.json`; the GUI solves on the generator's `_reduced` mesh) | 13.8 s (0.068) | 18.9 s (0.094) |
+| prototype2 full mesh, symmetry off (`proto2.blab.json`) | 39.5 s | 46.2 s |
+User's own in-app numbers before round 11: SAWMOD 37.4 s; prototype2 stock 12.4 s (why ours is 18.9 s
+is not explained: maybe fewer field points in the GUI). Accuracy harness jobs (maxrel vs a config):
+`"request": "proto2.json" | "vented_sub.json" | "compression_driver.json" | "sawmod.json"` in quick.py
+jobs (captured requests in perf/, some gitignored; recapture with scripts/capture_boundary_lab_request.py).
+Ideas for the tests: stock vs test on SAWMOD through app_timing (accuracy: compare output quantities
+too, not only time), 200-freq SAWMOD, cold first run (Julia start ~40-60 s), repeated runs on one worker.
+
 ## Per-frequency picture after round 11 (harness, 50-freq sweep, 0.468 s/freq)
 The critical chain is CPU only: build(i+1) = FEM stage 0.31 (MUMPS 0.25; 0.19 when alone) → gate/
 elimination 0.02 → F32 LU 0.11 fresh (29/50) / ~0 stale. Solve(i) (0.06 fresh, 0.17 stale GMRES) and
