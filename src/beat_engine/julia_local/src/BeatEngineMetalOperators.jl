@@ -11,7 +11,8 @@
 const _METAL_OPERATOR_KEYS = (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
 
 # Test (BLAB_TEST_OP_POOL=1): released operator buffers are kept for the next assembly of the same
-# shape instead of freed, and zeroed on the GPU there (allocation was ~0.02 s/freq). One set only.
+# shape instead of freed, and zeroed on the GPU there (allocation was ~0.02 s/freq). Two sets: with
+# the test prefetch, frequency i+1's operators are assembled while frequency i's are still held.
 const _TEST_OPERATOR_POOL = Any[]
 const _TEST_OPERATOR_POOL_LOCK = ReentrantLock()
 _test_operator_pool_enabled() = get(ENV, "BLAB_TEST_OP_POOL", "0") == "1"
@@ -61,7 +62,7 @@ function release_operator_storage!(operators::NamedTuple)
     if backing !== nothing
         if _test_operator_pool_enabled()
             kept = lock(_TEST_OPERATOR_POOL_LOCK) do
-                isempty(_TEST_OPERATOR_POOL) && (push!(_TEST_OPERATOR_POOL, backing); true)
+                length(_TEST_OPERATOR_POOL) < 2 && (push!(_TEST_OPERATOR_POOL, backing); true)
             end
             kept === true && return nothing
         end

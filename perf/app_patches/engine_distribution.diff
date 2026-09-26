@@ -1,5 +1,5 @@
 diff --git a/src/blab/solvers/engine_distribution.py b/src/blab/solvers/engine_distribution.py
-index 40299fc..b77c5b8 100644
+index 40299fc..ca730cf 100644
 --- a/src/blab/solvers/engine_distribution.py
 +++ b/src/blab/solvers/engine_distribution.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 40299fc..b77c5b8 100644
  try:
      import beat_engine
  except ImportError as exc:
-@@ -12,4 +14,74 @@ from beat_engine import backend_catalog as backend_catalog
+@@ -12,4 +14,80 @@ from beat_engine import backend_catalog as backend_catalog
  from beat_engine import backend_info as engine_backend_info
  from beat_engine import engine_paths as engine_paths
  
@@ -29,7 +29,7 @@ index 40299fc..b77c5b8 100644
 +        # Accelerate, fast field evaluation, fused dense-norm pass. Prefetch is off: with the
 +        # faster kernel the GPU assembly hides behind the FEM condensation, and prefetch only
 +        # adds CPU contention (1.31 vs 1.46 s/freq).
-+        "BLAB_TEST_COUPLED_PREFETCH": "0",
++        "BLAB_TEST_COUPLED_PREFETCH": "1",   # round 11: on again, for EARLY_BUILD (see below)
 +        "BLAB_METAL_REGULAR_KERNEL_MODE": "pair_tilereduce",
 +        "BLAB_TEST_BLAS": "accelerate",
 +        "BLAB_METAL_FIELD_FAST": "3",
@@ -72,6 +72,12 @@ index 40299fc..b77c5b8 100644
 +        # Round 11: no Float32 FEM system assembled only to be replaced by the Float64 one (bit-identical,
 +        # -0.006 s/freq).
 +        "BLAB_TEST_FEM_F32_SKIP": "1",
++        # Round 11: frequency i+1's build (FEM stage, elimination, LU) starts right after frequency i's
++        # solve and overlaps its field; its GPU operators were prefetched during i's host stages, now
++        # with the round 8/9 GPU switches (PREFETCH_OPT; they were off for prefetch). Bit-identical.
++        # 50-freq 0.625 -> 0.571 s/freq.
++        "BLAB_TEST_EARLY_BUILD": "1",
++        "BLAB_TEST_PREFETCH_OPT": "1",
 +    }
 +}
 +

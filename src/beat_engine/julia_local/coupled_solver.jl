@@ -2957,9 +2957,10 @@ function solve_request_impl(request; event_mode=false)
             frequencies_all = request["frequencies_hz"]
             spawn_next = if prefetch_operators && frequency_index < length(frequencies_all)
                 next_index = frequency_index + 1
-                () -> (next_operators = Threads.@spawn condensed_metal_operators(
+                (flux_columns=nothing) -> (next_operators = Threads.@spawn condensed_metal_operators(
                     coupled_cache, bem_mesh, FloatType(frequencies_all[next_index]), sound_speed;
                     quadrature_order=quadrature_selections[next_index].order, singular_order=singular_order,
+                    flux_columns=flux_columns,
                 ))
             else
                 nothing
@@ -3048,13 +3049,14 @@ function solve_request_impl(request; event_mode=false)
                 test_gate = test_field_done
                 test_next_index = frequency_index + 1
                 test_on_ready = if test_next_index < length(request["frequencies_hz"])
-                    () -> (next_operators = Threads.@spawn begin
+                    (flux_columns=nothing) -> (next_operators = Threads.@spawn begin
                         wait(test_gate)
                         condensed_metal_operators(
                             coupled_cache, bem_mesh, FloatType(request["frequencies_hz"][test_next_index + 1]),
                             sound_speed;
                             quadrature_order=quadrature_selections[test_next_index + 1].order,
                             singular_order=singular_order,
+                            flux_columns=flux_columns,
                         )
                     end)
                 else

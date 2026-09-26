@@ -2378,8 +2378,7 @@ function build_condensed_coupled_system(
     # Test (BLAB_TEST_FLUX_SKIP=1, Metal, own assembly only): DP0 columns whose face carries flux in
     # some right-hand-side block. S/K' are only ever multiplied by those flux matrices, so the GPU
     # skips the other columns and the host combine writes zeros there.
-    flux_skip = get(ENV, "BLAB_TEST_FLUX_SKIP", "0") == "1" && isnothing(prefetched_operators) &&
-                prepared.bem_backend == :metal
+    flux_skip = get(ENV, "BLAB_TEST_FLUX_SKIP", "0") == "1" && prepared.bem_backend == :metal
     flux_columns = if flux_skip
         used = vec(any(!iszero, interface_operators.bem_flux; dims=2))
         transducer_count == 0 || (used .|= vec(any(!iszero, bem_motion_flux; dims=2)))
@@ -2396,48 +2395,16 @@ function build_condensed_coupled_system(
         # while the previous frequency's host stages ran; `bem_operator_s` is the wait.
         fetched = fetch(prefetched_operators)
         fetched.k == wavenumber || error("prefetched operators for k=$(fetched.k), need k=$(wavenumber)")
+        # Test (BLAB_TEST_PREFETCH_OPT=1): the prefetch ran the same switches as the build below.
+        row_weights = get(fetched, :row_weights, nothing)
+        combined_bm = get(fetched, :combined, false)
+        flux_columns = get(fetched, :flux_columns, nothing)
         fetched.operators
     elseif prepared.bem_backend == :metal
-        # Metal assembles the four operators on the GPU; the condensed algebra
-        # below is CPU-only, so bring them down and free the device copies.
-        host_row_weights = get(ENV, "BLAB_TEST_HOST_ROW_WEIGHTS", "0") == "1" &&
-                           get(ENV, "BLAB_TEST_BM_THREADED", "0") == "1" &&
-                           BeatEngineCore.normalized_symmetry_mode(prepared.symmetry_mode) != :off
-        host_row_weights && (BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = true)
-        # Test (BLAB_TEST_COMBINED_BM=1, with HOST_ROW_WEIGHTS): the GPU writes A = -D + βH and
-        # C = -S - βK' directly (see BeatEngineCore._TEST_COMBINED_BM).
-        combined_bm = host_row_weights && get(ENV, "BLAB_TEST_COMBINED_BM", "0") == "1"
-        combined_bm && (BeatEngineCore._TEST_COMBINED_BM[] = Complex{Float32}(burton_miller_coupling(wavenumber)))
-        if flux_skip
-            BeatEngineCore._TEST_FLUX_MASK[] = BeatEngineCore.MtlArray(Int32.(flux_columns))
-        end
-        device_operators = try
-            assemble_regular_galerkin_operators(
-                bem_mesh,
-                prepared.p1,
-                prepared.dp0,
-                wavenumber,
-                prepared.rule;
-                skip_singular=false,
-                singular_order=singular_order,
-                backend=:metal,
-                device_cache=prepared.device_cache,
-                singular_cache=prepared.singular_cache,
-                device_singular_cache=prepared.device_singular_cache,
-                symmetry_mode=prepared.symmetry_mode,
-                timing=_test_asm_timing(),
-            )
-        finally
-            BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = false
-            BeatEngineCore._TEST_COMBINED_BM[] = nothing
-            BeatEngineCore._TEST_FLUX_MASK[] = nothing
-        end
-        host_row_weights && (row_weights = p1_symmetry_orbit_weights(bem_mesh, prepared.symmetry_mode))
-        _test_asm_timing_write(wavenumber)
-        # Wraps shared device storage in place (copies it when the storage mode
-        # is private); either way the host tuple owns the device buffers, so
-        # `device_operators` must not be released separately.
-        metal_host_operators(device_operators)
+        assembled = _test_metal_operators(prepared, bem_mesh, wavenumber, singular_order, flux_columns)
+        row_weights = assembled.row_weights
+        combined_bm = assembled.combined
+        assembled.operators
     else
         assemble_condensed_regular_operators(
             bem_mesh,
@@ -2453,7 +2420,7 @@ function build_condensed_coupled_system(
         )
     end
     bem_operator_s = (time_ns() - bem_operator_started) / 1.0e9
-    isnothing(on_operators_ready) || on_operators_ready()
+    isnothing(on_operators_ready) || on_operators_ready(flux_columns)
 
     bem_matrix_started = time_ns()
     bem_lhs, bem_rhs_operator = if !isnothing(row_weights)
@@ -2974,13 +2941,65 @@ end
 Test prefetch: the four Metal BEM operators exactly as `build_condensed_coupled_system` assembles
 them for this frequency, so a sweep can assemble frequency i+1 while frequency i's host stages run.
 """
+# Metal assembly of the four operators under the round 8/9 test switches (host row weights, combined
+# Burton-Miller, flux skip), which reach the kernels through BeatEngineCore globals: callers must
+# never run two of these at once. Returns the host operators, the row weights still to apply and
+# whether the operators are combined.
+function _test_metal_operators(prepared, bem_mesh, wavenumber, singular_order, flux_columns)
+    # Metal assembles the four operators on the GPU; the condensed algebra
+    # below is CPU-only, so bring them down and free the device copies.
+    host_row_weights = get(ENV, "BLAB_TEST_HOST_ROW_WEIGHTS", "0") == "1" &&
+                       get(ENV, "BLAB_TEST_BM_THREADED", "0") == "1" &&
+                       BeatEngineCore.normalized_symmetry_mode(prepared.symmetry_mode) != :off
+    host_row_weights && (BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = true)
+    # Test (BLAB_TEST_COMBINED_BM=1, with HOST_ROW_WEIGHTS): the GPU writes A = -D + βH and
+    # C = -S - βK' directly (see BeatEngineCore._TEST_COMBINED_BM).
+    combined_bm = host_row_weights && get(ENV, "BLAB_TEST_COMBINED_BM", "0") == "1"
+    combined_bm && (BeatEngineCore._TEST_COMBINED_BM[] = Complex{Float32}(burton_miller_coupling(wavenumber)))
+    if !isnothing(flux_columns)
+        BeatEngineCore._TEST_FLUX_MASK[] = BeatEngineCore.MtlArray(Int32.(flux_columns))
+    end
+    device_operators = try
+        assemble_regular_galerkin_operators(
+            bem_mesh,
+            prepared.p1,
+            prepared.dp0,
+            wavenumber,
+            prepared.rule;
+            skip_singular=false,
+            singular_order=singular_order,
+            backend=:metal,
+            device_cache=prepared.device_cache,
+            singular_cache=prepared.singular_cache,
+            device_singular_cache=prepared.device_singular_cache,
+            symmetry_mode=prepared.symmetry_mode,
+            timing=_test_asm_timing(),
+        )
+    finally
+        BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = false
+        BeatEngineCore._TEST_COMBINED_BM[] = nothing
+        BeatEngineCore._TEST_FLUX_MASK[] = nothing
+    end
+    row_weights = host_row_weights ? p1_symmetry_orbit_weights(bem_mesh, prepared.symmetry_mode) : nothing
+    _test_asm_timing_write(wavenumber)
+    # Wraps shared device storage in place (copies it when the storage mode
+    # is private); either way the host tuple owns the device buffers, so
+    # `device_operators` must not be released separately.
+    return (operators=metal_host_operators(device_operators), row_weights=row_weights, combined=combined_bm)
+end
+
 function condensed_metal_operators(
     cache, bem_mesh::BoundaryMesh{T}, frequency_hz::T, sound_speed::T;
-    quadrature_order::Int, singular_order::Int,
+    quadrature_order::Int, singular_order::Int, flux_columns=nothing,
 ) where {T<:AbstractFloat}
     prepared = merge(cache.base, cache.quadrature_bundles[quadrature_order])
     omega = T(2pi) * frequency_hz
     wavenumber = omega / sound_speed
+    # Test (BLAB_TEST_PREFETCH_OPT=1): the build's own assembly, with the flux mask the build used.
+    if get(ENV, "BLAB_TEST_PREFETCH_OPT", "0") == "1"
+        assembled = _test_metal_operators(prepared, bem_mesh, wavenumber, singular_order, flux_columns)
+        return (k=wavenumber, assembled..., flux_columns=flux_columns)
+    end
     device_operators = assemble_regular_galerkin_operators(
         bem_mesh,
         prepared.p1,
@@ -2997,7 +3016,7 @@ function condensed_metal_operators(
         timing=_test_asm_timing(),
     )
     _test_asm_timing_write(wavenumber)
-    return (k=wavenumber, operators=metal_host_operators(device_operators))
+    return (k=wavenumber, operators=metal_host_operators(device_operators), flux_columns=nothing)
 end
 
 # Test hook: BLAB_TEST_ASM_TIMING=<file> appends the Metal assembly stage timings per call.
