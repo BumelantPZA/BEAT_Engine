@@ -30,7 +30,7 @@ which makes that margin nearly free.
 """
 module BeatEngineCoupledCondensed
 
-using LinearAlgebra, SparseArrays, StaticArrays, Statistics
+using LinearAlgebra, Serialization, SparseArrays, StaticArrays, Statistics
 using ..BeatEngineCore
 using ..BeatEngineCoupled
 
@@ -1598,6 +1598,11 @@ function _build_mumps_condensation(
         analysis_reused = mumps_analyse!(solver, fem_system, retained)
         analysis_s = (time_ns() - analysis_started) / 1.0e9
 
+        # Test (BLAB_TEST_DUMP_FEM=<file>): the FEM system and its Schur set, for offline MUMPS studies.
+        dump_fem = get(ENV, "BLAB_TEST_DUMP_FEM", "")
+        if !isempty(dump_fem) && !isfile(dump_fem)
+            open(io -> serialize(io, (fem_system=fem_system, retained=retained, interior=interior_vertices)), dump_fem, "w")
+        end
         factorization_started = time_ns()
         # Assembly sums the (i, j) and (j, i) contributions separately, so allow round-off.
         schur_double = mumps_factorize!(solver, fem_system; symmetry_tolerance=64 * eps(S))
@@ -1716,6 +1721,11 @@ function _forward_schur(
     R = Complex{result_type}
     interior_rhs = ComplexF64.(fem_rhs[condensation.interior_vertices, :])
     if hasproperty(condensation, :backend) && condensation.backend == :mumps_seq
+        # Test (BLAB_TEST_ZERO_RHS_SKIP=1): voltage-only excitations leave the FEM right-hand side
+        # zero, and so its reduction; skip the MUMPS call (the back substitution never expands it).
+        if get(ENV, "BLAB_TEST_ZERO_RHS_SKIP", "0") == "1" && all(iszero, fem_rhs)
+            return zeros(R, condensation.retained_count, size(fem_rhs, 2)), interior_rhs
+        end
         reduced = mumps_reduce(condensation.mumps_solver, fem_rhs)
         return R.(reduced), interior_rhs
     end
