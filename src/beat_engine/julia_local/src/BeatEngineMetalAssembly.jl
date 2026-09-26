@@ -46,7 +46,10 @@ function _assemble_regular_galerkin_operators_metal_native(
     operators = nothing
     storage = metal_operator_storage_mode()
     allocation_elapsed = @elapsed begin
-        operators = (
+        p1n, dp0n = p1_space.global_dof_count, dp0_space.global_dof_count
+        pooled = storage == Metal.SharedStorage ?
+                 _test_take_pooled_operators(((p1n, dp0n), (p1n, p1n), (p1n, dp0n), (p1n, p1n))) : nothing
+        operators = !isnothing(pooled) ? pooled : (
             single_layer=Metal.zeros(Complex{T}, p1_space.global_dof_count, dp0_space.global_dof_count; storage=storage),
             double_layer=Metal.zeros(Complex{T}, p1_space.global_dof_count, p1_space.global_dof_count; storage=storage),
             adjoint_double_layer=Metal.zeros(Complex{T}, p1_space.global_dof_count, dp0_space.global_dof_count; storage=storage),
@@ -194,7 +197,7 @@ function _assemble_regular_galerkin_operators_metal_native(
         timing !== nothing && (timing["metal_host_singular_corrections"] = host_elapsed)
         singular_pairs = correction_cache.pair_count
     end
-    weight_elapsed = @elapsed _apply_metal_operator_p1_row_weights!(operators, mesh, normalized_mode)
+    weight_elapsed = @elapsed (_TEST_DEFER_ROW_WEIGHTS[] || _apply_metal_operator_p1_row_weights!(operators, mesh, normalized_mode))
     timing !== nothing && (timing["metal_native_symmetry_row_weights"] = weight_elapsed)
     total_pairs = length(indices) * length(indices)
     image_count = length(native_cache.image_transforms)

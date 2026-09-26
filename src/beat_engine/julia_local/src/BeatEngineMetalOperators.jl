@@ -10,6 +10,29 @@
 
 const _METAL_OPERATOR_KEYS = (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
 
+# Test (BLAB_TEST_OP_POOL=1): released operator buffers are kept for the next assembly of the same
+# shape instead of freed, and zeroed on the GPU there (allocation was ~0.02 s/freq). One set only.
+const _TEST_OPERATOR_POOL = Any[]
+const _TEST_OPERATOR_POOL_LOCK = ReentrantLock()
+_test_operator_pool_enabled() = get(ENV, "BLAB_TEST_OP_POOL", "0") == "1"
+function _test_take_pooled_operators(sizes)
+    _test_operator_pool_enabled() || return nothing
+    pooled = lock(_TEST_OPERATOR_POOL_LOCK) do
+        isempty(_TEST_OPERATOR_POOL) ? nothing : pop!(_TEST_OPERATOR_POOL)
+    end
+    isnothing(pooled) && return nothing
+    if map(key -> size(getfield(pooled, key)), _METAL_OPERATOR_KEYS) != sizes
+        foreach(key -> Metal.unsafe_free!(getfield(pooled, key)), _METAL_OPERATOR_KEYS)
+        return nothing
+    end
+    foreach(key -> fill!(getfield(pooled, key), zero(eltype(getfield(pooled, key)))), _METAL_OPERATOR_KEYS)
+    return pooled
+end
+
+# Test (BLAB_TEST_HOST_ROW_WEIGHTS=1): set by the condensed builder around its own assembly, which
+# then folds the symmetry row weights into its host Burton-Miller combine instead of a GPU pass.
+const _TEST_DEFER_ROW_WEIGHTS = Ref(false)
+
 """
     release_operator_storage!(operators)
 
@@ -23,6 +46,12 @@ tuple while host views over it are still in use leaves those views dangling.
 function release_operator_storage!(operators::NamedTuple)
     backing = get(operators, :metal_backing, nothing)
     if backing !== nothing
+        if _test_operator_pool_enabled()
+            kept = lock(_TEST_OPERATOR_POOL_LOCK) do
+                isempty(_TEST_OPERATOR_POOL) && (push!(_TEST_OPERATOR_POOL, backing); true)
+            end
+            kept === true && return nothing
+        end
         for key in _METAL_OPERATOR_KEYS
             Metal.unsafe_free!(getfield(backing, key))
         end

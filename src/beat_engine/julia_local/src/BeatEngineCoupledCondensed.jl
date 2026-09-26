@@ -2107,6 +2107,7 @@ function build_condensed_coupled_system(
     condensation_task = stage_overlap ? Threads.@spawn(fem_stage()) : nothing
 
     bem_operator_started = time_ns()
+    row_weights = nothing   # test (BLAB_TEST_HOST_ROW_WEIGHTS): symmetry weights still to apply on the host
     # This solver's own fork of the CPU regular assembly, so it can be optimised without
     # touching the shared path every other backend runs through. Behaviourally identical to
     # `assemble_regular_galerkin_operators(...; backend=:cpu)`, pinned by an equivalence test.
@@ -2119,21 +2120,30 @@ function build_condensed_coupled_system(
     elseif prepared.bem_backend == :metal
         # Metal assembles the four operators on the GPU; the condensed algebra
         # below is CPU-only, so bring them down and free the device copies.
-        device_operators = assemble_regular_galerkin_operators(
-            bem_mesh,
-            prepared.p1,
-            prepared.dp0,
-            wavenumber,
-            prepared.rule;
-            skip_singular=false,
-            singular_order=singular_order,
-            backend=:metal,
-            device_cache=prepared.device_cache,
-            singular_cache=prepared.singular_cache,
-            device_singular_cache=prepared.device_singular_cache,
-            symmetry_mode=prepared.symmetry_mode,
-            timing=_test_asm_timing(),
-        )
+        host_row_weights = get(ENV, "BLAB_TEST_HOST_ROW_WEIGHTS", "0") == "1" &&
+                           get(ENV, "BLAB_TEST_BM_THREADED", "0") == "1" &&
+                           BeatEngineCore.normalized_symmetry_mode(prepared.symmetry_mode) != :off
+        host_row_weights && (BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = true)
+        device_operators = try
+            assemble_regular_galerkin_operators(
+                bem_mesh,
+                prepared.p1,
+                prepared.dp0,
+                wavenumber,
+                prepared.rule;
+                skip_singular=false,
+                singular_order=singular_order,
+                backend=:metal,
+                device_cache=prepared.device_cache,
+                singular_cache=prepared.singular_cache,
+                device_singular_cache=prepared.device_singular_cache,
+                symmetry_mode=prepared.symmetry_mode,
+                timing=_test_asm_timing(),
+            )
+        finally
+            BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = false
+        end
+        host_row_weights && (row_weights = p1_symmetry_orbit_weights(bem_mesh, prepared.symmetry_mode))
         _test_asm_timing_write(wavenumber)
         # Wraps shared device storage in place (copies it when the storage mode
         # is private); either way the host tuple owns the device buffers, so
@@ -2157,18 +2167,32 @@ function build_condensed_coupled_system(
     isnothing(on_operators_ready) || on_operators_ready()
 
     bem_matrix_started = time_ns()
-    bem_lhs, bem_rhs_operator = (get(ENV, "BLAB_TEST_BM_THREADED", "0") == "1" ?
-                                 _test_burton_miller_matrices_threaded : burton_miller_neumann_matrices)(
-        operators,
-        prepared.identity_p1_p1,
-        prepared.identity_p1_dp0,
-        wavenumber,
-    )
+    bem_lhs, bem_rhs_operator = if !isnothing(row_weights)
+        _test_burton_miller_matrices_threaded(
+            operators, prepared.identity_p1_p1, prepared.identity_p1_dp0, wavenumber; row_weights=row_weights,
+        )
+    else
+        (get(ENV, "BLAB_TEST_BM_THREADED", "0") == "1" ?
+         _test_burton_miller_matrices_threaded : burton_miller_neumann_matrices)(
+            operators,
+            prepared.identity_p1_p1,
+            prepared.identity_p1_dp0,
+            wavenumber,
+        )
+    end
     elimination_split[:diag_bm_matrices] = (time_ns() - bem_matrix_started) / 1.0e9
     # `operators` is dead from here on and the matrices above are freshly
     # allocated host arrays, so free the Metal buffers now rather than leaking
     # one operator set per condensed frequency.
     prepared.bem_backend == :metal && release_operator_storage!(operators)
+    if !isempty(get(ENV, "BLAB_TEST_FLUX_COUNT", ""))
+        used = vec(any(!iszero, interface_operators.bem_flux; dims=2))
+        transducer_count == 0 || (used .|= vec(any(!iszero, bem_motion_flux; dims=2)))
+        prescribed_bem_count == 0 || (used .|= vec(any(!iszero, bem_prescribed_neumann; dims=2)))
+        open(io -> println(io, "faces=$(length(used)) flux_faces=$(count(used)) p1=$(size(bem_rhs_operator, 1)) ",
+                           "interface=$(size(interface_operators.bem_flux, 2)) transducers=$transducer_count prescribed=$prescribed_bem_count ",
+                           "images=$(length(bem_mesh.faces))"), ENV["BLAB_TEST_FLUX_COUNT"], "a")
+    end
     bem_interface_block = -(bem_rhs_operator * Complex{T}.(interface_operators.bem_flux))
     bem_motion_block = transducer_count == 0 ? nothing : -(bem_rhs_operator * bem_motion_flux)
     bem_prescribed_rhs = prescribed_bem_count == 0 ?
@@ -2506,13 +2530,31 @@ end
 # Test (BLAB_TEST_BM_THREADED=1): `burton_miller_neumann_matrices` with each output column on its own
 # thread. The per-entry expressions are the broadcasts' own, in the same order, so the result is
 # bit-identical; the broadcasts run on one thread and took ~0.15 s/freq on the critical path.
-function _test_burton_miller_matrices_threaded(operators, identity_p1_p1, identity_p1_dp0, k::T) where {T<:AbstractFloat}
+function _test_burton_miller_matrices_threaded(
+    operators, identity_p1_p1, identity_p1_dp0, k::T; row_weights=nothing,
+) where {T<:AbstractFloat}
     coupling = burton_miller_coupling(k)
     half = Complex{T}(0.5)
     D, H = operators.double_layer, operators.hypersingular
     S, Kp = operators.single_layer, operators.adjoint_double_layer
     lhs = Matrix{Complex{T}}(undef, size(D))
     rhs = Matrix{Complex{T}}(undef, size(S))
+    if !isnothing(row_weights)
+        # BLAB_TEST_HOST_ROW_WEIGHTS: the GPU skipped `operator .*= w` (row i scaled by w[i]); the
+        # same products are formed here, then combined exactly as below.
+        w = Complex{T}.(row_weights)
+        Threads.@threads for j in axes(lhs, 2)
+            @inbounds for i in axes(lhs, 1)
+                lhs[i, j] = half * identity_p1_p1[i, j] - D[i, j] * w[i] + coupling * (H[i, j] * w[i])
+            end
+        end
+        Threads.@threads for j in axes(rhs, 2)
+            @inbounds for i in axes(rhs, 1)
+                rhs[i, j] = -(S[i, j] * w[i]) - coupling * (Kp[i, j] * w[i] + half * identity_p1_dp0[i, j])
+            end
+        end
+        return lhs, rhs
+    end
     Threads.@threads for j in axes(lhs, 2)
         @inbounds for i in axes(lhs, 1)
             lhs[i, j] = half * identity_p1_p1[i, j] - D[i, j] + coupling * H[i, j]
