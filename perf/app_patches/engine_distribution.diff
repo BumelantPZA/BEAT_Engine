@@ -1,5 +1,5 @@
 diff --git a/src/blab/solvers/engine_distribution.py b/src/blab/solvers/engine_distribution.py
-index 40299fc..6f0cd7e 100644
+index 40299fc..07da51a 100644
 --- a/src/blab/solvers/engine_distribution.py
 +++ b/src/blab/solvers/engine_distribution.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 40299fc..6f0cd7e 100644
  try:
      import beat_engine
  except ImportError as exc:
-@@ -12,4 +14,67 @@ from beat_engine import backend_catalog as backend_catalog
+@@ -12,4 +14,71 @@ from beat_engine import backend_catalog as backend_catalog
  from beat_engine import backend_info as engine_backend_info
  from beat_engine import engine_paths as engine_paths
  
@@ -65,6 +65,10 @@ index 40299fc..6f0cd7e 100644
 +        # (1.13 -> 0.37 GB/freq, bit-identical). 50-freq sweep 0.807 -> 0.667 s/freq.
 +        "BLAB_TEST_ELIM_IMPLICIT": "1",
 +        "BLAB_TEST_HOST_POOL": "1",
++        # 2026-09-26 round 11: MUMPS without numerical pivoting (CNTL(1)=0; the SAWMOD FEM matrix never
++        # delays a pivot, the search alone cost 0.04 s per factorization; a failed factorization
++        # retries with the default threshold). 50-freq 0.642 -> 0.623 s/freq, maxrel 4.4e-8.
++        "BLAB_TEST_MUMPS_CNTL": "1=0",
 +    }
 +}
 +

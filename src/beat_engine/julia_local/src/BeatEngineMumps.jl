@@ -348,6 +348,9 @@ function _quiet!(s::ZMumpsStruc)
     return s
 end
 
+_test_get_cntl(s::ZMumpsStruc, index::Integer) =
+    GC.@preserve s unsafe_load(_field_pointer(s, :cntl, Float64), index)
+
 _test_set_cntl!(s::ZMumpsStruc, index::Integer, value::Real) =
     GC.@preserve s unsafe_store!(_field_pointer(s, :cntl, Float64), Float64(value), index)
 
@@ -469,11 +472,13 @@ function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; sym
         end
         solver.values[index] = ComplexF64(value)
     end
+    test_t0 = time_ns()
     fill!(solver.schur_buffer, zero(ComplexF64))
     s = solver.struc
     _bind_arrays!(solver)
     _set_blas_threads(solver)
     attempts = 0
+    test_t1 = time_ns()
     while true
         GC.@preserve solver _call!(solver.library, s, 2)
         status = infog(s, 1)
@@ -483,9 +488,26 @@ function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; sym
             attempts += 1
             continue
         end
+        # Test (BLAB_TEST_MUMPS_CNTL="1=0", no numerical pivoting): a failed factorization goes back to
+        # MUMPS's default threshold for this and every later factorization of the solver.
+        if status < 0 && _test_get_cntl(s, 1) == 0.0
+            _test_set_cntl!(s, 1, 0.01)
+            @warn "MUMPS factorization without pivoting failed (INFOG(1)=$status); retrying with CNTL(1)=0.01"
+            continue
+        end
         break
     end
     _check(solver, "factorization")
+    # Test (BLAB_TEST_MUMPS_STATS=<file>): one line per factorization with MUMPS's own statistics.
+    test_stats = get(ENV, "BLAB_TEST_MUMPS_STATS", "")
+    if !isempty(test_stats)
+        open(test_stats, "a") do io
+            println(io, "n=$(solver.n) nz=$(length(solver.values)) schur=$(length(solver.schur_variables)) ",
+                    "prep_s=$((test_t1 - test_t0) / 1e9) fac_s=$((time_ns() - test_t1) / 1e9) ",
+                    "rinfog1=$(s.rinfog[1]) rinfog3=$(s.rinfog[3]) infog9=$(infog(s, 9)) infog12=$(infog(s, 12)) ",
+                    "infog13=$(infog(s, 13)) infog29=$(infog(s, 29)) infog11=$(infog(s, 11)) threads=$(solver.threads)")
+        end
+    end
     solver.factored = true
     solver.factorization_count += 1
     m = length(solver.schur_variables)
