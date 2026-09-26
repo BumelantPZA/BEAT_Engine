@@ -1,5 +1,5 @@
 diff --git a/src/blab/solvers/engine_distribution.py b/src/blab/solvers/engine_distribution.py
-index 40299fc..e2f1c56 100644
+index 40299fc..bde543f 100644
 --- a/src/blab/solvers/engine_distribution.py
 +++ b/src/blab/solvers/engine_distribution.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 40299fc..e2f1c56 100644
  try:
      import beat_engine
  except ImportError as exc:
-@@ -12,4 +14,38 @@ from beat_engine import backend_catalog as backend_catalog
+@@ -12,4 +14,43 @@ from beat_engine import backend_catalog as backend_catalog
  from beat_engine import backend_info as engine_backend_info
  from beat_engine import engine_paths as engine_paths
  
@@ -36,6 +36,11 @@ index 40299fc..e2f1c56 100644
 +        "BLAB_TEST_DENSE_STATS": "1",
 +        # 2026-09-26 round 5: threaded Burton-Miller matrix build, bit-identical (bem_matrix 0.10 -> 0.04).
 +        "BLAB_TEST_BM_THREADED": "1",
++        # 2026-09-26 round 6: GC off during each frequency, one collection after (-0.05 s/freq,
++        # bit-identical), and a blocked ComplexF32 LU with cgemm trailing updates (-0.085 s/freq,
++        # maxrel 1.3e-7). Harness: 1.224 -> 1.084 s/freq.
++        "BLAB_TEST_GC_DEFER": "1",
++        "BLAB_TEST_BLOCKED_LU": "512",
 +    }
 +}
 +
