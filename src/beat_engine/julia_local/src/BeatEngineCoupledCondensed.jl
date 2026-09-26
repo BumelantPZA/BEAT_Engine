@@ -2168,6 +2168,8 @@ function build_condensed_coupled_system(
     allow_transducer_condensation::Bool=true,
     prefetched_operators=nothing,
     on_operators_ready=nothing,
+    on_fem_done=nothing,
+    dense_gate=nothing,
 ) where {T<:AbstractFloat}
     # `relative_residual` needs the monolithic coupled matrix, which this formulation never
     # forms. `fem_interior_residual` on each solution is the condensed-appropriate check.
@@ -2547,6 +2549,14 @@ function build_condensed_coupled_system(
         end
     end
     fem_condensation_s = (time_ns() - condensation_started) / 1.0e9
+    # Test (BLAB_TEST_FEM_LANE): this frequency's MUMPS work is over, so the next build may start its
+    # FEM stage; the dense part below waits for the previous frequency's solve.
+    isnothing(on_fem_done) || on_fem_done()
+    if !isnothing(dense_gate)
+        test_gate_started = time_ns()
+        wait(dense_gate)
+        elimination_split[:diag_dense_gate_wait] = (time_ns() - test_gate_started) / 1.0e9
+    end
     elimination_split[:diag_fem_stage_work] = fem_stage_work[]
 
     block_assembly_started = time_ns()
@@ -3210,6 +3220,10 @@ function solve_condensed_coupled_excitations(system, excitations; reconstruct_in
     if elimination_mode == :flux
         # BEM rows gain B_q M_Γ⁻¹ g from substituting q = M_Γ⁻¹ (S P p_B + E y - g).
         flux_rhs_solution = _split_timed!(solve_split, :flux_rhs_mass) do
+            # BLAB_TEST_ZERO_RHS_SKIP: a zero reduced right-hand side needs no mass solve.
+            get(ENV, "BLAB_TEST_ZERO_RHS_SKIP", "0") == "1" && all(iszero, reduced_rhs) ?
+            zeros(ComplexF64, hasproperty(elimination, :mass_operator) ? elimination.mass_operator.count :
+                              size(reduced_rhs, 1), size(reduced_rhs, 2)) :
             hasproperty(elimination, :mass_operator) ?
                 _interface_mass_apply(elimination.mass_operator, reduced_rhs) :
                 elimination.mass_factorization \ ComplexF64.(reduced_rhs)

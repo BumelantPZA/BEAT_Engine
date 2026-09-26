@@ -1,5 +1,5 @@
 diff --git a/src/blab/solvers/engine_distribution.py b/src/blab/solvers/engine_distribution.py
-index 40299fc..e159019 100644
+index 40299fc..ffc7a91 100644
 --- a/src/blab/solvers/engine_distribution.py
 +++ b/src/blab/solvers/engine_distribution.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 40299fc..e159019 100644
  try:
      import beat_engine
  except ImportError as exc:
-@@ -12,4 +14,83 @@ from beat_engine import backend_catalog as backend_catalog
+@@ -12,4 +14,88 @@ from beat_engine import backend_catalog as backend_catalog
  from beat_engine import backend_info as engine_backend_info
  from beat_engine import engine_paths as engine_paths
  
@@ -81,6 +81,11 @@ index 40299fc..e159019 100644
 +        # Round 11: no MUMPS reduction of an all-zero FEM right-hand side (voltage-only excitations).
 +        # Bit-identical, 0.574 -> 0.549 s/freq.
 +        "BLAB_TEST_ZERO_RHS_SKIP": "1",
++        # Round 11: build(i+1) starts when build(i) returns, so its FEM stage (MUMPS) overlaps i's solve
++        # and field; its elimination/LU wait for i's solve. Only with voltage excitations and no interior
++        # outputs (nothing after the FEM stage calls MUMPS). Bit-identical, 0.558 -> 0.492 s/freq.
++        # (=1, starting at i's FEM end, overlaps i's LU too and loses: 0.569 vs 0.549.)
++        "BLAB_TEST_FEM_LANE": "2",
 +    }
 +}
 +

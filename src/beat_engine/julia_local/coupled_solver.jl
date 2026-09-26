@@ -2904,7 +2904,7 @@ function solve_request_impl(request; event_mode=false)
     test_next_build = nothing
     test_field_done = nothing
     test_gpu_next = nothing
-    test_build_at = (index, prefetched_ops, on_ready) -> build_condensed_coupled_system(
+    test_build_at = (index, prefetched_ops, on_ready; on_fem_done=nothing, dense_gate=nothing) -> build_condensed_coupled_system(
         fem_mesh,
         bem_mesh,
         interface_map,
@@ -2925,7 +2925,67 @@ function solve_request_impl(request; event_mode=false)
         allow_transducer_condensation=true,
         prefetched_operators=prefetched_ops,
         on_operators_ready=on_ready,
+        on_fem_done=on_fem_done,
+        dense_gate=dense_gate,
     )
+    # Test (BLAB_TEST_FEM_LANE=1, with EARLY_BUILD): build(i+1) starts as soon as build(i)'s FEM stage,
+    # its last MUMPS call, is done, so the next factorization overlaps i's elimination, LU and solve;
+    # build(i+1)'s dense part waits for i's solve (stale-LU order, one dense LU at a time). MUMPS has
+    # process-global state and one factor slot, so only when nothing after the FEM stage calls it:
+    # voltage excitations (zero FEM right-hand side, skipped) and no interior reconstruction. GPU work
+    # keeps the EARLY_BUILD order: field(i) waits for GPU(i+1), GPU(i+2) waits for field(i).
+    test_frequency_count = length(request["frequencies_hz"])
+    test_fem_lane = test_early_build && use_condensed_solver && get(ENV, "BLAB_TEST_FEM_LANE", "0") == "1" &&
+                    get(ENV, "BLAB_TEST_ZERO_RHS_SKIP", "0") == "1" &&
+                    all(excitation -> Symbol(excitation.kind) == :voltage, excitations) &&
+                    BeatEngineCoupledCondensed._demand_reconstruction_enabled(bem_backend) &&
+                    !validation_diagnostics &&
+                    all(String(output["quantity"]) in INTERIOR_FREE_COUPLED_OUTPUTS for output in outputs)
+    lane_builds = Vector{Any}(nothing, test_frequency_count)
+    lane_gpu = Vector{Any}(nothing, test_frequency_count)
+    lane_gpu_owned = falses(test_frequency_count)   # handed to a build, which releases it
+    lane_solved = [Base.Event() for _ in 1:test_frequency_count]
+    lane_field = [Base.Event() for _ in 1:test_frequency_count]
+    lane_consumed = 1
+    lane_on_ready = index -> (flux_columns=nothing) -> begin
+        if index < test_frequency_count
+            gate = index >= 2 ? lane_field[index - 1] : nothing
+            lane_gpu[index + 1] = Threads.@spawn begin
+                isnothing(gate) || wait(gate)
+                condensed_metal_operators(
+                    coupled_cache, bem_mesh, FloatType(request["frequencies_hz"][index + 1]), sound_speed;
+                    quadrature_order=quadrature_selections[index + 1].order, singular_order=singular_order,
+                    flux_columns=flux_columns,
+                )
+            end
+        end
+        nothing
+    end
+    # BLAB_TEST_FEM_LANE=2: build(i+1) starts when build(i) returns (after its LU), so its FEM stage
+    # overlaps only i's solve and field (=1 overlapped the LU too: both on the AMX units, LU 2x slower).
+    lane_after_build = get(ENV, "BLAB_TEST_FEM_LANE", "0") == "2"
+    test_fem_lane |= test_early_build && use_condensed_solver && lane_after_build &&
+                     get(ENV, "BLAB_TEST_ZERO_RHS_SKIP", "0") == "1" &&
+                     all(excitation -> Symbol(excitation.kind) == :voltage, excitations) &&
+                     BeatEngineCoupledCondensed._demand_reconstruction_enabled(bem_backend) &&
+                     !validation_diagnostics &&
+                     all(String(output["quantity"]) in INTERIOR_FREE_COUPLED_OUTPUTS for output in outputs)
+    lane_on_fem_done = nothing
+    lane_on_fem_done = index -> () -> begin
+        if index < test_frequency_count
+            lane_gpu_owned[index + 1] = true
+            lane_builds[index + 1] = Threads.@spawn begin
+                built = test_build_at(
+                    index + 1, lane_gpu[index + 1], lane_on_ready(index + 1);
+                    on_fem_done=lane_after_build ? nothing : lane_on_fem_done(index + 1),
+                    dense_gate=lane_solved[index],
+                )
+                lane_after_build && lane_on_fem_done(index + 1)()
+                built
+            end
+        end
+        nothing
+    end
     try
         # Test instrumentation: the previous frequency's emit/release and whole-iteration wall + GC,
         # reported one frequency late as `test_prev_*` timings.
@@ -2965,7 +3025,17 @@ function solve_request_impl(request; event_mode=false)
             else
                 nothing
             end
-            coupled_system = if !isnothing(test_early_system)
+            coupled_system = if test_fem_lane && frequency_index > 1
+                lane_task = lane_builds[frequency_index]
+                lane_builds[frequency_index] = nothing
+                lane_consumed = frequency_index
+                try
+                    fetch(lane_task)
+                catch exception
+                    exception isa TaskFailedException || rethrow()
+                    rethrow(exception.task.result)
+                end
+            elseif !isnothing(test_early_system)
                 try
                     fetch(test_early_system)
                 catch exception
@@ -2995,7 +3065,8 @@ function solve_request_impl(request; event_mode=false)
                     allow_transducer_condensation=!rom_requested &&
                         isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing)),
                     prefetched_operators=prefetched,
-                    on_operators_ready=spawn_next,
+                    on_operators_ready=test_fem_lane ? lane_on_ready(frequency_index) : spawn_next,
+                    on_fem_done=test_fem_lane && !lane_after_build ? lane_on_fem_done(frequency_index) : nothing,
                 )
             else
                 build_coupled_system(
@@ -3023,6 +3094,7 @@ function solve_request_impl(request; event_mode=false)
                 )
             end
             assembly_s = (time_ns() - assembly_started) / 1.0e9
+            test_fem_lane && lane_after_build && frequency_index == 1 && lane_on_fem_done(1)()
             # BLAB_COUPLED_DEMAND_RECONSTRUCTION: skip the interior back substitution only when every
             # requested output is known not to read interior FEM pressure.
             reconstruct_interior = !(
@@ -3041,8 +3113,11 @@ function solve_request_impl(request; event_mode=false)
                         ) :
                         solve_coupled_excitations(coupled_system, excitations)
             solve_s = (time_ns() - solve_started) / 1.0e9
+            test_fem_lane && notify(lane_solved[frequency_index])
             test_gpu_next = nothing
-            if test_early_build && frequency_index < length(request["frequencies_hz"]) && !isnothing(next_operators)
+            if test_fem_lane && frequency_index < test_frequency_count
+                test_gpu_next = lane_gpu[frequency_index + 1]
+            elseif test_early_build && frequency_index < length(request["frequencies_hz"]) && !isnothing(next_operators)
                 test_gpu_next = next_operators          # GPU(i+1), spawned while building i
                 next_operators = nothing
                 test_field_done = Base.Event()
@@ -3603,6 +3678,7 @@ function solve_request_impl(request; event_mode=false)
                 "test_pre_emit_wall_s" => (time_ns() - test_iteration_started) / 1.0e9,
             ), test_prev_tail)
             isnothing(test_field_done) || notify(test_field_done)
+            test_fem_lane && notify(lane_field[frequency_index])
             if validation_diagnostics
                 diagnostics["relative_residual"] = maximum(solution.relative_residual for solution in solutions)
                 diagnostics["all_bem_replay_error"] = maximum(
@@ -3665,6 +3741,27 @@ function solve_request_impl(request; event_mode=false)
         GC.enable(true)   # BLAB_TEST_GC_DEFER may have left it off on an error
         BeatEngineCoupledCondensed._test_stale_reset!()
         isnothing(test_field_done) || notify(test_field_done)
+        if test_fem_lane
+            # Unblock every waiting lane task, then release what they built.
+            foreach(notify, lane_solved)
+            foreach(notify, lane_field)
+            for index in (lane_consumed + 1):test_frequency_count
+                task = lane_builds[index]
+                isnothing(task) && continue
+                try
+                    release_condensed_coupled_system!(fetch(task))
+                catch
+                end
+                lane_builds[index] = nothing
+            end
+            for (task, owned) in zip(lane_gpu, lane_gpu_owned)
+                (isnothing(task) || owned) && continue
+                try
+                    BeatEngineCoupledCondensed.release_operator_storage!(fetch(task).operators)
+                catch
+                end
+            end
+        end
         if test_next_build !== nothing
             try
                 release_condensed_coupled_system!(fetch(test_next_build))
