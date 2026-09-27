@@ -286,7 +286,8 @@ function _metal_fused_pair_blocks_kernel!(
     trial_curl_sign_y,
     trial_curl_sign_z,
     ::Val{PROBE}=Val(0),
-) where {R,PROBE}
+    ::Val{ACC}=Val(false),
+) where {R,PROBE,ACC}
     position = thread_position_in_grid_2d()
     test_position = Int32(position.x)
     trial_local = Int32(position.y)
@@ -303,6 +304,7 @@ function _metal_fused_pair_blocks_kernel!(
         singular_trial_indices,
         skip_mode,
     )
+        ACC && return nothing   # a later transform adds nothing to a skipped pair
         component = Int32(0)
         while component < Int32(_METAL_FUSED_COMPONENTS)
             @inbounds blocks[base + component * pair_stride] = zero(eltype(blocks))
@@ -346,10 +348,26 @@ function _metal_fused_pair_blocks_kernel!(
         total == -1.2345f-30 && @inbounds blocks[base] = total
         return nothing
     end
+    if ACC
+        _test_add_block!(blocks, base, pair_stride, Int32(0), lhs_re)
+        _test_add_block!(blocks, base, pair_stride, Int32(9), lhs_im)
+        _test_add_block!(blocks, base, pair_stride, Int32(18), rhs_re)
+        _test_add_block!(blocks, base, pair_stride, Int32(21), rhs_im)
+        return nothing
+    end
     _metal_store_block!(blocks, base, pair_stride, Int32(0), lhs_re)
     _metal_store_block!(blocks, base, pair_stride, Int32(9), lhs_im)
     _metal_store_block!(blocks, base, pair_stride, Int32(18), rhs_re)
     _metal_store_block!(blocks, base, pair_stride, Int32(21), rhs_im)
+    return nothing
+end
+
+@inline function _test_add_block!(blocks, base::Int32, stride::Int32, offset::Int32, values::SVector{N,T}) where {N,T}
+    i = 1
+    while i <= N
+        @inbounds blocks[base + (offset + Int32(i - 1)) * stride] += values[i]
+        i += 1
+    end
     return nothing
 end
 
@@ -499,6 +517,15 @@ function _launch_metal_fused_pair_kernels!(
     trial_curl_sign_y,
     trial_curl_sign_z,
 )
+    return _launch_metal_fused_pair_kernels!(lhs, rhs_partial, q_neumann, cache, k, Any[(
+        pair_offsets, singular_trial_indices, skip_mode,
+        trial_sign_x, trial_sign_y, trial_sign_z, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z)])
+end
+
+# `transforms`: one tuple (pair_offsets, singular_trial_indices, skip_mode, 6 signs) per symmetry
+# transform. Per chunk, the first transform writes the pair blocks and later ones add into them
+# (BLAB_TEST_FUSED_IMAGE_ACC=1 passes all transforms at once), so the gathers run once per chunk.
+function _launch_metal_fused_pair_kernels!(lhs, rhs_partial, q_neumann, cache::MetalRegularAssemblyCache, k, transforms)
     element_count = length(cache.element_indices)
     element_count == 0 && return nothing
     rule_count = cache.rule_count
@@ -517,6 +544,9 @@ function _launch_metal_fused_pair_kernels!(
     for chunk in 1:tables.chunk_count
         chunk_start = (chunk - 1) * chunk_size + 1
         chunk_count = min(chunk_size, element_count - chunk_start + 1)
+      for (transform_number, transform) in enumerate(transforms)
+        (pair_offsets, singular_trial_indices, skip_mode, trial_sign_x, trial_sign_y, trial_sign_z,
+         trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z) = transform
         pair_args = (
             tables.blocks,
             cache.face_vertices,
@@ -546,11 +576,13 @@ function _launch_metal_fused_pair_kernels!(
             trial_curl_sign_y,
             trial_curl_sign_z,
             Val(parse(Int, get(ENV, "BLAB_TEST_FUSED_PROBE", "0"))),
+            Val(transform_number > 1),
         )
         chunk == 1 && _test_pipeinfo("fused_pair", _metal_fused_pair_blocks_kernel!, pair_args...)
         Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_fused_pair_blocks_kernel!(pair_args...
         )
         stamp = _metal_gather_stage!("fused_pairs", timed, stamp)
+      end
         _metal_launch(
             _metal_fused_rhs_gather_kernel!,
             cache.p1_dof_count * chunk_count,
@@ -1071,7 +1103,20 @@ function assemble_burton_miller_neumann_system_metal(
             error("Fused Metal Burton-Miller assembly has no host singular mode; unset BLAB_METAL_SINGULAR_MODE.")
         skip_image_singular = !skip_singular
         one_t = one(T)
-        kernel_elapsed = @elapsed begin
+        kernel_elapsed = @elapsed if get(ENV, "BLAB_TEST_FUSED_IMAGE_ACC", "0") == "1"
+            transforms = Any[(device_cache.vertex_offsets, device_cache.incident_elements, Int32(0),
+                              one_t, one_t, one_t, one_t, one_t, one_t)]
+            for (transform, image_cache) in zip(device_cache.image_transforms, device_cache.image_singular_caches)
+                push!(transforms, (image_cache.pair_offsets, image_cache.trial_indices,
+                    skip_image_singular ? Int32(1) : Int32(2),
+                    T(transform.signs[1]), T(transform.signs[2]), T(transform.signs[3]),
+                    T(transform.determinant * transform.signs[1]),
+                    T(transform.determinant * transform.signs[2]),
+                    T(transform.determinant * transform.signs[3])))
+            end
+            _launch_metal_fused_pair_kernels!(lhs, rhs_partial, d_q, device_cache, k, transforms)
+            Metal.synchronize()
+        else
             _launch_metal_fused_pair_kernels!(
                 lhs, rhs_partial, d_q, device_cache, k,
                 device_cache.vertex_offsets, device_cache.incident_elements, Int32(0),

@@ -1,0 +1,187 @@
+diff --git a/src/beat_engine/julia_local/src/BeatEngineMetalBurtonMiller.jl b/src/beat_engine/julia_local/src/BeatEngineMetalBurtonMiller.jl
+index 6bcd84b..3fcc319 100644
+--- a/src/beat_engine/julia_local/src/BeatEngineMetalBurtonMiller.jl
++++ b/src/beat_engine/julia_local/src/BeatEngineMetalBurtonMiller.jl
+@@ -1048,6 +1048,17 @@ function assemble_burton_miller_neumann_system_metal(
+     end
+     d_q = q_host isa MtlArray ? q_host : MtlArray(Complex{T}.(q_host))
+     owns_q = !(q_host isa MtlArray)
++    if T === Float32 && get(ENV, "BLAB_TEST_FUSED_TR", "0") == "1"
++        try
++            return _test_fused_via_tilereduce(
++                mesh, p1_space, dp0_space, q_host isa MtlArray ? Array(q_host) : q_host, d_q, k, device_cache,
++                singular_cache, device_singular_cache, identity_cache, skip_singular, singular_order, normalized_mode, timing,
++            )
++        finally
++            owns_q && Metal.unsafe_free!(d_q)
++            owns_identity_cache && release_metal_fused_identity_cache!(identity_cache)
++        end
++    end
+     tables = _metal_fused_gather_tables(device_cache)
+     lhs = rhs = rhs_partial = nothing
+     succeeded = false
+@@ -1259,3 +1270,164 @@ function solve_metal_burton_miller_system(system; method::Symbol=beat_dense_solv
+     pressure, _ = solve_metal_burton_miller_system_with_report(system; method=method)
+     return pressure
+ end
++
++# Test (BLAB_TEST_FUSED_TR=1): the exterior Burton-Miller system through the coupled path's combined
++# tile-reduce kernels (packed loads, in-group reduction, images summed before one gather, combined
++# singular gather) instead of the fused pair kernel. The combined kernels write A = -D + βH and
++# C = -S - βK' with β = i/k, which are exactly the fused path's lhs and right-hand-side coefficient;
++# rhs = C q then comes from a small kernel. Same return value as the fused assembler.
++const _TEST_FUSED_TR_POOL = Dict{Tuple{Int,Int},Any}()
++const _TEST_FUSED_TR_LOCK = ReentrantLock()
++
++function _test_take_fused_c(p1n, dp0n)
++    buffer = lock(() -> pop!(_TEST_FUSED_TR_POOL, (p1n, dp0n), nothing), _TEST_FUSED_TR_LOCK)
++    if buffer === nothing
++        return Metal.zeros(ComplexF32, p1n, dp0n)
++    end
++    fill!(buffer, zero(ComplexF32))
++    return buffer
++end
++function _test_give_fused_c(buffer)
++    old = lock(_TEST_FUSED_TR_LOCK) do
++        previous = get(_TEST_FUSED_TR_POOL, size(buffer), nothing)
++        _TEST_FUSED_TR_POOL[size(buffer)] = buffer
++        previous
++    end
++    old === nothing || old === buffer || Metal.unsafe_free!(old)
++    return nothing
++end
++
++# rhs[row, drive] = sum_c C[row, c] q[c, drive]; one thread per (row, drive), columns in order.
++function _test_cq_kernel!(rhs, cmat, q, p1_count::Int32, dp0_count::Int32, drive_count::Int32)
++    index = Int32(thread_position_in_grid_1d())
++    index > p1_count * drive_count && return nothing
++    row = (index - Int32(1)) % p1_count + Int32(1)
++    drive = (index - Int32(1)) ÷ p1_count + Int32(1)
++    total = zero(ComplexF32)
++    column = Int32(1)
++    q_base = (drive - Int32(1)) * dp0_count
++    while column <= dp0_count
++        @inbounds qv = q[q_base + column]
++        if qv != zero(ComplexF32)
++            @inbounds total += cmat[row + (column - Int32(1)) * p1_count] * qv
++        end
++        column += Int32(1)
++    end
++    @inbounds rhs[index] = total
++    return nothing
++end
++
++function _test_fused_via_tilereduce(
++    mesh, p1_space, dp0_space, q_host, d_q, k, device_cache, singular_cache, device_singular_cache,
++    identity_cache, skip_singular, singular_order, normalized_mode, timing,
++)
++    T = Float32
++    p1n = p1_space.global_dof_count
++    dp0n = dp0_space.global_dof_count
++    drive_count = size(q_host, 2)
++    storage = metal_operator_storage_mode()
++    lhs = rhs = cmat = nothing
++    succeeded = false
++    empty!(_metal_gather_stage_timing)
++    try
++        allocation_elapsed = @elapsed begin
++            lhs = Metal.zeros(Complex{T}, p1n, p1n; storage=storage)
++            rhs = Metal.zeros(Complex{T}, p1n, drive_count; storage=storage)
++            cmat = _test_take_fused_c(p1n, dp0n)
++            Metal.synchronize()
++        end
++        timing !== nothing && (timing["metal_fused_alloc"] = allocation_elapsed)
++        # C and A alias the unused operator slots: the combined kernels only write these two.
++        operators = (single_layer=cmat, double_layer=lhs, adjoint_double_layer=cmat, hypersingular=lhs)
++        # Right-hand-side columns never driven need no C column (the flux-skip mask of the coupled path).
++        _TEST_FLUX_MASK[] = MtlArray(Int32.(vec(any(!iszero, q_host; dims=2))))
++        _TEST_COMBINED_BM[] = ComplexF32(burton_miller_coupling(k))
++        kernel_elapsed = @elapsed begin
++            _launch_metal_accumulated_tilereduce_kernels!(operators, device_cache, k, !skip_singular)
++            Metal.synchronize()
++        end
++        timing !== nothing && (timing["metal_fused_regular_kernel"] = kernel_elapsed)
++        if timing !== nothing
++            for (stage, elapsed) in _metal_gather_stage_timing
++                timing["metal_fused_" * stage] = elapsed
++            end
++        end
++        indices = device_cache.element_indices
++        correction_cache = singular_cache === nothing ?
++            build_singular_correction_cache(mesh, singular_order, indices) : singular_cache
++        singular_pairs = 0
++        image_singular_pairs = 0
++        if !skip_singular
++            owns = device_singular_cache === nothing
++            active = owns ? build_metal_singular_correction_cache(correction_cache) : device_singular_cache
++            singular_elapsed = @elapsed begin
++                _launch_metal_singular_block_scatter_kernels!(operators, device_cache, active, k)
++                Metal.synchronize()
++            end
++            timing !== nothing && (timing["metal_fused_singular_kernel"] = singular_elapsed)
++            singular_pairs = correction_cache.pair_count
++            owns && release_metal_singular_correction_cache!(active)
++            image_elapsed = @elapsed begin
++                for (transform, image_cache) in zip(device_cache.image_transforms, device_cache.image_singular_caches)
++                    image_cache.pair_count == 0 && continue
++                    _launch_metal_singular_block_scatter_kernels!(operators, device_cache, image_cache, k, transform)
++                end
++                Metal.synchronize()
++            end
++            timing !== nothing && (timing["metal_fused_image_singular_kernel"] = image_elapsed)
++            image_singular_pairs = device_cache.image_singular_pair_count
++        end
++        rhs_elapsed = @elapsed begin
++            _metal_launch(_test_cq_kernel!, p1n * drive_count, rhs, cmat, d_q, Int32(p1n), Int32(dp0n), Int32(drive_count))
++            Metal.synchronize()
++        end
++        timing !== nothing && (timing["metal_fused_rhs_reduce"] = rhs_elapsed)
++        weight_elapsed = @elapsed begin
++            if normalized_mode != :off
++                d_weights = MtlArray(Complex{T}.(p1_symmetry_orbit_weights(mesh, normalized_mode)))
++                lhs .*= reshape(d_weights, :, 1)
++                rhs .*= reshape(d_weights, :, 1)
++                Metal.synchronize()
++                Metal.unsafe_free!(d_weights)
++            end
++        end
++        timing !== nothing && (timing["metal_fused_symmetry_row_weights"] = weight_elapsed)
++        identity_elapsed = @elapsed begin
++            scatter_metal_sparse_to_dense!(lhs, identity_cache.p1_p1_scatter; alpha=Complex{T}(0.5), add=true)
++            coupling = burton_miller_coupling(k)
++            identity_rhs = (identity_cache.p1_dp0 * Complex{T}.(q_host)) .* (-Complex{T}(0.5) * coupling)
++            d_identity_rhs = MtlArray(identity_rhs)
++            try
++                rhs .+= d_identity_rhs
++                Metal.synchronize()
++            finally
++                Metal.unsafe_free!(d_identity_rhs)
++            end
++        end
++        timing !== nothing && (timing["metal_fused_identity"] = identity_elapsed)
++        total_pairs = length(indices) * length(indices)
++        image_count = length(device_cache.image_transforms)
++        succeeded = true
++        return (
++            matrix=lhs,
++            rhs=rhs,
++            regular_pairs=total_pairs - correction_cache.pair_count + image_count * total_pairs - image_singular_pairs,
++            singular_pairs=singular_pairs,
++            image_singular_pairs=image_singular_pairs,
++            drive_count=drive_count,
++            on_gpu=true,
++            gpu_backend=:metal,
++            assembly_mode=:metal_fused_burton_miller,
++        )
++    finally
++        mask = _TEST_FLUX_MASK[]
++        _TEST_FLUX_MASK[] = nothing
++        _TEST_COMBINED_BM[] = nothing
++        mask === nothing || Metal.unsafe_free!(mask)
++        cmat === nothing || _test_give_fused_c(cmat)
++        if !succeeded
++            lhs === nothing || Metal.unsafe_free!(lhs)
++            rhs === nothing || Metal.unsafe_free!(rhs)
++        end
++    end
++end
