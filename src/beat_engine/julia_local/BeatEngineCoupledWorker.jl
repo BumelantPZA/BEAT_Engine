@@ -1367,6 +1367,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 "diagnostics" => diagnostics,
             )
             record_result_provenance!(result, request)
+            test_save_result(result)
             println(JSON.json(event_mode ? Dict("type" => "result", "result" => result) : result))
             flush(stdout)
             operators === nothing || release_operator_storage!(operators)
@@ -2447,6 +2448,7 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
         )
         record_result_provenance!(result, request)
         if event_mode
+            test_save_result(result)
             println(JSON.json(Dict("type" => "result", "result" => result)))
         else
             println(JSON.json(result))
@@ -2490,6 +2492,13 @@ function _condensed_split_timings(system, solutions)
 end
 
 # Test (BLAB_TEST_PHASE_LOG=<file>): "<time_ns> <label>" lines for the request's phases.
+# Test (BLAB_TEST_SAVE_RESULTS=<file>): append each emitted result as one JSON line, so runs of
+# different code can be compared exactly afterwards (perf/cmp_results.py).
+function test_save_result(result)
+    path = get(ENV, "BLAB_TEST_SAVE_RESULTS", "")
+    isempty(path) || open(io -> println(io, JSON.json(result)), path, "a")
+    return nothing
+end
 function test_phase_log(label, at=time_ns())
     path = get(ENV, "BLAB_TEST_PHASE_LOG", "")
     isempty(path) || open(io -> println(io, at, " ", label), path, "a")
@@ -3749,6 +3758,7 @@ function solve_request_impl(request; event_mode=false)
             test_emit_started = time_ns()
             record_result_provenance!(result, request)
             if event_mode
+                test_save_result(result)
                 println(JSON.json(Dict("type" => "result", "result" => result)))
             else
                 println(JSON.json(result))

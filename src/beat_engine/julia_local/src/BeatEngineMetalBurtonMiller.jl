@@ -1038,9 +1038,27 @@ function _metal_singular_fused_bm_blocks_kernel!(
     trial_curl_sign_x,
     trial_curl_sign_y,
     trial_curl_sign_z,
-)
+    ::Val{PROBE},
+) where {PROBE}
     linear_index = Int32(thread_position_in_grid_1d())
     linear_index > pair_count * part_count && return nothing
+    value_stride = pair_count * part_count
+    # Timing probe (BLAB_TEST_SING_PROBE=2, wrong results): stores only, no quadrature.
+    if PROBE == 2
+        @inbounds begin
+            i = 1
+            while i <= 3
+                rhs_values[linear_index + Int32(i - 1) * value_stride] = zero(eltype(rhs_values))
+                i += 1
+            end
+            i = 1
+            while i <= 9
+                lhs_values[linear_index + Int32(i - 1) * value_stride] = zero(eltype(lhs_values))
+                i += 1
+            end
+        end
+        return nothing
+    end
     lhs_re, lhs_im, rhs_re, rhs_im = _metal_singular_pair_fused_bm_blocks(
         linear_index,
         test_indices, trial_indices, rule_indices, jac_scales, normal_products,
@@ -1050,7 +1068,9 @@ function _metal_singular_fused_bm_blocks_kernel!(
         trial_sign_x, trial_sign_y, trial_sign_z,
         trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
     )
-    value_stride = pair_count * part_count
+    # Timing probe (BLAB_TEST_SING_PROBE=1, wrong results): full quadrature, the stores kept behind a
+    # test that never holds so the compiler cannot drop the maths.
+    PROBE == 1 && lhs_re[1] + rhs_im[3] != -1.2345f30 && return nothing
     @inbounds begin
         i = 1
         while i <= 3
@@ -1210,9 +1230,7 @@ function _launch_metal_fused_singular_kernels!(
             sx, sy, sz, csx, csy, csz,
         )
     else
-    _metal_launch(
-        _metal_singular_fused_bm_blocks_kernel!,
-        value_count,
+    sing_args = (
         lhs_values, rhs_values,
         singular_cache.test_indices, singular_cache.trial_indices, singular_cache.rule_indices,
         singular_cache.jac_scales, singular_cache.normal_products, singular_cache.rule_offsets,
@@ -1221,7 +1239,10 @@ function _launch_metal_fused_singular_kernels!(
         k, inv(k), Int32(regular_cache.face_count), Int32(pair_count),
         Int32(rule_point_count), Int32(part_count),
         sx, sy, sz, csx, csy, csz,
+        Val(parse(Int, get(ENV, "BLAB_TEST_SING_PROBE", "0"))),
     )
+    transform.label == :identity && _test_pipeinfo("sing_fused_bm", _metal_singular_fused_bm_blocks_kernel!, sing_args...)
+    _metal_launch(_metal_singular_fused_bm_blocks_kernel!, value_count, sing_args...)
     end
     stamp = _metal_gather_stage!("sing_blocks", timed, stamp)
     if gather_tables === nothing

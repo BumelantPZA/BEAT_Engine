@@ -70,10 +70,12 @@ end
     return (_metal_fast_cos(reduced), _metal_fast_sin(reduced))
 end
 
+_test_field_probe() = Val(parse(Int, get(ENV, "BLAB_TEST_FIELD_PROBE", "0")))
+
 function _metal_fast_field_kernel!(
     partials, eval_points, points4, normals4, weights4, k::Float32,
-    source_count::Int32, point_count::Int32, chunk_length::Int32, chunk_count::Int32, ::Val{MODE},
-) where {MODE}
+    source_count::Int32, point_count::Int32, chunk_length::Int32, chunk_count::Int32, ::Val{MODE}, ::Val{PROBE},
+) where {MODE,PROBE}
     linear_index = Int32(thread_position_in_grid_1d())
     linear_index > point_count * chunk_count && return nothing
     point_index = (linear_index - Int32(1)) % point_count + Int32(1)
@@ -86,17 +88,21 @@ function _metal_fast_field_kernel!(
     @inbounds x3 = eval_points[point_index + Int32(2) * point_count]
     potential_re = 0.0f0
     potential_im = 0.0f0
+    # Timing probe (BLAB_TEST_FIELD_PROBE=2, wrong results): one fixed source per thread, nudged by s
+    # so the maths stays in the loop; no per-source loads.
+    fixed = min(source_start, source_count)
+    @inbounds sp_fixed = points4[fixed]
     s = source_start
     while s <= source_stop
-        @inbounds sp = points4[s]
+        @inbounds sp = PROBE == 2 ? sp_fixed : points4[s]
         Base.@fastmath begin
-        r1 = sp[1].value - x1
+        r1 = PROBE == 2 ? (sp[1].value - x1) + Float32(s) * 1.0f-9 : sp[1].value - x1
         r2 = sp[2].value - x2
         r3 = sp[3].value - x3
         radius2 = r1 * r1 + r2 * r2 + r3 * r3
         if radius2 > 0.0f0
-            @inbounds sn = normals4[s]
-            @inbounds w = weights4[s]
+            @inbounds sn = normals4[PROBE == 2 ? fixed : s]
+            @inbounds w = weights4[PROBE == 2 ? fixed : s]
             if MODE == 4
                 radius = _metal_precise_sqrt(radius2)
                 inv_radius = 1.0f0 / radius
@@ -106,7 +112,8 @@ function _metal_fast_field_kernel!(
             end
             phase = k * radius
             green_scale = inv_radius * inv_four_pi
-            c, sn_ = _metal_field_cis(phase, Val(MODE))
+            # Timing probe (BLAB_TEST_FIELD_PROBE=1, wrong results): no cis.
+            c, sn_ = PROBE == 1 ? (1.0f0 - phase, phase) : _metal_field_cis(phase, Val(MODE))
             green_re = c * green_scale
             green_im = sn_ * green_scale
             normal_projection = (r1 * sn[1].value + r2 * sn[2].value + r3 * sn[3].value) * inv_radius
@@ -155,14 +162,13 @@ function _evaluate_galerkin_field_metal_fast(
     chunk_count = _metal_field_chunk_count(point_count, cache.source_count)
     chunk_length = cld(cache.source_count, chunk_count)
     d_partials = chunk_count == 1 ? d_potentials : Metal.zeros(ComplexF32, point_count * chunk_count)
-    _metal_launch(
-        _metal_fast_field_kernel!,
-        point_count * chunk_count,
+    field_args = (
         d_partials, d_eval_points, tables.points4, tables.normals4, d_weights4, k,
         Int32(cache.source_count), Int32(point_count), Int32(chunk_length), Int32(chunk_count),
-        Val(parse(Int, get(ENV, "BLAB_METAL_FIELD_FAST", "1")));
-        groupsize=groupsize,
+        Val(parse(Int, get(ENV, "BLAB_METAL_FIELD_FAST", "1"))), _test_field_probe(),
     )
+    _test_pipeinfo("field_fast", _metal_fast_field_kernel!, field_args...)
+    _metal_launch(_metal_fast_field_kernel!, point_count * chunk_count, field_args...; groupsize=groupsize)
     if chunk_count > 1
         _metal_launch(
             _metal_field_reduce_partials_kernel!,
@@ -201,7 +207,8 @@ end
 function _test_multi_field_kernel!(
     partials, eval_points, points4, normals4, weights4, k::Float32,
     source_count::Int32, point_count::Int32, chunk_length::Int32, chunk_count::Int32, ::Val{MODE}, ::Val{ND},
-) where {MODE,ND}
+    ::Val{PROBE},
+) where {MODE,ND,PROBE}
     linear_index = Int32(thread_position_in_grid_1d())
     linear_index > point_count * chunk_count && return nothing
     point_index = (linear_index - Int32(1)) % point_count + Int32(1)
@@ -214,16 +221,20 @@ function _test_multi_field_kernel!(
     @inbounds x3 = eval_points[point_index + Int32(2) * point_count]
     potential_re = ntuple(_ -> 0.0f0, Val(ND))
     potential_im = ntuple(_ -> 0.0f0, Val(ND))
+    # Timing probe (BLAB_TEST_FIELD_PROBE=2, wrong results): one fixed source per thread, nudged by s
+    # so the maths stays in the loop; no per-source loads.
+    fixed = min(source_start, source_count)
+    @inbounds sp_fixed = points4[fixed]
     s = source_start
     while s <= source_stop
-        @inbounds sp = points4[s]
+        @inbounds sp = PROBE == 2 ? sp_fixed : points4[s]
         Base.@fastmath begin
-        r1 = sp[1].value - x1
+        r1 = PROBE == 2 ? (sp[1].value - x1) + Float32(s) * 1.0f-9 : sp[1].value - x1
         r2 = sp[2].value - x2
         r3 = sp[3].value - x3
         radius2 = r1 * r1 + r2 * r2 + r3 * r3
         if radius2 > 0.0f0
-            @inbounds sn = normals4[s]
+            @inbounds sn = normals4[PROBE == 2 ? fixed : s]
             if MODE == 4
                 radius = _metal_precise_sqrt(radius2)
                 inv_radius = 1.0f0 / radius
@@ -233,13 +244,14 @@ function _test_multi_field_kernel!(
             end
             phase = k * radius
             green_scale = inv_radius * inv_four_pi
-            c, sn_ = _metal_field_cis(phase, Val(MODE))
+            # Timing probe (BLAB_TEST_FIELD_PROBE=1, wrong results): no cis.
+            c, sn_ = PROBE == 1 ? (1.0f0 - phase, phase) : _metal_field_cis(phase, Val(MODE))
             green_re = c * green_scale
             green_im = sn_ * green_scale
             normal_projection = (r1 * sn[1].value + r2 * sn[2].value + r3 * sn[3].value) * inv_radius
             double_re = (-green_re * inv_radius - green_im * k) * normal_projection
             double_im = (green_re * k - green_im * inv_radius) * normal_projection
-            potential_re, potential_im = _test_mf_update(potential_re, potential_im, weights4, s, source_count,
+            potential_re, potential_im = _test_mf_update(potential_re, potential_im, weights4, PROBE == 2 ? fixed : s, source_count,
                 double_re, double_im, green_re, green_im, Val(ND))
         end
         end
@@ -328,14 +340,13 @@ function _test_multi_field_pass(eval_points, pressures, neumanns, k::Float32, ca
     d_potentials = MtlArray{ComplexF32}(undef, point_count * nd)
     far = _test_far_rule()
     if far === nothing
-    _metal_launch(
-        _test_multi_field_kernel!,
-        point_count * chunk_count,
+    multi_args = (
         d_partials, d_eval_points, tables.points4, tables.normals4, d_weights4, k,
         Int32(source_count), Int32(point_count), Int32(chunk_length), Int32(chunk_count),
-        Val(parse(Int, get(ENV, "BLAB_METAL_FIELD_FAST", "1"))), Val(nd);
-        groupsize=groupsize,
+        Val(parse(Int, get(ENV, "BLAB_METAL_FIELD_FAST", "1"))), Val(nd), _test_field_probe(),
     )
+    _test_pipeinfo("field_multi_nd$(nd)", _test_multi_field_kernel!, multi_args...)
+    _metal_launch(_test_multi_field_kernel!, point_count * chunk_count, multi_args...; groupsize=groupsize)
     else
         rule = _test_field_rule(cache)
         far_tables = _test_far_tables_for(cache, rule)
