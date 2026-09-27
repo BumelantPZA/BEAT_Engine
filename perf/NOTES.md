@@ -473,3 +473,23 @@ the CPU chain is longer by ~20 ms per frequency (~4 % of the cycle)**. Both test
 GPU slack (+78 = 100 - 22; -19). They are coupled, not independent: the dense step waits for the GPU
 matrices, and the field waits for the CPU solution. Consequence: shortening either lane alone gains at
 most ~20 ms/freq (~1 s per 50 freqs); larger gains need both lanes shorter.
+
+### Round 16 (2026-09-27): GPU_PLAN targets T1-T5
+**T1 (exterior fused kernel), done.** Switches (test-only, off by default): `BLAB_TEST_FUSED_IMAGE_ACC=1`,
+`BLAB_TEST_FUSED_PACKED=2`. Harness, quick.py, maxdB vs stock settings:
+| Project | stock | T1 | dB |
+|---|---|---|---|
+| prototype2 quarter + xy symmetry, 50 freqs | 0.077 (0.073 rerun) | 0.058 s/freq (1.26-1.33x) | 0.0021 |
+| prototype2 full mesh, no symmetry, 12 freqs | 0.279 | 0.247 (1.13x) | 0.0015 |
+| SAWMOD 12 freqs (coupled path, untouched) | 0.658 | 0.660 | 0 (bit-identical) |
+- Step 1 `FUSED_IMAGE_ACC=1`: transforms 2-4 add into the pair blocks, gathers once per chunk: 0.077 -> 0.071.
+- Step 2 `FUSED_PACKED=2`: float4 points/normals/curls, rule constants as Val, trial fold unrolled, test
+  loop at runtime: 512 threads/group (was 384), 0.069 -> 0.058. `FUSED_PACKED=1` (both loops unrolled,
+  36 bodies) is slower: 0.080.
+- Step 3 (tile-reduce gathers) skipped: after step 1 the gathers are 4.4 ms (lhs 2.9 + rhs 1.5) and the
+  SAWMOD tile reduction costs ~21 ms per transform.
+- Step 4 `FUSED_POOL=1` (pooled singular value buffers and rhs partials): 0.058 vs 0.058, no gain; left off.
+- Dead end: `FUSED_TR` draft (exterior via the coupled tile-reduce COMB kernels): 0.146 vs 0.082, the
+  6-point rule makes that kernel 85 ms (vs 22). Diff in perf/attic/t1_fused_via_tilereduce.diff.
+Stage split after T1 (proto2q, synced timers): pairs 18.9 ms (4 transforms), lhs gather 2.9, rhs 1.5,
+singular 8.8 (blocks 8.9 of it), image singular 4.2.

@@ -1099,6 +1099,32 @@ function _metal_singular_fused_bm_scatter_kernel!(
     return nothing
 end
 
+# Test (BLAB_TEST_FUSED_POOL=1): device scratch of the fused path (singular value buffers,
+# right-hand-side partials) kept between calls instead of a fresh `Metal.zeros` per call. Taken and
+# given back under a lock, so overlapping assemblies never share a buffer.
+const _TEST_FUSED_POOL = Dict{Tuple{DataType,Tuple},Vector{Any}}()
+const _TEST_FUSED_POOL_LOCK = ReentrantLock()
+_test_fused_pool_on() = get(ENV, "BLAB_TEST_FUSED_POOL", "0") == "1"
+
+function _test_fused_take(::Type{E}, dims...; zero_fill::Bool) where {E}
+    _test_fused_pool_on() || return Metal.zeros(E, dims...)
+    buffer = lock(_TEST_FUSED_POOL_LOCK) do
+        list = get(_TEST_FUSED_POOL, (E, dims), nothing)
+        list === nothing || isempty(list) ? nothing : pop!(list)
+    end
+    buffer === nothing && return Metal.zeros(E, dims...)
+    zero_fill && fill!(buffer, zero(E))
+    return buffer
+end
+
+function _test_fused_give(buffer)
+    _test_fused_pool_on() || return Metal.unsafe_free!(buffer)
+    lock(_TEST_FUSED_POOL_LOCK) do
+        push!(get!(_TEST_FUSED_POOL, (eltype(buffer), size(buffer)), Any[]), buffer)
+    end
+    return nothing
+end
+
 function _launch_metal_fused_singular_kernels!(
     lhs,
     rhs,
@@ -1132,8 +1158,8 @@ function _launch_metal_fused_singular_kernels!(
         _metal_gather_stage_timing["sing_info_parts"] = part_count
         _metal_gather_stage_timing["sing_info_rule_points"] = rule_point_count
     end
-    lhs_values = Metal.zeros(eltype(lhs), value_count, 9)
-    rhs_values = Metal.zeros(eltype(lhs), value_count, 3)
+    lhs_values = _test_fused_take(eltype(lhs), value_count, 9; zero_fill=false)   # every entry written below
+    rhs_values = _test_fused_take(eltype(lhs), value_count, 3; zero_fill=false)
     stamp = _metal_gather_stage!("sing_alloc", timed, stamp)
     _metal_launch(
         _metal_singular_fused_bm_blocks_kernel!,
@@ -1192,8 +1218,8 @@ function _launch_metal_fused_singular_kernels!(
     end
     Metal.synchronize()
     stamp = _metal_gather_stage!("sing_gather", timed, stamp)
-    Metal.unsafe_free!(lhs_values)
-    Metal.unsafe_free!(rhs_values)
+    _test_fused_give(lhs_values)
+    _test_fused_give(rhs_values)
     return nothing
 end
 
@@ -1291,7 +1317,7 @@ function assemble_burton_miller_neumann_system_metal(
             # right-hand-side partials are device-only scratch and stay private.
             lhs = Metal.zeros(Complex{T}, p1_count, p1_count; storage=storage)
             rhs = Metal.zeros(Complex{T}, p1_count, drive_count; storage=storage)
-            rhs_partial = Metal.zeros(Complex{T}, p1_count, tables.chunk_size, drive_count)
+            rhs_partial = _test_fused_take(Complex{T}, p1_count, tables.chunk_size, drive_count; zero_fill=true)
             Metal.synchronize()
         end
         timing !== nothing && (timing["metal_fused_alloc"] = allocation_elapsed)
@@ -1428,7 +1454,7 @@ function assemble_burton_miller_neumann_system_metal(
             assembly_mode=:metal_fused_burton_miller,
         )
     finally
-        rhs_partial === nothing || Metal.unsafe_free!(rhs_partial)
+        rhs_partial === nothing || _test_fused_give(rhs_partial)
         owns_q && Metal.unsafe_free!(d_q)
         owns_identity_cache && release_metal_fused_identity_cache!(identity_cache)
         if !succeeded
