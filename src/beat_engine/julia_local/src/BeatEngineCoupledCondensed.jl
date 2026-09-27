@@ -45,7 +45,7 @@ export assemble_condensed_regular_operators,
     build_condensed_coupled_system,
     condensed_metal_operators,
     release_condensed_coupled_system!,
-    reset_condensed_request_state!,
+    clear_condensed_host_pool!,
     solve_condensed_coupled_excitations,
     solve_condensed_coupled_system,
     solve_condensed_coupled_systems
@@ -1534,8 +1534,12 @@ function prepare_condensed_coupled_cache(
         mumps_store=Dict{Symbol,Any}(),
         # Double-precision FEM matrices for BLAB_COUPLED_FEM_FLOAT64.
         fem_float64_store=Dict{Symbol,Any}(),
+        # The sweep's reused Float32 dense factor (`RefinedDenseLU`).
+        dense_factor_reuse=DenseFactorReuse(),
     )
 end
+
+_dense_factor_reuse(cache) = hasproperty(cache, :dense_factor_reuse) ? cache.dense_factor_reuse : nothing
 
 function release_condensed_coupled_cache!(cache)
     # Extra bundles (orders other than the base) own their own device caches
@@ -2161,7 +2165,8 @@ function build_condensed_coupled_system(
 
     coupled_factorization_started = time_ns()
     factorization = dense_type === Float64 && T !== Float64 && _dense_refinement_enabled(bem_backend) ?
-                    RefinedDenseLU(coupled; correction=dense_correction) : lu!(coupled)
+                    RefinedDenseLU(coupled; correction=dense_correction, reuse=_dense_factor_reuse(condensed_cache)) :
+                    lu!(coupled)
     coupled_factorization_s = (time_ns() - coupled_factorization_started) / 1.0e9
 
     # Nothing below references the BEM matrices; `release_condensed_coupled_system!` returns the rest.
@@ -2323,17 +2328,20 @@ function _flux_columns(interface_operators, bem_motion_flux, bem_prescribed_neum
 end
 
 # The four Metal BEM operators for the condensed builder, as host arrays, with what the host
-# Burton-Miller combine needs to know about them. Under symmetry the host combine applies the row
-# weights (instead of a separate GPU pass), and where the kernels support it the GPU writes the
-# combined operators A = -D + βH and C = -S - βK' (CUDA's combined assembly).
+# Burton-Miller combine needs to know about them. The builder assembles with the tile-reduce kernels
+# unless BLAB_METAL_REGULAR_KERNEL_MODE says otherwise: under symmetry the host combine then applies
+# the row weights (instead of a separate GPU pass) and the GPU writes the combined operators
+# A = -D + βH and C = -S - βK' (CUDA's combined assembly), and faces without flux are skipped.
 function _condensed_metal_assembly(prepared, bem_mesh, wavenumber, singular_order, flux_columns)
-    supported = BeatEngineCore.metal_combined_assembly_supported()
+    kernel_mode = BeatEngineCore._normalized_metal_regular_kernel_mode(nothing; default="pair_tilereduce")
+    supported = BeatEngineCore.metal_combined_assembly_supported(kernel_mode)
     host_row_weights = supported && BeatEngineCore.normalized_symmetry_mode(prepared.symmetry_mode) != :off
-    options = supported ? BeatEngineCore.MetalAssemblyOptions(
+    options = BeatEngineCore.MetalAssemblyOptions(
+        regular_kernel_mode=kernel_mode,
         bm_coupling=host_row_weights ? Complex{Float32}(burton_miller_coupling(wavenumber)) : nothing,
-        flux_mask=isnothing(flux_columns) ? nothing : BeatEngineCore.MtlArray(Int32.(flux_columns)),
+        flux_mask=supported && !isnothing(flux_columns) ? BeatEngineCore.MtlArray(Int32.(flux_columns)) : nothing,
         apply_row_weights=!host_row_weights,
-    ) : nothing
+    )
     device_operators = assemble_regular_galerkin_operators(
         bem_mesh,
         prepared.p1,
@@ -2379,12 +2387,13 @@ end
 
 function release_condensed_coupled_system!(system)
     # The system's large host arrays go back to the pool for the next frequency. The current stale
-    # factor stays with `_STALE_DENSE_FACTOR`, which a later frequency may still reuse.
+    # factor stays with the cache's `DenseFactorReuse`, which a later frequency may still reuse.
     if hasproperty(system, :factorization) && system.factorization isa RefinedDenseLU
         refined = system.factorization
         _pool_give!(refined.matrix)
         factor = refined.factor
-        !isnothing(factor) && factor !== _STALE_DENSE_FACTOR.factor && _pool_give!(factor.factors)
+        reuse = refined.reuse
+        !isnothing(factor) && (isnothing(reuse) || factor !== reuse.factor) && _pool_give!(factor.factors)
         isnothing(refined.correction) || _pool_give!(refined.correction.block32)
         data = system.interface_elimination_data
         !isnothing(data) && hasproperty(data, :interface_block) && _pool_give!(data.interface_block)

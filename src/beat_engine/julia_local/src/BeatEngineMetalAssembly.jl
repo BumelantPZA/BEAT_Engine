@@ -43,9 +43,10 @@ function _assemble_regular_galerkin_operators_metal_native(
     native_cache.symmetry_mode == normalized_mode ||
         error("Metal assembly cache symmetry mode $(native_cache.symmetry_mode) does not match requested $(normalized_mode).")
     singular_mode = _normalized_metal_singular_mode()
+    regular_kernel_mode = something(options.regular_kernel_mode, _normalized_metal_regular_kernel_mode())
     combined = !isnothing(options.bm_coupling)
-    combined && !metal_combined_assembly_supported() && error(
-        "Combined Metal Burton-Miller assembly needs BLAB_METAL_REGULAR_KERNEL_MODE=pair_tilereduce, " *
+    combined && !metal_combined_assembly_supported(regular_kernel_mode) && error(
+        "Combined Metal Burton-Miller assembly needs the pair_tilereduce kernels, " *
         "BLAB_METAL_SINGULAR_MODE=native and BLAB_METAL_SINGULAR_WRITEBACK=gather.",
     )
 
@@ -65,7 +66,6 @@ function _assemble_regular_galerkin_operators_metal_native(
     end
     timing !== nothing && (timing["metal_native_operator_alloc"] = allocation_elapsed)
 
-    regular_kernel_mode = _normalized_metal_regular_kernel_mode()
     # In host singular mode the image regular kernels must integrate every
     # image pair with the regular rule (skip_mode 2), because the CPU image
     # correction is a Duffy-minus-regular delta. In native mode they skip the
@@ -267,7 +267,8 @@ function assemble_regular_galerkin_operators_metal_regular(
             options=options,
         )
     end
-    options == MetalAssemblyOptions() || error("MetalAssemblyOptions need native Metal assembly.")
+    isnothing(options.bm_coupling) && isnothing(options.flux_mask) && options.apply_row_weights ||
+        error("Combined operators, flux masks and host row weights need native Metal assembly.")
     metal_singular_cache === nothing ||
         error("Native Metal singular-correction caches are not supported by the host-staged backend.")
 

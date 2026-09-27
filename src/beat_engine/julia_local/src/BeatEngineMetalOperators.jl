@@ -11,36 +11,39 @@
 const _METAL_OPERATOR_KEYS = (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
 
 """
-    MetalAssemblyOptions(; bm_coupling=nothing, flux_mask=nothing, apply_row_weights=true)
+    MetalAssemblyOptions(; regular_kernel_mode=nothing, bm_coupling=nothing, flux_mask=nothing, apply_row_weights=true)
 
 Per-assembly options for a caller that consumes the operators on the host and forms the
 Burton-Miller system itself (the condensed coupled builder).
 
+- `regular_kernel_mode`: the regular kernels, instead of `BLAB_METAL_REGULAR_KERNEL_MODE`.
+
 - `bm_coupling`: the Burton-Miller coupling `β`. When set, the kernels write the combined
   operators `A = -D + βH` into `double_layer` and `C = -S - βK'` into `single_layer`, as the
   CUDA backend's combined assembly does; `adjoint_double_layer` and `hypersingular` stay zero.
-  Needs `metal_combined_assembly_supported()`.
+  Needs `metal_combined_assembly_supported(regular_kernel_mode)`.
 - `flux_mask`: an `Int32` device vector over the DP0 columns. Columns marked 0 carry no flux, so
   the tile-reduce S/K' gather skips them; the caller must not read them.
 - `apply_row_weights`: `false` leaves the symmetry row weights to the caller, which can fold them
   into its own pass over the operators instead of a separate GPU pass.
 """
 Base.@kwdef struct MetalAssemblyOptions
+    regular_kernel_mode::Union{Nothing,Symbol} = nothing
     bm_coupling::Union{Nothing,ComplexF32} = nothing
     flux_mask::Any = nothing
     apply_row_weights::Bool = true
 end
 
 """
-    metal_combined_assembly_supported()
+    metal_combined_assembly_supported(regular_kernel_mode)
 
-Whether non-default `MetalAssemblyOptions` are available with the current settings: only native
-assembly with the `pair_tilereduce` kernels and the native gather write-back of the singular pairs
-forms the combined operators and honours the flux mask.
+Whether the combined operators, the flux mask and host row weights (`MetalAssemblyOptions`) are
+available with these kernels and the current settings: only native assembly with the
+`pair_tilereduce` kernels and the native gather write-back of the singular pairs supports them.
 """
-metal_combined_assembly_supported() =
+metal_combined_assembly_supported(regular_kernel_mode::Symbol) =
     _normalized_metal_assembly_mode(nothing) == :native &&
-    _normalized_metal_regular_kernel_mode() == :pair_tilereduce &&
+    regular_kernel_mode == :pair_tilereduce &&
     _normalized_metal_singular_mode() == :native &&
     _normalized_metal_singular_writeback() == :gather
 
@@ -55,6 +58,25 @@ const _METAL_OPERATOR_POOL_SIZE = 2
 # buffers are known to be zero needs only the written two zeroed. Keyed by the set's
 # `adjoint_double_layer` buffer.
 const _METAL_POOL_AUXILIARY_ZERO = IdDict{Any,Bool}()
+
+"""
+    release_metal_operator_pool!()
+
+Free the pooled operator buffers (up to `_METAL_OPERATOR_POOL_SIZE` dense operator sets). The
+worker calls it when it reclaims accelerator memory.
+"""
+function release_metal_operator_pool!()
+    pooled = lock(_METAL_OPERATOR_POOL_LOCK) do
+        sets = copy(_METAL_OPERATOR_POOL)
+        empty!(_METAL_OPERATOR_POOL)
+        empty!(_METAL_POOL_AUXILIARY_ZERO)
+        sets
+    end
+    for set in pooled, key in _METAL_OPERATOR_KEYS
+        Metal.unsafe_free!(getfield(set, key))
+    end
+    return nothing
+end
 
 function _take_pooled_operators(sizes, combined::Bool)
     pooled = lock(_METAL_OPERATOR_POOL_LOCK) do

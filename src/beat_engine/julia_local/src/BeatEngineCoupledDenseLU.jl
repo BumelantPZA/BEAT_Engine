@@ -38,8 +38,9 @@ mutable struct RefinedDenseLU
     iterations::Int
     fallback_reason::Union{Nothing,String}
     backward_error::Float64
-    stale::Bool   # `factor` belongs to an earlier frequency (see `_STALE_DENSE_FACTOR`)
+    stale::Bool   # `factor` belongs to an earlier frequency (see `DenseFactorReuse`)
     correction::Any   # `B_q W` blocks kept out of `matrix` (see `_dense_mul!`), or nothing
+    reuse::Union{Nothing,DenseFactorReuse}
 end
 
 # The flux elimination's `B_q W` columns stay out of the Float64 dense matrix. `correction.parts` holds them per block as factors (Float64 `coupling` and `schur`,
@@ -153,35 +154,21 @@ function _materialize_correction!(refined)
     return refined
 end
 
-# The last fresh ComplexF32 factor of the request, reused as a GMRES preconditioner at later
-# frequencies while the previous stale solve needed at most `DENSE_STALE_REUSE_MAX_ITERATIONS`
-# iterations. A stale solve that has not reached the Float64 backward error after
+# A sweep's last fresh ComplexF32 factor, reused as a GMRES preconditioner at later frequencies
+# while the previous stale solve needed at most `DENSE_STALE_REUSE_MAX_ITERATIONS` iterations. A
+# stale solve that has not reached the Float64 backward error after
 # `DENSE_STALE_GMRES_MAX_ITERATIONS` iterations factors afresh and ends reuse for the rest of the
-# request: a sweep ascends and the iterations grow with frequency, so on SAWMOD reuse covers
-# 23 Hz - 0.9 kHz and saves the Float32 LU there. The driver resets it per request.
+# sweep: a sweep ascends and the iterations grow with frequency, so on SAWMOD reuse covers
+# 23 Hz - 0.9 kHz and saves the Float32 LU there. The condensed cache owns one per request.
 const DENSE_STALE_GMRES_MAX_ITERATIONS = 15
 const DENSE_STALE_REUSE_MAX_ITERATIONS = 8
 
-mutable struct StaleDenseFactor
+mutable struct DenseFactorReuse
     factor::Union{Nothing,LinearAlgebra.LU{ComplexF32,Matrix{ComplexF32},Vector{LinearAlgebra.BlasInt}}}
     last_iterations::Int
     disabled::Bool
 end
-const _STALE_DENSE_FACTOR = StaleDenseFactor(nothing, 0, false)
-
-"""
-    reset_condensed_request_state!()
-
-Forget the reused dense factor and empty the host array pool. Called by the driver at the start and
-end of every request, so neither carries over between requests.
-"""
-function reset_condensed_request_state!()
-    _STALE_DENSE_FACTOR.factor = nothing
-    _STALE_DENSE_FACTOR.last_iterations = 0
-    _STALE_DENSE_FACTOR.disabled = false
-    _pool_clear!()
-    return nothing
-end
+DenseFactorReuse() = DenseFactorReuse(nothing, 0, false)
 
 # `opnorm(matrix, Inf)` and `maximum(abs, matrix)` in one threaded pass. `opnorm` walks the column-major matrix row by row (~95 ms at n = 3116); here each
 # task owns a block of rows and sweeps it column by column, so every row sum adds the same terms
@@ -276,11 +263,12 @@ function _lu_solve(factor::LinearAlgebra.LU{T}, rhs::AbstractVecOrMat; nb::Int=D
     return rhs isa AbstractVector ? vec(B) : B
 end
 
-function RefinedDenseLU(matrix::Matrix{ComplexF64}; correction=nothing)
+function RefinedDenseLU(matrix::Matrix{ComplexF64}; correction=nothing, reuse::Union{Nothing,DenseFactorReuse}=nothing)
     all(isfinite, matrix) || throw(ArgumentError("dense coupled matrix has non-finite entries"))
-    refined = RefinedDenseLU(matrix, 0.0, nothing, nothing, 0, nothing, NaN, false, correction)
-    stale = _STALE_DENSE_FACTOR
-    reuse_stale = !stale.disabled && !isnothing(stale.factor) && size(stale.factor.factors) == size(matrix) &&
+    refined = RefinedDenseLU(matrix, 0.0, nothing, nothing, 0, nothing, NaN, false, correction, reuse)
+    stale = reuse
+    reuse_stale = !isnothing(stale) && !stale.disabled && !isnothing(stale.factor) &&
+                  size(stale.factor.factors) == size(matrix) &&
                   stale.last_iterations <= DENSE_STALE_REUSE_MAX_ITERATIONS
     if !isnothing(correction) && reuse_stale
         # No Float32 product for a stale factor: the norm is bounded from above instead, which only
@@ -313,11 +301,14 @@ function _fresh_factor!(refined::RefinedDenseLU, narrowed=nothing)
     if issuccess(candidate) && all(isfinite, candidate.factors)
         refined.factor = candidate
         refined.stale = false
-        previous = _STALE_DENSE_FACTOR.factor
-        # The replaced stale factor is referenced by no system any more.
-        isnothing(previous) || previous === candidate || _pool_give!(previous.factors)
-        _STALE_DENSE_FACTOR.factor = candidate
-        _STALE_DENSE_FACTOR.last_iterations = 0
+        reuse = refined.reuse
+        if !isnothing(reuse)
+            previous = reuse.factor
+            # The replaced stale factor is referenced by no system any more.
+            isnothing(previous) || previous === candidate || _pool_give!(previous.factors)
+            reuse.factor = candidate
+            reuse.last_iterations = 0
+        end
     else
         _dense_fall_back!(refined, "the Float32 factorization is singular or not finite")
     end
@@ -418,12 +409,12 @@ function Base.:\(factorization::RefinedDenseLU, rhs::AbstractVecOrMat)
         result = _stale_gmres(factorization, Matrix(reshape(target, size(target, 1), :)), DENSE_STALE_GMRES_MAX_ITERATIONS)
         if !isnothing(result)
             solution, iterations, ratio = result
-            _STALE_DENSE_FACTOR.last_iterations = iterations
+            factorization.reuse.last_iterations = iterations
             factorization.iterations = max(factorization.iterations, iterations)
             factorization.backward_error = ratio
             return rhs isa AbstractVector ? vec(solution) : solution
         end
-        _STALE_DENSE_FACTOR.disabled = true
+        factorization.reuse.disabled = true
         _fresh_factor!(factorization)
     end
     if isnothing(factorization.fallback)

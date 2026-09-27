@@ -144,8 +144,8 @@ function _metal_kernel_groupsize()
     return groupsize
 end
 
-function _normalized_metal_regular_kernel_mode(value=nothing)
-    value === nothing && (value = get(ENV, "BLAB_METAL_REGULAR_KERNEL_MODE", "pair_tilereduce"))
+function _normalized_metal_regular_kernel_mode(value=nothing; default::AbstractString="pair_gather")
+    value === nothing && (value = get(ENV, "BLAB_METAL_REGULAR_KERNEL_MODE", default))
     mode = Symbol(lowercase(strip(String(value))))
     aliases = Dict(
         :pair => :pair_owned,
@@ -166,7 +166,7 @@ function _normalized_metal_regular_kernel_mode(value=nothing)
     )
     normalized = get(aliases, mode, nothing)
     normalized === nothing && error(
-        "BLAB_METAL_REGULAR_KERNEL_MODE must be pair_tilereduce, pair_gather, pair_atomic, pair_owned, or entry_owned; got $(value).",
+        "BLAB_METAL_REGULAR_KERNEL_MODE must be pair_gather, pair_tilereduce, pair_atomic, pair_owned, or entry_owned; got $(value).",
     )
     return normalized
 end

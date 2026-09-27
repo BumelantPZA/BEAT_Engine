@@ -2861,7 +2861,7 @@ function solve_request_impl(request; event_mode=false)
     else
         nothing
     end
-    use_condensed_solver && reset_condensed_request_state!()
+    use_condensed_solver && clear_condensed_host_pool!()
     coupled_system = nothing
     try
         for (frequency_index, frequency_value) in enumerate(frequencies)
@@ -3482,7 +3482,7 @@ function solve_request_impl(request; event_mode=false)
     finally
         GC.enable(true)
         isnothing(pipeline) || release_pipeline!(pipeline)
-        use_condensed_solver && reset_condensed_request_state!()
+        use_condensed_solver && clear_condensed_host_pool!()
         if coupled_system !== nothing
             use_condensed_solver ? release_condensed_coupled_system!(coupled_system) :
             release_coupled_system!(coupled_system)
@@ -3502,6 +3502,8 @@ function reclaim_accelerator_memory!()
     catch
         nothing
     end
+    clear_condensed_host_pool!()
+    isdefined(BeatEngineCore, :release_metal_operator_pool!) && BeatEngineCore.release_metal_operator_pool!()
     GC.gc(true)
     try
         cuda = BeatEngineCore.cuda_module()

@@ -4,7 +4,7 @@
 # so the next frequency writes pages it already owns. Filling a fresh 155 MB array costs ~57 ms of
 # page faults, a reused one 1.5 ms; SAWMOD allocated ~1.1 GB per frequency (~76k faults, ~0.3 s of
 # system time). An array goes back only once nothing references it; the driver empties the pool at
-# the start and end of each request (`reset_condensed_request_state!`).
+# the start and end of each request (`clear_condensed_host_pool!`).
 
 const _HOST_POOL = Dict{Any,Vector{Any}}()
 const _HOST_POOL_LOCK = ReentrantLock()
@@ -28,7 +28,12 @@ function _pool_give!(arrays...)
     return nothing
 end
 
-_pool_clear!() = lock(() -> empty!(_HOST_POOL), _HOST_POOL_LOCK)
+"""
+    clear_condensed_host_pool!()
+
+Drop every pooled host array, so none outlives the request that allocated it.
+"""
+clear_condensed_host_pool!() = lock(() -> empty!(_HOST_POOL), _HOST_POOL_LOCK)
 
 # `zeros(T, m, n)` from the pool, zeroed by column on all threads.
 function _pool_zeros(::Type{T}, m::Int, n::Int) where {T}
