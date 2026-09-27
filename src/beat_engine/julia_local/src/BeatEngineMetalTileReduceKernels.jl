@@ -900,7 +900,7 @@ function _launch_metal_tilereduce_transforms!(operators, cache::MetalRegularAsse
             cache.rule_weights,
             )
             chunk == 1 && transform_index == 1 && _test_pipeinfo("tilereduce_pair", _metal_tilereduce_pair_kernel!, pair_args...)
-            Metal.@metal threads=(_METAL_TILEREDUCE_TX, ty) groups=(tables.tile_count, cld(chunk_count, ty)) _metal_tilereduce_pair_kernel!(pair_args...)
+            @_test_cold_launch Metal.@metal threads=(_METAL_TILEREDUCE_TX, ty) groups=(tables.tile_count, cld(chunk_count, ty)) _metal_tilereduce_pair_kernel!(pair_args...)
         end
         stamp = _metal_gather_stage!("pairs", timed, stamp)
         if !isnothing(combined)

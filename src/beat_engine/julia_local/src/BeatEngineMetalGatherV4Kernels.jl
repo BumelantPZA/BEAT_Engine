@@ -235,7 +235,7 @@ function _launch_metal_gather_v4_pair_kernels!(
         chunk_start = (chunk - 1) * chunk_size + 1
         chunk_count = min(chunk_size, element_count - chunk_start + 1)
         if packed !== nothing
-            Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_regular_pair_blocks_v4p_kernel!(
+            @_test_cold_launch Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_regular_pair_blocks_v4p_kernel!(
                 blocks4,
                 packed.points4,
                 packed.normals4,
@@ -262,7 +262,7 @@ function _launch_metal_gather_v4_pair_kernels!(
                 trial_curl_sign_z,
             )
         else
-        Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_regular_pair_blocks_v4_kernel!(
+        @_test_cold_launch Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_regular_pair_blocks_v4_kernel!(
             blocks4,
             cache.face_vertices,
             cache.normals,

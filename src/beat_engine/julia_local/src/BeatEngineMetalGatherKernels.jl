@@ -363,7 +363,7 @@ function _launch_metal_gather_pair_kernels!(
     for chunk in 1:tables.chunk_count
         chunk_start = (chunk - 1) * chunk_size + 1
         chunk_count = min(chunk_size, element_count - chunk_start + 1)
-        Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_regular_pair_blocks_kernel!(
+        @_test_cold_launch Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_regular_pair_blocks_kernel!(
             tables.blocks,
             cache.face_vertices,
             cache.normals,

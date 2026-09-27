@@ -353,7 +353,7 @@ function _launch_metal_atomic_pair_kernels!(
     groups_x = cld(element_count, tile_x)
     groups_y = cld(element_count, tile_y)
     scatter = Val(get(ENV, "BLAB_METAL_ATOMIC_SCATTER", "1") != "0")
-    Metal.@metal threads=(tile_x, tile_y) groups=(groups_x, groups_y) _metal_regular_pair_atomic_kernel!(
+    @_test_cold_launch Metal.@metal threads=(tile_x, tile_y) groups=(groups_x, groups_y) _metal_regular_pair_atomic_kernel!(
         reinterpret(Float32, operators.single_layer),
         reinterpret(Float32, operators.adjoint_double_layer),
         reinterpret(Float32, operators.double_layer),

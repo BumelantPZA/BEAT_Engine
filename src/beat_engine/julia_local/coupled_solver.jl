@@ -1,6 +1,20 @@
 #!/usr/bin/env julia
 
+# Test (BLAB_TEST_COLD_LOG=<file>, process env): "<epoch s> <compile s> <label>" lines for the worker's
+# start-up phases and the request phases of test_phase_log; kernel first launches come from _metal_launch.
+function test_cold_log(label)
+    path = get(ENV, "BLAB_TEST_COLD_LOG", "")
+    isempty(path) && return nothing
+    compile_s = Base.cumulative_compile_time_ns()[1] / 1.0e9
+    open(io -> println(io, round(time(); digits=4), " ", round(compile_s; digits=4), " ", label), path, "a")
+    return nothing
+end
+isempty(get(ENV, "BLAB_TEST_COLD_LOG", "")) || Base.cumulative_compile_timing(true)
+isempty(get(ENV, "BLAB_TEST_COLD_LOG", "")) ||
+    test_cold_log("script_start pid=$(getpid()) process_elapsed=$(strip(read(`ps -o etime= -p $(getpid())`, String)))")
+
 using Base64, JSON, LinearAlgebra, SparseArrays, StaticArrays, Statistics
+test_cold_log("using_done")
 
 include(joinpath(@__DIR__, "src", "BeatEngineContract.jl"))
 using .BeatEngineContract
@@ -19,6 +33,7 @@ using .BeatEngineSpeakerRom
 
 include(joinpath(@__DIR__, "src", "BeatEngineInterfaceVelocity.jl"))
 using .BeatEngineInterfaceVelocity
+test_cold_log("includes_done")
 
 const DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V = 2.83
 const RUN_MESH_PROVENANCE = Ref{Any}([])
@@ -896,6 +911,9 @@ function solve_exterior_direct_metal_system(system)
     # one factorization serves every column.
     started = time_ns()
     pressure, report = solve_metal_burton_miller_system_with_report(system)
+    # Test (BLAB_TEST_DELAY_EXT_SOLVE=<s>): lengthen the host solve by an idle wait (overlap test).
+    test_delay = parse(Float64, get(ENV, "BLAB_TEST_DELAY_EXT_SOLVE", "0"))
+    test_delay > 0 && sleep(test_delay)
     pressures = [copy(column) for column in eachcol(pressure)]
     return pressures, (time_ns() - started) / 1.0e9, report.method
 end
@@ -1072,6 +1090,11 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         frequency_count=length(frequencies_hz),
     ) : nothing
     metal_pipeline = overlap_plan !== nothing && overlap_plan.enabled
+    overlap_plan === nothing || test_phase_log(
+        "overlap_plan enabled=$(overlap_plan.enabled) reason=$(overlap_plan.reason) " *
+        "assembly_model_s=$(overlap_plan.assembly_model_s) solve_model_s=$(overlap_plan.solve_model_s) " *
+        "saving_model_s=$(overlap_plan.saving_model_s)",
+    )
     produce_metal_system = function (index)
         omega = FloatType(2pi) * FloatType(frequencies_hz[index])
         wavenumber = omega / sound_speed
@@ -1110,6 +1133,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         end
         for (frequency_index, raw_frequency) in enumerate(frequencies_hz)
             cancel_requested() && return (cancelled=true, solved_count=solved_count)
+            test_phase_log("ext_iter $frequency_index")
             frequency_hz = FloatType(raw_frequency)
             omega = FloatType(2pi) * frequency_hz
             wavenumber = omega / sound_speed
@@ -2464,6 +2488,7 @@ end
 function test_phase_log(label, at=time_ns())
     path = get(ENV, "BLAB_TEST_PHASE_LOG", "")
     isempty(path) || open(io -> println(io, at, " ", label), path, "a")
+    test_cold_log("phase " * label)
     return nothing
 end
 # Test instrumentation: (user s, system s, minor page faults) of this process, from getrusage.
@@ -4129,7 +4154,9 @@ function worker_backend_availability()
 end
 
 function run_worker()
+    test_cold_log("run_worker")
     ready = worker_ready(worker_backend_availability())
+    test_cold_log("backends_checked")
     ready["worker_cleanup_policies"] = ["aggressive", "cuda_reuse"]
     push!(ready["operations"], "reclaim")
     println(JSON.json(ready))

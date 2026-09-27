@@ -207,9 +207,38 @@ end
     return Int(thread_position_in_grid_1d())
 end
 
+# Test (BLAB_TEST_COLD_LOG=<file>): the host wall of each kernel's first launch (Metal compiles
+# there), as "<epoch s> <compile s> launch1 <wall s> <kernel>". Keyed by kernel name.
+const _TEST_LAUNCHED = Set{String}()
+function _test_cold_launch_log(path, started, name)
+    wall = (time_ns() - started) / 1.0e9
+    compile_s = Base.cumulative_compile_time_ns()[1] / 1.0e9
+    open(io -> println(io, round(time(); digits=4), " ", round(compile_s; digits=4), " launch1 ",
+                       round(wall; digits=4), " ", name), path, "a")
+    return nothing
+end
+macro _test_cold_launch(ex)
+    return _test_cold_launch_expr(string(ex.args[end].args[1]), ex)
+end
+macro _test_cold_launch(name, ex)
+    return _test_cold_launch_expr(esc(name), ex)
+end
+function _test_cold_launch_expr(name, ex)
+    return quote
+        local cold_log = get(ENV, "BLAB_TEST_COLD_LOG", "")
+        local name = isempty(cold_log) ? "" : string($name)
+        local first = !isempty(cold_log) && !(name in _TEST_LAUNCHED)
+        first && push!(_TEST_LAUNCHED, name)
+        local started = time_ns()
+        $(esc(ex))
+        first && _test_cold_launch_log(cold_log, started, name)
+        nothing
+    end
+end
+
 function _metal_launch(kernel, count::Integer, args...; groupsize::Integer=_metal_kernel_groupsize())
     count <= 0 && return nothing
-    Metal.@metal threads=groupsize groups=cld(count, groupsize) kernel(args...)
+    @_test_cold_launch nameof(kernel) Metal.@metal threads=groupsize groups=cld(count, groupsize) kernel(args...)
     return nothing
 end
 

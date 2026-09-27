@@ -799,7 +799,7 @@ function _launch_metal_fused_pair_kernels!(lhs, rhs_partial, q_neumann, cache::M
             )
             if far_tables !== nothing
                 near_args = (packed_args..., Val(1), far_tables.centroids4, far_rho, far_kh)
-                Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _test_fused_pair_blocks_packed_kernel!(near_args...)
+                @_test_cold_launch Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _test_fused_pair_blocks_packed_kernel!(near_args...)
                 packed_args = (
                     tables.blocks, far_tables.points3, packed.normals4, cache.areas, packed.curls4, cache.faces, tables.elements,
                     far_tables.rule3_points, far_tables.rule3_weights,
@@ -811,10 +811,10 @@ function _launch_metal_fused_pair_kernels!(lhs, rhs_partial, q_neumann, cache::M
                 )
             end
             chunk == 1 && transform_number == 1 && _test_pipeinfo("fused_pair_packed", _test_fused_pair_blocks_packed_kernel!, packed_args...)
-            Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _test_fused_pair_blocks_packed_kernel!(packed_args...)
+            @_test_cold_launch Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _test_fused_pair_blocks_packed_kernel!(packed_args...)
         else
         chunk == 1 && _test_pipeinfo("fused_pair", _metal_fused_pair_blocks_kernel!, pair_args...)
-        Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_fused_pair_blocks_kernel!(pair_args...
+        @_test_cold_launch Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_fused_pair_blocks_kernel!(pair_args...
         )
         end
         stamp = _metal_gather_stage!("fused_pairs", timed, stamp)
