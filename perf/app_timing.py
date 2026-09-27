@@ -7,6 +7,13 @@ BACKEND = os.environ.get("APP_TIMING_BACKEND", "beat_metal_test")
 from blab.headless import load_headless_solve_spec, HeadlessSolveSpec, load_headless_project, prepare_headless_solve, run_headless_solve
 from blab.solvers.coupled_backend import PhysicalSystemProductionBackend
 
+# APP_TIMING_EXTRA="K=V,K=V": extra switches on top of the app's test_env (test only; the app is untouched).
+if os.environ.get("APP_TIMING_EXTRA"):
+    from blab.solvers import engine_distribution as _ed
+    for _kv in os.environ["APP_TIMING_EXTRA"].split(","):
+        _k, _v = _kv.split("=", 1)
+        _ed.METAL_TEST_SOLVER_OPTIONS["test_env"][_k] = _v
+ROWS_DIR = os.environ.get("APP_TIMING_ROWS_DIR", tempfile.gettempdir())
 path = sys.argv[1]; runs = int(sys.argv[2]) if len(sys.argv) > 2 else 2
 threads = sys.argv[3] if len(sys.argv) > 3 else None
 nfreq = int(sys.argv[4]) if len(sys.argv) > 4 else None
@@ -49,7 +56,7 @@ for run in range(runs):
     steady = (freq[-1] - freq[1]) / (len(freq) - 2) if len(freq) > 2 else float("nan")
     print(f"run {run+1}: total {done-start:.2f} s  to first freq {first:.2f} s  "
           f"steady {steady:.3f} s/freq  after last {done-freq[-1]:.2f} s  n={len(freq)}", flush=True)
-    json.dump([{"t": t, **tm} for t, tm in RAW], open(f"/private/tmp/claude-501/-Users-aleksanderspitalniak-boundary-lab/4b9c8f71-9ea4-4b86-b7b8-1b0f0a794056/scratchpad/app_rows{run+1}.json", "w"))
+    json.dump([{"t": t, **tm} for t, tm in RAW], open(f"{ROWS_DIR}/app_rows{run+1}.json", "w"))
     RAW.clear()
     if os.environ.get("APP_TIMING_DUMP"):   # raw per-frequency results of the last run, for accuracy checks
         import pickle

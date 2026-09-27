@@ -1,0 +1,15 @@
+--- a/src/blab/solvers/engine_distribution.py	2026-09-27 13:37:56
++++ b/src/blab/solvers/engine_distribution.py	2026-09-27 13:37:56
+@@ -98,6 +98,12 @@
+         # allocation whose pages fault in on every factorization (12.6k -> 3.0k faults). Bit-identical,
+         # SAWMOD 50-freq 0.467 -> 0.450 s/freq; Vented_Sub and compression_driver neutral.
+         "BLAB_TEST_MUMPS_WK": "1",
++        # Round 16 (GPU_PLAN T1, T3): exterior fused kernel with images summed before one gather and
++        # packed loads (prototype2 quarter 0.077 -> 0.058 s/freq, 0.002 dB); every excitation's field in
++        # one pass (SAWMOD 50-freq 0.530 -> 0.504 s/freq, 0.0005 dB).
++        "BLAB_TEST_FUSED_IMAGE_ACC": "1",
++        "BLAB_TEST_FUSED_PACKED": "2",
++        "BLAB_TEST_FIELD_MULTI": "1",
+     }
+ }
+ 

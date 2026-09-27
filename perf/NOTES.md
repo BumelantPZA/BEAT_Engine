@@ -563,3 +563,13 @@ rule bodies crashes the Metal compiler at pipeline link, like TR_EARLY_COMB=2). 
 The pair kernel is not the only cost any more after T1 (gathers, singular, field, solve), the second
 launch re-reads every pair, and the 3-point rule cannot follow the phase once k h ~ 1. SAWMOD already
 uses the 3-point rule (only a 1-point rule would be cheaper, first-order like T3 part 2): not tried.
+
+**Round 16 summary, app path** (`perf/app_timing.py`, the app's headless solve, run 2 = warm; machine
+shared with WindowServer/Beeper at ~45 % CPU each, so absolute times are above the round 14 baselines;
+`APP_TIMING_EXTRA` adds switches on top of the app's test_env):
+| Project | current app settings | + round 16 switches | gain |
+|---|---|---|---|
+| SAWMOD 50 freqs (+FIELD_MULTI) | 32.5 s (0.618 s/freq steady) | 28.0 s (0.518) | -14 % |
+| prototype2 quarter 200 freqs (+FUSED_IMAGE_ACC, FUSED_PACKED=2, FIELD_MULTI) | 14.3 s (0.070) | 12.3 s (0.060) | -14 % |
+Accuracy (quick.py, vs stock): SAWMOD 0.0005 dB, prototype2 0.002 dB. App patch:
+`perf/app_patches/round16_engine_distribution.diff` (not applied; the user applies it).

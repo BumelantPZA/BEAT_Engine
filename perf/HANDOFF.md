@@ -22,6 +22,18 @@ Explain accuracy to the user in plain terms (dB change and seconds saved), not m
   off at 10-20 kHz at the quietest points of the 60 dB window (Float32 summation). A max-dB limit of
   0.01 there is below what Float32 can deliver; compare against stock, not against zero.
 
+## Status after round 16 (2026-09-27): GPU_PLAN T1-T5 worked through (NOTES "Round 16")
+- Kept (test-only switches, off by default, app patch `perf/app_patches/round16_engine_distribution.diff`
+  not yet applied): `BLAB_TEST_FUSED_IMAGE_ACC=1` + `BLAB_TEST_FUSED_PACKED=2` (T1, exterior),
+  `BLAB_TEST_FIELD_MULTI=1` (T3 part 1, coupled). App path: SAWMOD 32.5 -> 28.0 s, prototype2 quarter
+  14.3 -> 12.3 s (busy machine), 0.0005 / 0.002 dB.
+- No gain or rejected: T2 (early combine slower in the tile-reduce kernel, runtime-loop variant crashes
+  the Metal compiler; TY=8 neutral), T3 part 2 (centroid far field: 20-43 dB), T4 (3-point far pairs:
+  0.24-50 dB for <= 4 %), T5 (singular split: accurate only for k h < 0.8, ~2-3 ms/freq; optional
+  `BLAB_TEST_SING_SPLIT=0.6`, 0.0004 dB). T1 steps 3-4 skipped / no gain.
+- Metal compiler: a kernel with two runtime-loop quadrature bodies (or a runtime test loop beside the
+  tile-reduce barriers) fails at pipeline link; use one body per launch.
+
 ## Status after round 15 (2026-09-27): GPU timing study done, plan in perf/GPU_PLAN.md
 - Operators alone: SAWMOD 250 ms (pair kernel 214 = maths ~120 + in-group reduction ~90), field 84;
   prototype2 quarter 49 ms (pairs 22, gathers 17, singular 12), field 12.6. Kernels are
