@@ -1,20 +1,6 @@
 #!/usr/bin/env julia
 
-# Test (BLAB_TEST_COLD_LOG=<file>, process env): "<epoch s> <compile s> <label>" lines for the worker's
-# start-up phases and the request phases of test_phase_log; kernel first launches come from _metal_launch.
-function test_cold_log(label)
-    path = get(ENV, "BLAB_TEST_COLD_LOG", "")
-    isempty(path) && return nothing
-    compile_s = Base.cumulative_compile_time_ns()[1] / 1.0e9
-    open(io -> println(io, round(time(); digits=4), " ", round(compile_s; digits=4), " ", label), path, "a")
-    return nothing
-end
-isempty(get(ENV, "BLAB_TEST_COLD_LOG", "")) || Base.cumulative_compile_timing(true)
-isempty(get(ENV, "BLAB_TEST_COLD_LOG", "")) ||
-    test_cold_log("script_start pid=$(getpid()) process_elapsed=$(strip(read(`ps -o etime= -p $(getpid())`, String)))")
-
 using Base64, JSON, LinearAlgebra, SparseArrays, StaticArrays, Statistics
-test_cold_log("using_done")
 
 include(joinpath(@__DIR__, "src", "BeatEngineContract.jl"))
 using .BeatEngineContract
@@ -28,12 +14,14 @@ include(joinpath(@__DIR__, "src", "BeatEngineCoupled.jl"))
 using .BeatEngineCoupled
 include(joinpath(@__DIR__, "src", "BeatEngineCoupledCondensed.jl"))
 using .BeatEngineCoupledCondensed
+
+include(joinpath(@__DIR__, "src", "BeatEngineCoupledPipeline.jl"))
+using .BeatEngineCoupledPipeline
 include(joinpath(@__DIR__, "src", "BeatEngineSpeakerRom.jl"))
 using .BeatEngineSpeakerRom
 
 include(joinpath(@__DIR__, "src", "BeatEngineInterfaceVelocity.jl"))
 using .BeatEngineInterfaceVelocity
-test_cold_log("includes_done")
 
 const DEFAULT_TRANSDUCER_REFERENCE_VOLTAGE_V = 2.83
 const RUN_MESH_PROVENANCE = Ref{Any}([])
@@ -63,42 +51,28 @@ const BEM_FIELD_EVALUATION_CACHES = Dict{String,Any}()
 const BEM_FIELD_EVALUATION_CACHE_ORDER = String[]
 const MAX_BEM_FIELD_EVALUATION_CACHES = Int(BeatEngineContract.WORKER["field_cache"]["max_entries"])
 
-# Test hook: BLAB_TEST_BLAS=accelerate routes BLAS/LAPACK (Julia's dense calls and MUMPS,
-# both via libblastrampoline) to Apple Accelerate; anything else restores the startup libraries.
-const TEST_ACCELERATE = "/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate"
-const TEST_BLAS_MODE = Ref("openblas")
-const TEST_BLAS_STARTUP = Ref{Any}(nothing)
+const APPLE_ACCELERATE = "/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate"
+const ACCELERATE_BLAS_ACTIVE = Ref(false)
 
-function test_apply_blas!()
-    requested = lowercase(get(ENV, "BLAB_TEST_BLAS", "openblas"))
-    # "hybrid": Julia's ILP64 calls on Accelerate, MUMPS's LP64 calls on OpenBLAS32 (so
-    # BLAB_MUMPS_THREADS applies again).
-    mode = requested in ("accelerate", "hybrid") ? requested : "openblas"
-    mode == TEST_BLAS_MODE[] && return
+"""
+    use_accelerate_blas!()
+
+Route BLAS and LAPACK, Julia's dense calls and MUMPS's alike (both go through libblastrampoline),
+to Apple Accelerate, once per process. Metal solves keep the dense factorizations, the
+Burton-Miller combine and MUMPS on the host, where Accelerate runs them on the AMX units: on
+SAWMOD on an M1 Pro, OpenBLAS's ComplexF32 LU and trailing updates were the largest host cost.
+"""
+function use_accelerate_blas!()
+    ACCELERATE_BLAS_ACTIVE[] && return nothing
+    Sys.isapple() || return nothing
     # Load MUMPS first: OpenBLAS32's lazy library forwards itself into libblastrampoline on its first
-    # dlopen, so loaded after the forward below it would put MUMPS's LP64 calls back on OpenBLAS32
-    # (the app hit this, the harness did not: its warmup loads MUMPS before any test_env applies).
-    mode == "openblas" || BeatEngineCoupledCondensed.BeatEngineMumps.mumps_library()
-    if isnothing(TEST_BLAS_STARTUP[])
-        TEST_BLAS_STARTUP[] = (libs=[l.libname for l in BLAS.get_config().loaded_libs],
-                               threads=BLAS.get_num_threads())
-    end
-    if mode == "accelerate"
-        # "\x1a" tells libblastrampoline to drop the trailing underscore: zgemm_64_ -> zgemm$NEWLAPACK$ILP64.
-        BLAS.lbt_forward(TEST_ACCELERATE; clear=true, suffix_hint="\x1a\$NEWLAPACK\$ILP64")
-        BLAS.lbt_forward(TEST_ACCELERATE; clear=false, suffix_hint="\x1a\$NEWLAPACK")
-    elseif mode == "hybrid"
-        BLAS.lbt_forward(TEST_ACCELERATE; clear=true, suffix_hint="\x1a\$NEWLAPACK\$ILP64")
-        openblas32 = Base.require(BeatEngineCoupledCondensed.BeatEngineMumps.OPENBLAS32_PKGID)
-        BLAS.lbt_forward(Base.invokelatest(getproperty, openblas32, :libopenblas_path); clear=false)
-    else
-        for (i, lib) in enumerate(TEST_BLAS_STARTUP[].libs)
-            BLAS.lbt_forward(lib; clear=(i == 1))
-        end
-        BLAS.set_num_threads(TEST_BLAS_STARTUP[].threads)
-    end
-    TEST_BLAS_MODE[] = mode
-    return
+    # dlopen, so loaded after the forward below it would put MUMPS's LP64 calls back on OpenBLAS32.
+    BeatEngineCoupledCondensed.BeatEngineMumps.mumps_library()
+    # "\x1a" tells libblastrampoline to drop the trailing underscore: zgemm_64_ -> zgemm$NEWLAPACK$ILP64.
+    BLAS.lbt_forward(APPLE_ACCELERATE; clear=true, suffix_hint="\x1a\$NEWLAPACK\$ILP64")
+    BLAS.lbt_forward(APPLE_ACCELERATE; clear=false, suffix_hint="\x1a\$NEWLAPACK")
+    ACCELERATE_BLAS_ACTIVE[] = true
+    return nothing
 end
 """
 Coupled outputs computed from BEM pressure and flux, interface pressure and flux, diaphragm
@@ -874,9 +848,6 @@ function metal_direct_assembly_available()
     return BeatEngineCore._normalized_metal_assembly_mode(nothing) != :host_staged &&
            BeatEngineCore._normalized_metal_singular_mode() == :native &&
            BeatEngineCore._normalized_metal_regular_kernel_mode() in (:pair_gather, :pair_tilereduce)
-    # pair_tilereduce is the production kernel of the four-operator path (coupled solves); the fused
-    # direct assembler has its own kernel and ignores the mode. Excluding it sent exterior sweeps to
-    # the four-operator path without the sweep pipeline (0.27 -> 0.67 s/freq on a waveguide).
 end
 
 function assemble_exterior_direct_metal(
@@ -885,25 +856,11 @@ function assemble_exterior_direct_metal(
     # The fused Metal assembler is the Metal counterpart of the direct CUDA
     # assembler: A and every excitation's b are formed on the GPU without
     # materializing S, D, D' or H.
-    # Test (BLAB_TEST_GPU_MICRO): repeated fused assemblies of this wavenumber under variants, once.
-    BeatEngineCore._test_gpu_micro(wavenumber, get(kwargs, :device_cache, nothing)) do t
-        micro = assemble_burton_miller_neumann_system_metal(
-            mesh, p1_space, dp0_space, reduce(hcat, neumann_values), wavenumber, rule; kwargs..., timing=t,
-        )
-        release_metal_burton_miller_system!(micro)
-    end
     started = time_ns()
-    # Test (BLAB_TEST_FUSED_TIMING=<file>): the fused assembler's own stage split, one line per call.
-    test_timing_file = get(ENV, "BLAB_TEST_FUSED_TIMING", "")
-    test_timing = isempty(test_timing_file) ? nothing : Dict{String,Float64}()
     system = assemble_burton_miller_neumann_system_metal(
         mesh, p1_space, dp0_space, reduce(hcat, neumann_values), wavenumber, rule; kwargs...,
-        (isnothing(test_timing) ? (;) : (timing=test_timing,))...,
     )
-    elapsed = (time_ns() - started) / 1.0e9
-    isnothing(test_timing) || open(io -> println(io, "total=$elapsed ", join(("$k=$v" for (k, v) in test_timing), " ")),
-                                   test_timing_file, "a")
-    return system, elapsed
+    return system, (time_ns() - started) / 1.0e9
 end
 
 function solve_exterior_direct_metal_system(system)
@@ -911,9 +868,6 @@ function solve_exterior_direct_metal_system(system)
     # one factorization serves every column.
     started = time_ns()
     pressure, report = solve_metal_burton_miller_system_with_report(system)
-    # Test (BLAB_TEST_DELAY_EXT_SOLVE=<s>): lengthen the host solve by an idle wait (overlap test).
-    test_delay = parse(Float64, get(ENV, "BLAB_TEST_DELAY_EXT_SOLVE", "0"))
-    test_delay > 0 && sleep(test_delay)
     pressures = [copy(column) for column in eachcol(pressure)]
     return pressures, (time_ns() - started) / 1.0e9, report.method
 end
@@ -939,18 +893,12 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
     components = system["components"]
     port_objects = system["excitation_ports"]
     options = get(request, "solver_options", Dict{String,Any}())
-    # Test hook, as in the coupled path. ENV is process-wide, so without this an exterior request
-    # inherits whatever the last coupled request of this worker set (e.g. the tile-reduce kernel,
-    # which turns the fused direct assembly off).
-    for (key, value) in get(options, "test_env", Dict{String,Any}())
-        value === nothing ? delete!(ENV, String(key)) : (ENV[String(key)] = string(value))
-    end
-    test_apply_blas!()
     precision_name = lowercase(String(get(options, "precision", "float32")))
     FloatType = precision_name == "float64" ? Float64 : precision_name == "float32" ? Float32 :
                 error("Exterior precision must be float32 or float64.")
     backend = Symbol(lowercase(String(get(options, "bem_backend", "cpu"))))
     backend in (:cpu, :cuda, :rocm, :metal) || error("Exterior BEM backend must be cpu, cuda, rocm, or metal.")
+    backend == :metal && use_accelerate_blas!()
     requested_assembly = lowercase(String(get(options, "burton_miller_assembly", "direct_system")))
     requested_assembly in ("direct_system", "operator_matrices") || error(
         "Exterior burton_miller_assembly must be direct_system or operator_matrices.",
@@ -1090,11 +1038,6 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         frequency_count=length(frequencies_hz),
     ) : nothing
     metal_pipeline = overlap_plan !== nothing && overlap_plan.enabled
-    overlap_plan === nothing || test_phase_log(
-        "overlap_plan enabled=$(overlap_plan.enabled) reason=$(overlap_plan.reason) " *
-        "assembly_model_s=$(overlap_plan.assembly_model_s) solve_model_s=$(overlap_plan.solve_model_s) " *
-        "saving_model_s=$(overlap_plan.saving_model_s)",
-    )
     produce_metal_system = function (index)
         omega = FloatType(2pi) * FloatType(frequencies_hz[index])
         wavenumber = omega / sound_speed
@@ -1133,7 +1076,6 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
         end
         for (frequency_index, raw_frequency) in enumerate(frequencies_hz)
             cancel_requested() && return (cancelled=true, solved_count=solved_count)
-            test_phase_log("ext_iter $frequency_index")
             frequency_hz = FloatType(raw_frequency)
             omega = FloatType(2pi) * frequency_hz
             wavenumber = omega / sound_speed
@@ -1362,7 +1304,6 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 "diagnostics" => diagnostics,
             )
             record_result_provenance!(result, request)
-            test_save_result(result)
             println(JSON.json(event_mode ? Dict("type" => "result", "result" => result) : result))
             flush(stdout)
             operators === nothing || release_operator_storage!(operators)
@@ -2058,12 +1999,6 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
     components = system["components"]
     ports = system["excitation_ports"]
     solver_options = get(request, "solver_options", Dict{String,Any}())
-    # Test hook: per-request environment overrides so one warm worker can A/B settings.
-    # A `nothing` value unsets the variable.
-    for (key, value) in get(solver_options, "test_env", Dict{String,Any}())
-        value === nothing ? delete!(ENV, String(key)) : (ENV[String(key)] = string(value))
-    end
-    test_apply_blas!()
     precision_name = lowercase(String(get(solver_options, "precision", "float64")))
     FloatType = if precision_name in ("float32", "complex64")
         Float32
@@ -2443,7 +2378,6 @@ function solve_interior_request(request, system, bounded_regions; event_mode=fal
         )
         record_result_provenance!(result, request)
         if event_mode
-            test_save_result(result)
             println(JSON.json(Dict("type" => "result", "result" => result)))
         else
             println(JSON.json(result))
@@ -2486,62 +2420,7 @@ function _condensed_split_timings(system, solutions)
     return timings
 end
 
-# Test (BLAB_TEST_PHASE_LOG=<file>): "<time_ns> <label>" lines for the request's phases.
-# Test (BLAB_TEST_SAVE_RESULTS=<file>): append each emitted result as one JSON line, so runs of
-# different code can be compared exactly afterwards (perf/cmp_results.py).
-function test_save_result(result)
-    path = get(ENV, "BLAB_TEST_SAVE_RESULTS", "")
-    isempty(path) || open(io -> println(io, JSON.json(result)), path, "a")
-    return nothing
-end
-function test_phase_log(label, at=time_ns())
-    path = get(ENV, "BLAB_TEST_PHASE_LOG", "")
-    isempty(path) || open(io -> println(io, at, " ", label), path, "a")
-    test_cold_log("phase " * label)
-    return nothing
-end
-# Test instrumentation: (user s, system s, minor page faults) of this process, from getrusage.
-function test_rusage()
-    buffer = zeros(UInt8, 256)   # struct rusage is 144 bytes on macOS
-    ccall(:getrusage, Cint, (Cint, Ptr{UInt8}), 0, buffer)
-    words = reinterpret(Int64, buffer[1:144])
-    # ru_utime (sec, usec), ru_stime (sec, usec), then maxrss, ixrss, idrss, isrss, minflt
-    return (words[1] + words[2] / 1.0e6, words[3] + words[4] / 1.0e6, words[9])
-end
-# Test (BLAB_TEST_ALLOC_PROFILE=<file>): every allocation of >= 1 MB during frequency 3, summed by
-# the first engine source line on its stack.
-const TEST_PROFILE_PKG = Base.PkgId(Base.UUID("9abbd945-dff8-562f-b5e8-e1ebf5ef1b79"), "Profile")
-function test_alloc_profile_start()
-    Profile = Base.require(TEST_PROFILE_PKG)
-    Base.invokelatest(Profile.Allocs.clear)
-    Base.invokelatest(Profile.Allocs.start; sample_rate=1.0)
-    return nothing
-end
-function test_alloc_profile_stop(path)
-    Profile = Base.require(TEST_PROFILE_PKG)
-    Base.invokelatest(Profile.Allocs.stop)
-    results = Base.invokelatest(Profile.Allocs.fetch)
-    totals = Dict{String,Tuple{Float64,Int}}()
-    for alloc in results.allocs
-        alloc.size >= 2^20 || continue
-        frame = findfirst(f -> occursin(r"BeatEngine|coupled_solver", string(f.file)), alloc.stacktrace)
-        key = isnothing(frame) ? "?" : (f = alloc.stacktrace[frame]; "$(basename(string(f.file))):$(f.line) $(f.func)")
-        bytes, count = get(totals, key, (0.0, 0))
-        totals[key] = (bytes + alloc.size, count + 1)
-    end
-    open(path, "w") do io
-        for (key, (bytes, count)) in sort(collect(totals); by=x -> -x[2][1])
-            println(io, rpad(string(round(bytes / 1.0e6; digits=1)), 8), " MB  x", rpad(string(count), 4), key)
-        end
-    end
-    Base.invokelatest(Profile.Allocs.clear)
-    return nothing
-end
-const TEST_SUBMISSION_NS = Ref{UInt64}(0)   # worker: before/after reading the request JSON
-const TEST_PARSED_NS = Ref{UInt64}(0)
-
 function solve_request_impl(request; event_mode=false)
-    test_request_ns = time_ns()
     validate_system_request(request)
     BeatEngineContract.BeatEngineProvenance.engine_identity()
     BeatEngineContract.BeatEngineProvenance.runtime_identity()
@@ -2593,16 +2472,6 @@ function solve_request_impl(request; event_mode=false)
     end
 
     solver_options = get(request, "solver_options", Dict{String,Any}())
-    # Test hook: per-request environment overrides so one warm worker can A/B settings.
-    # A `nothing` value unsets the variable.
-    for (key, value) in get(solver_options, "test_env", Dict{String,Any}())
-        value === nothing ? delete!(ENV, String(key)) : (ENV[String(key)] = string(value))
-    end
-    test_phase_log("submitted", TEST_SUBMISSION_NS[])
-    test_phase_log("parsed", TEST_PARSED_NS[])
-    test_phase_log("request", test_request_ns)
-    test_phase_log("env")
-    test_apply_blas!()
     precision_name = lowercase(String(get(solver_options, "precision", "float64")))
     FloatType = if precision_name in ("float32", "complex64")
         Float32
@@ -2614,6 +2483,7 @@ function solve_request_impl(request; event_mode=false)
     bem_backend = Symbol(lowercase(String(get(solver_options, "bem_backend", "cpu"))))
     bem_backend in (:cpu, :cuda, :rocm, :metal) ||
         error("Unsupported coupled BEM backend: $bem_backend. Expected cpu, cuda, rocm, or metal.")
+    bem_backend == :metal && use_accelerate_blas!()
     symmetry_mode = BeatEngineCore.normalized_symmetry_mode(
         get(solver_options, "symmetry", "off"),
     )
@@ -2934,188 +2804,82 @@ function solve_request_impl(request; event_mode=false)
     rom_requested = any(
         String(output["quantity"]) in SPEAKER_ROM_QUANTITIES for output in outputs
     )
-    coupled_system = nothing
-    # Test prefetch: assemble frequency i+1's Metal BEM operators while frequency i's host stages run.
-    prefetch_operators = use_condensed_solver && bem_backend == :metal && Threads.nthreads() > 1 &&
-                         get(ENV, "BLAB_TEST_COUPLED_PREFETCH", "0") == "1"
-    prefetch_blas = tryparse(Int, get(ENV, "BLAB_TEST_PREFETCH_BLAS_THREADS", ""))
-    process_blas_threads = BLAS.get_num_threads()
-    prefetch_operators && !isnothing(prefetch_blas) && BLAS.set_num_threads(prefetch_blas)
-    next_operators = nothing
-    # Test (BLAB_TEST_EARLY_BUILD=1, with BLAB_TEST_COUPLED_PREFETCH=1): frequency i+1's whole build
-    # (condensation, elimination, dense LU) starts as a task right after frequency i's solve, i.e.
-    # after i's last MUMPS call, and overlaps i's field and output. Its GPU operators were prefetched
-    # during i's host stages; i's field waits for them, and GPU(i+2) waits for i's field, so no GPU
-    # work ever runs next to a field evaluation (Round 5: that gives wrong results).
-    test_early_build = prefetch_operators && get(ENV, "BLAB_TEST_EARLY_BUILD", "0") == "1" && !rom_requested &&
-                       isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing))
-    test_next_build = nothing
-    test_field_done = nothing
-    test_gpu_next = nothing
-    test_build_at = (index, prefetched_ops, on_ready; on_fem_done=nothing, dense_gate=nothing) -> build_condensed_coupled_system(
-        fem_mesh,
-        bem_mesh,
-        interface_map,
-        FloatType(request["frequencies_hz"][index]),
-        sound_speed,
-        density;
-        quadrature_order=quadrature_order,
-        regular_quadrature_order=quadrature_selections[index].order,
-        singular_order=singular_order,
-        cache=coupled_cache,
-        validation_diagnostics=validation_diagnostics,
-        symmetry_mode=symmetry_mode,
-        bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
-        wall_impedances=fem_domains.wall_impedances,
-        transducers=transducers,
-        transducer_operators=transducer_operators,
-        prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
-        allow_transducer_condensation=true,
-        prefetched_operators=prefetched_ops,
-        on_operators_ready=on_ready,
-        on_fem_done=on_fem_done,
-        dense_gate=dense_gate,
+    rank_experiment = !isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing))
+    # BLAB_COUPLED_DEMAND_RECONSTRUCTION: skip the interior back substitution only when every
+    # requested output is known not to read interior FEM pressure.
+    reconstruct_interior = !(
+        use_condensed_solver &&
+        BeatEngineCoupledCondensed._demand_reconstruction_enabled(bem_backend) &&
+        !validation_diagnostics &&
+        !rank_experiment &&
+        all(String(output["quantity"]) in INTERIOR_FREE_COUPLED_OUTPUTS for output in outputs)
     )
-    # Test (BLAB_TEST_FEM_LANE=1, with EARLY_BUILD): build(i+1) starts as soon as build(i)'s FEM stage,
-    # its last MUMPS call, is done, so the next factorization overlaps i's elimination, LU and solve;
-    # build(i+1)'s dense part waits for i's solve (stale-LU order, one dense LU at a time). MUMPS has
-    # process-global state and one factor slot, so only when nothing after the FEM stage calls it:
-    # voltage excitations (zero FEM right-hand side, skipped) and no interior reconstruction. GPU work
-    # keeps the EARLY_BUILD order: field(i) waits for GPU(i+1), GPU(i+2) waits for field(i).
-    test_frequency_count = length(request["frequencies_hz"])
-    test_fem_lane = test_early_build && use_condensed_solver && get(ENV, "BLAB_TEST_FEM_LANE", "0") == "1" &&
-                    get(ENV, "BLAB_TEST_ZERO_RHS_SKIP", "0") == "1" &&
-                    all(excitation -> Symbol(excitation.kind) == :voltage, excitations) &&
-                    BeatEngineCoupledCondensed._demand_reconstruction_enabled(bem_backend) &&
-                    !validation_diagnostics &&
-                    all(String(output["quantity"]) in INTERIOR_FREE_COUPLED_OUTPUTS for output in outputs)
-    lane_builds = Vector{Any}(nothing, test_frequency_count)
-    lane_gpu = Vector{Any}(nothing, test_frequency_count)
-    lane_gpu_owned = falses(test_frequency_count)   # handed to a build, which releases it
-    lane_solved = [Base.Event() for _ in 1:test_frequency_count]
-    lane_field = [Base.Event() for _ in 1:test_frequency_count]
-    lane_consumed = 1
-    lane_on_ready = index -> (flux_columns=nothing) -> begin
-        if index < test_frequency_count
-            gate = index >= 2 ? lane_field[index - 1] : nothing
-            lane_gpu[index + 1] = Threads.@spawn begin
-                isnothing(gate) || wait(gate)
-                condensed_metal_operators(
-                    coupled_cache, bem_mesh, FloatType(request["frequencies_hz"][index + 1]), sound_speed;
-                    quadrature_order=quadrature_selections[index + 1].order, singular_order=singular_order,
-                    flux_columns=flux_columns,
-                )
-            end
-        end
+    frequencies = request["frequencies_hz"]
+    build_condensed_at = (index; prefetched_operators=nothing, on_operators_ready=nothing, dense_gate=nothing) ->
+        build_condensed_coupled_system(
+            fem_mesh,
+            bem_mesh,
+            interface_map,
+            FloatType(frequencies[index]),
+            sound_speed,
+            density;
+            quadrature_order=quadrature_order,
+            regular_quadrature_order=quadrature_selections[index].order,
+            singular_order=singular_order,
+            cache=coupled_cache,
+            validation_diagnostics=validation_diagnostics,
+            symmetry_mode=symmetry_mode,
+            bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
+            wall_impedances=fem_domains.wall_impedances,
+            transducers=transducers,
+            transducer_operators=transducer_operators,
+            prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
+            # ROM exports and the rank experiment read transducer surfaces from the Schur block.
+            allow_transducer_condensation=!rom_requested && !rank_experiment,
+            prefetched_operators=prefetched_operators,
+            on_operators_ready=on_operators_ready,
+            dense_gate=dense_gate,
+        )
+    # Condensed Metal sweeps overlap consecutive frequencies (BeatEngineCoupledPipeline). The FEM
+    # lane also needs a solve that makes no MUMPS call: zero FEM right-hand sides (voltage drives
+    # only) and no interior reconstruction.
+    pipeline = if use_condensed_solver && bem_backend == :metal && Threads.nthreads() > 1 &&
+                  length(frequencies) > 1 && !rom_requested && !rank_experiment
+        CondensedSweepPipeline(
+            length(frequencies);
+            fem_lane=!reconstruct_interior && all(excitation -> Symbol(excitation.kind) == :voltage, excitations),
+            build=(index, operators, on_ready, gate) ->
+                build_condensed_at(index; prefetched_operators=operators, on_operators_ready=on_ready, dense_gate=gate),
+            assemble=(index, flux_columns) -> condensed_metal_operators(
+                coupled_cache, bem_mesh, FloatType(frequencies[index]), sound_speed;
+                quadrature_order=quadrature_selections[index].order, singular_order=singular_order,
+                flux_columns=flux_columns,
+            ),
+            release_system=release_condensed_coupled_system!,
+            release_operators=BeatEngineCoupledCondensed.release_operator_storage!,
+        )
+    else
         nothing
     end
-    # BLAB_TEST_FEM_LANE=2: build(i+1) starts when build(i) returns (after its LU), so its FEM stage
-    # overlaps only i's solve and field (=1 overlapped the LU too: both on the AMX units, LU 2x slower).
-    lane_after_build = get(ENV, "BLAB_TEST_FEM_LANE", "0") == "2"
-    test_fem_lane |= test_early_build && use_condensed_solver && lane_after_build &&
-                     get(ENV, "BLAB_TEST_ZERO_RHS_SKIP", "0") == "1" &&
-                     all(excitation -> Symbol(excitation.kind) == :voltage, excitations) &&
-                     BeatEngineCoupledCondensed._demand_reconstruction_enabled(bem_backend) &&
-                     !validation_diagnostics &&
-                     all(String(output["quantity"]) in INTERIOR_FREE_COUPLED_OUTPUTS for output in outputs)
-    lane_on_fem_done = nothing
-    lane_on_fem_done = index -> () -> begin
-        if index < test_frequency_count
-            lane_gpu_owned[index + 1] = true
-            lane_builds[index + 1] = Threads.@spawn begin
-                built = test_build_at(
-                    index + 1, lane_gpu[index + 1], lane_on_ready(index + 1);
-                    on_fem_done=lane_after_build ? nothing : lane_on_fem_done(index + 1),
-                    dense_gate=lane_solved[index],
-                )
-                lane_after_build && lane_on_fem_done(index + 1)()
-                built
-            end
-        end
-        nothing
-    end
+    use_condensed_solver && reset_condensed_request_state!()
+    coupled_system = nothing
     try
-        # Test instrumentation: the previous frequency's emit/release and whole-iteration wall + GC,
-        # reported one frequency late as `test_prev_*` timings.
-        test_prev_tail = Dict{String,Float64}()
-        BeatEngineCoupledCondensed._test_stale_reset!()   # BLAB_TEST_STALE_LU: no factor from another request
-        for (frequency_index, frequency_value) in enumerate(request["frequencies_hz"])
+        for (frequency_index, frequency_value) in enumerate(frequencies)
             if cancel_requested()
                 cancelled = true
                 break
             end
-            test_iteration_started = time_ns()
-            test_phase_log("iter $frequency_index")
-            # Test: BLAB_TEST_GC_DEFER=1 disables the GC during the frequency; the allocations are
-            # collected once, at the next allocation after the re-enable below.
-            test_gc_defer = get(ENV, "BLAB_TEST_GC_DEFER", "0") == "1"
-            test_gc_defer && GC.enable(false)
-            test_gc_started = Base.gc_num()
-            test_rusage_started = test_rusage()
-            test_alloc_profile = frequency_index == 3 ? get(ENV, "BLAB_TEST_ALLOC_PROFILE", "") : ""
-            isempty(test_alloc_profile) || test_alloc_profile_start()
+            # No collection during the frequency: its allocations are collected once, after the
+            # frequency's system is released (~0.05 s per frequency on SAWMOD, where the collector
+            # otherwise ran several times inside the host stages).
+            GC.enable(false)
             frequency_hz = FloatType(frequency_value)
             println(stderr, "Coupled $(precision_name)/$(bem_backend): assembling $(frequency_hz) Hz")
             assembly_started = time_ns()
-            test_early_system = test_next_build
-            test_next_build = nothing
-            prefetched = next_operators
-            # Early build: next_operators is GPU(i+2), set by build(i+1)'s callback; keep it.
-            isnothing(test_early_system) && (next_operators = nothing)
-            frequencies_all = request["frequencies_hz"]
-            spawn_next = if prefetch_operators && frequency_index < length(frequencies_all)
-                next_index = frequency_index + 1
-                (flux_columns=nothing) -> (next_operators = Threads.@spawn condensed_metal_operators(
-                    coupled_cache, bem_mesh, FloatType(frequencies_all[next_index]), sound_speed;
-                    quadrature_order=quadrature_selections[next_index].order, singular_order=singular_order,
-                    flux_columns=flux_columns,
-                ))
-            else
-                nothing
-            end
-            coupled_system = if test_fem_lane && frequency_index > 1
-                lane_task = lane_builds[frequency_index]
-                lane_builds[frequency_index] = nothing
-                lane_consumed = frequency_index
-                try
-                    fetch(lane_task)
-                catch exception
-                    exception isa TaskFailedException || rethrow()
-                    rethrow(exception.task.result)
-                end
-            elseif !isnothing(test_early_system)
-                try
-                    fetch(test_early_system)
-                catch exception
-                    exception isa TaskFailedException || rethrow()
-                    rethrow(exception.task.result)
-                end
+            coupled_system = if !isnothing(pipeline)
+                pipeline_system!(pipeline, frequency_index)
             elseif use_condensed_solver
-                build_condensed_coupled_system(
-                    fem_mesh,
-                    bem_mesh,
-                    interface_map,
-                    frequency_hz,
-                    sound_speed,
-                    density;
-                    quadrature_order=quadrature_order,
-                    regular_quadrature_order=quadrature_selections[frequency_index].order,
-                    singular_order=singular_order,
-                    cache=coupled_cache,
-                    validation_diagnostics=validation_diagnostics,
-                    symmetry_mode=symmetry_mode,
-                    bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
-                    wall_impedances=fem_domains.wall_impedances,
-                    transducers=transducers,
-                    transducer_operators=transducer_operators,
-                    prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
-                    # ROM exports and the rank experiment read transducer surfaces from the Schur block.
-                    allow_transducer_condensation=!rom_requested &&
-                        isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing)),
-                    prefetched_operators=prefetched,
-                    on_operators_ready=test_fem_lane ? lane_on_ready(frequency_index) : spawn_next,
-                    on_fem_done=test_fem_lane && !lane_after_build ? lane_on_fem_done(frequency_index) : nothing,
-                )
+                build_condensed_at(frequency_index)
             else
                 build_coupled_system(
                     fem_mesh,
@@ -3142,16 +2906,6 @@ function solve_request_impl(request; event_mode=false)
                 )
             end
             assembly_s = (time_ns() - assembly_started) / 1.0e9
-            test_fem_lane && lane_after_build && frequency_index == 1 && lane_on_fem_done(1)()
-            # BLAB_COUPLED_DEMAND_RECONSTRUCTION: skip the interior back substitution only when every
-            # requested output is known not to read interior FEM pressure.
-            reconstruct_interior = !(
-                use_condensed_solver &&
-                BeatEngineCoupledCondensed._demand_reconstruction_enabled(bem_backend) &&
-                !validation_diagnostics &&
-                isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing)) &&
-                all(String(output["quantity"]) in INTERIOR_FREE_COUPLED_OUTPUTS for output in outputs)
-            )
             solve_started = time_ns()
             solutions = use_condensed_solver ?
                         solve_condensed_coupled_excitations(
@@ -3161,33 +2915,7 @@ function solve_request_impl(request; event_mode=false)
                         ) :
                         solve_coupled_excitations(coupled_system, excitations)
             solve_s = (time_ns() - solve_started) / 1.0e9
-            test_fem_lane && notify(lane_solved[frequency_index])
-            test_gpu_next = nothing
-            if test_fem_lane && frequency_index < test_frequency_count
-                test_gpu_next = lane_gpu[frequency_index + 1]
-            elseif test_early_build && frequency_index < length(request["frequencies_hz"]) && !isnothing(next_operators)
-                test_gpu_next = next_operators          # GPU(i+1), spawned while building i
-                next_operators = nothing
-                test_field_done = Base.Event()
-                test_gate = test_field_done
-                test_next_index = frequency_index + 1
-                test_on_ready = if test_next_index < length(request["frequencies_hz"])
-                    (flux_columns=nothing) -> (next_operators = Threads.@spawn begin
-                        wait(test_gate)
-                        condensed_metal_operators(
-                            coupled_cache, bem_mesh, FloatType(request["frequencies_hz"][test_next_index + 1]),
-                            sound_speed;
-                            quadrature_order=quadrature_selections[test_next_index + 1].order,
-                            singular_order=singular_order,
-                            flux_columns=flux_columns,
-                        )
-                    end)
-                else
-                    nothing
-                end
-                test_next_build = Threads.@spawn test_build_at(test_next_index, test_gpu_next, test_on_ready)
-            end
-            test_interface_errors_started = time_ns()
+            isnothing(pipeline) || pipeline_solved!(pipeline, frequency_index)
             interface_error_sets = [
                 per_interface_errors(
                     solution,
@@ -3207,14 +2935,7 @@ function solve_request_impl(request; event_mode=false)
                 maximum(errors[2][index] for errors in interface_error_sets)
                 for index in eachindex(interfaces)
             ]
-            test_interface_errors_s = (time_ns() - test_interface_errors_started) / 1.0e9
-            if !isnothing(test_gpu_next)
-                try
-                    wait(test_gpu_next)
-                catch
-                end
-            end
-            test_quantities_started = time_ns()
+            isnothing(pipeline) || pipeline_before_field!(pipeline, frequency_index)
             field_s = 0.0
             quantities = Dict{String,Any}[]
             rom_options = get(solver_options, "speaker_rom", Dict{String,Any}())
@@ -3398,7 +3119,8 @@ function solve_request_impl(request; event_mode=false)
                                   get(options, "excitation_weights", Any[]) :
                                   raw_weight_sweep[frequency_index]
                     if isempty(raw_weights)
-                        pressures = bem_backend == :metal && BeatEngineCore._test_field_multi_on() ?
+                        # Metal evaluates every drive's field in one kernel pass.
+                        pressures = bem_backend == :metal ?
                             BeatEngineCore.evaluate_galerkin_field_metal_multi(
                                 points, bem_mesh, [s.bem_pressure for s in solutions], [s.bem_neumann for s in solutions],
                                 coupled_system.wavenumber, coupled_system.field_cache,
@@ -3724,13 +3446,7 @@ function solve_request_impl(request; event_mode=false)
                     "replay_factorization_s" => coupled_system.timings.replay_factorization_s,
                 )),
             )
-            merge!(diagnostics["timings"], Dict(
-                "test_interface_errors_s" => test_interface_errors_s,
-                "test_quantities_other_s" => (time_ns() - test_quantities_started) / 1.0e9 - field_s,
-                "test_pre_emit_wall_s" => (time_ns() - test_iteration_started) / 1.0e9,
-            ), test_prev_tail)
-            isnothing(test_field_done) || notify(test_field_done)
-            test_fem_lane && notify(lane_field[frequency_index])
+            isnothing(pipeline) || pipeline_field_done!(pipeline, frequency_index)
             if validation_diagnostics
                 diagnostics["relative_residual"] = maximum(solution.relative_residual for solution in solutions)
                 diagnostics["all_bem_replay_error"] = maximum(
@@ -3750,84 +3466,23 @@ function solve_request_impl(request; event_mode=false)
                 "quantities" => quantities,
                 "diagnostics" => diagnostics,
             )
-            test_emit_started = time_ns()
             record_result_provenance!(result, request)
             if event_mode
-                test_save_result(result)
                 println(JSON.json(Dict("type" => "result", "result" => result)))
             else
                 println(JSON.json(result))
             end
             flush(stdout)
-            test_release_started = time_ns()
             use_condensed_solver ? release_condensed_coupled_system!(coupled_system) :
             release_coupled_system!(coupled_system)
             coupled_system = nothing
             solved_count = frequency_index
-            test_gc_defer && GC.enable(true)
-            test_gc = Base.GC_Diff(Base.gc_num(), test_gc_started)
-            # Test (BLAB_TEST_GC_MODE=young|full): collect the deferred garbage explicitly and time it
-            # (otherwise the next allocation does, outside every timer).
-            test_gc_mode = get(ENV, "BLAB_TEST_GC_MODE", "")
-            test_gc_explicit_started = time_ns()
-            test_gc_mode == "young" && GC.gc(false)
-            test_gc_mode == "full" && GC.gc(true)
-            test_gc_explicit_s = (time_ns() - test_gc_explicit_started) / 1.0e9
-            test_prev_tail = Dict{String,Float64}(
-                "test_prev_emit_s" => (test_release_started - test_emit_started) / 1.0e9,
-                "test_prev_release_s" => (time_ns() - test_release_started) / 1.0e9,
-                "test_prev_iteration_wall_s" => (time_ns() - test_iteration_started) / 1.0e9,
-                "test_prev_gc_s" => test_gc.total_time / 1.0e9,
-                "test_prev_alloc_gb" => test_gc.allocd / 1.0e9,
-                "test_prev_gc_pauses" => Float64(test_gc.pause),
-                "test_prev_gc_full" => Float64(test_gc.full_sweep),
-                "test_prev_gc_explicit_s" => test_gc_explicit_s,
-                "test_prev_user_s" => test_rusage()[1] - test_rusage_started[1],
-                "test_prev_system_s" => test_rusage()[2] - test_rusage_started[2],
-                "test_prev_minflt" => Float64(test_rusage()[3] - test_rusage_started[3]),
-            )
-            isempty(test_alloc_profile) || test_alloc_profile_stop(test_alloc_profile)
-            test_phase_log("iterend $frequency_index")
+            GC.enable(true)
         end
-        test_phase_log("loopend")
     finally
-        GC.enable(true)   # BLAB_TEST_GC_DEFER may have left it off on an error
-        BeatEngineCoupledCondensed._test_stale_reset!()
-        isnothing(test_field_done) || notify(test_field_done)
-        if test_fem_lane
-            # Unblock every waiting lane task, then release what they built.
-            foreach(notify, lane_solved)
-            foreach(notify, lane_field)
-            for index in (lane_consumed + 1):test_frequency_count
-                task = lane_builds[index]
-                isnothing(task) && continue
-                try
-                    release_condensed_coupled_system!(fetch(task))
-                catch
-                end
-                lane_builds[index] = nothing
-            end
-            for (task, owned) in zip(lane_gpu, lane_gpu_owned)
-                (isnothing(task) || owned) && continue
-                try
-                    BeatEngineCoupledCondensed.release_operator_storage!(fetch(task).operators)
-                catch
-                end
-            end
-        end
-        if test_next_build !== nothing
-            try
-                release_condensed_coupled_system!(fetch(test_next_build))
-            catch
-            end
-        end
-        if next_operators !== nothing
-            try
-                BeatEngineCoupledCondensed.release_operator_storage!(fetch(next_operators).operators)
-            catch
-            end
-        end
-        BLAS.get_num_threads() == process_blas_threads || BLAS.set_num_threads(process_blas_threads)
+        GC.enable(true)
+        isnothing(pipeline) || release_pipeline!(pipeline)
+        use_condensed_solver && reset_condensed_request_state!()
         if coupled_system !== nothing
             use_condensed_solver ? release_condensed_coupled_system!(coupled_system) :
             release_coupled_system!(coupled_system)
@@ -3838,7 +3493,6 @@ function solve_request_impl(request; event_mode=false)
         end
     end
     cancelled = cancelled || cancel_requested()
-    test_phase_log("return")
     return (cancelled=cancelled, solved_count=solved_count)
 end
 
@@ -4164,9 +3818,7 @@ function worker_backend_availability()
 end
 
 function run_worker()
-    test_cold_log("run_worker")
     ready = worker_ready(worker_backend_availability())
-    test_cold_log("backends_checked")
     ready["worker_cleanup_policies"] = ["aggressive", "cuda_reuse"]
     push!(ready["operations"], "reclaim")
     println(JSON.json(ready))
@@ -4188,9 +3840,7 @@ function run_worker()
                 continue
             end
             request_path = String(get(submission, "request", ""))
-            TEST_SUBMISSION_NS[] = time_ns()
             request = haskey(submission, "request_inline") ? submission["request_inline"] : JSON.parse(read(request_path, String))
-            TEST_PARSED_NS[] = time_ns()
             operation = String(get(submission, "operation", "solve"))
             options = operation == "solve" ? get(request, "solver_options", Dict()) : request
             get(options, "phasor_convention", NEGATIVE_TIME_PHASOR) ==
@@ -4215,10 +3865,7 @@ function run_worker()
             elseif operation == "solve"
                 cleanup = cleanup_options(options)
                 release_all_bem_field_evaluation_caches!()
-                # perf/dev_worker.jl: apply source edits, and call through the newest world so they count.
-                isdefined(Main, :BLAB_DEV_WORKER) && Main._dev_revise()
-                outcome = Base.invokelatest(solve_request, request; event_mode=true)
-                test_phase_log("solved")
+                outcome = solve_request(request; event_mode=true)
                 # Preserve historical driver reclamation by default. Campaign
                 # clients may opt into bounded reuse; cancellation, pressure,
                 # periodic cleanup and failures still take the full path.
@@ -4252,7 +3899,6 @@ function run_worker()
                         "seconds" => (time_ns() - cleanup_started) / 1e9)
                 end
                 println(JSON.json(event))
-                test_phase_log("emitted")
             else
                 error("Unsupported coupled worker operation: $operation")
             end
@@ -4266,9 +3912,7 @@ function run_worker()
     end
 end
 
-if isdefined(Main, :BLAB_DEV_WORKER)
-    # perf/dev_worker.jl (Revise hot reload, test harness) starts the worker itself.
-elseif "--worker" in ARGS
+if "--worker" in ARGS
     try
         run_worker()
     catch exception

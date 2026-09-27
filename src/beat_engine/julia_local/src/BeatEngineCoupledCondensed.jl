@@ -45,6 +45,7 @@ export assemble_condensed_regular_operators,
     build_condensed_coupled_system,
     condensed_metal_operators,
     release_condensed_coupled_system!,
+    reset_condensed_request_state!,
     solve_condensed_coupled_excitations,
     solve_condensed_coupled_system,
     solve_condensed_coupled_systems
@@ -1599,6 +1600,11 @@ always produces the `:fem_interface_condensed` formulation and never the monolit
 
 `cache` is a `prepare_condensed_coupled_cache` result. `regular_quadrature_order` selects which of its
 bundles to assemble with, defaulting to the cache's base order.
+
+Hooks for a pipelined sweep (`BeatEngineCoupledPipeline`): `prefetched_operators` is a task
+returning `condensed_metal_operators` for this frequency, used instead of assembling here;
+`on_operators_ready(flux_columns)` is called once the BEM operators exist, so the next frequency's
+can be assembled; `dense_gate` is an event the dense part waits for.
 """
 function build_condensed_coupled_system(
     fem_mesh::VolumeMesh{T},
@@ -1623,7 +1629,6 @@ function build_condensed_coupled_system(
     allow_transducer_condensation::Bool=true,
     prefetched_operators=nothing,
     on_operators_ready=nothing,
-    on_fem_done=nothing,
     dense_gate=nothing,
 ) where {T<:AbstractFloat}
     # `relative_residual` needs the monolithic coupled matrix, which this formulation never
@@ -1915,9 +1920,8 @@ function build_condensed_coupled_system(
         end
     end
     fem_condensation_s = (time_ns() - condensation_started) / 1.0e9
-    # This frequency's MUMPS work is over, so a pipelined sweep may start the next build's FEM stage;
-    # the dense part below waits for the previous frequency's solve.
-    isnothing(on_fem_done) || on_fem_done()
+    # A pipelined sweep (BeatEngineCoupledPipeline) may run this build beside the previous frequency's
+    # solve; the dense part below, which reuses that frequency's stale factor, waits for it.
     isnothing(dense_gate) || wait(dense_gate)
 
     block_assembly_started = time_ns()
