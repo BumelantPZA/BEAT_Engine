@@ -16,6 +16,11 @@ const _METAL_OPERATOR_KEYS = (:single_layer, :double_layer, :adjoint_double_laye
 const _TEST_OPERATOR_POOL = Any[]
 const _TEST_OPERATOR_POOL_LOCK = ReentrantLock()
 _test_operator_pool_enabled() = get(ENV, "BLAB_TEST_OP_POOL", "0") == "1"
+# Test (BLAB_TEST_POOL_ZERO2=1): a combined Burton-Miller assembly (BLAB_TEST_COMBINED_BM) writes only
+# `single_layer` and `double_layer`, so a pooled set whose other two buffers were zeroed and then only
+# used by combined assemblies needs just the two written ones zeroed. Keyed by the
+# `adjoint_double_layer` buffer: true while that set's adjoint and hypersingular buffers are known zero.
+const _TEST_POOL_AUX_ZERO = IdDict{Any,Bool}()
 function _test_take_pooled_operators(sizes)
     _test_operator_pool_enabled() || return nothing
     pooled = lock(_TEST_OPERATOR_POOL_LOCK) do
@@ -23,10 +28,16 @@ function _test_take_pooled_operators(sizes)
     end
     isnothing(pooled) && return nothing
     if map(key -> size(getfield(pooled, key)), _METAL_OPERATOR_KEYS) != sizes
+        lock(() -> delete!(_TEST_POOL_AUX_ZERO, pooled.adjoint_double_layer), _TEST_OPERATOR_POOL_LOCK)
         foreach(key -> Metal.unsafe_free!(getfield(pooled, key)), _METAL_OPERATOR_KEYS)
         return nothing
     end
-    foreach(key -> fill!(getfield(pooled, key), zero(eltype(getfield(pooled, key)))), _METAL_OPERATOR_KEYS)
+    combined = get(ENV, "BLAB_TEST_POOL_ZERO2", "0") == "1" && !isnothing(_TEST_COMBINED_BM[])
+    aux_zero = combined && lock(() -> get(_TEST_POOL_AUX_ZERO, pooled.adjoint_double_layer, false), _TEST_OPERATOR_POOL_LOCK)
+    keys = aux_zero ? (:single_layer, :double_layer) : _METAL_OPERATOR_KEYS
+    foreach(key -> fill!(getfield(pooled, key), zero(eltype(getfield(pooled, key)))), keys)
+    # After this assembly the other two buffers stay zero only if it is a combined one.
+    lock(() -> (_TEST_POOL_AUX_ZERO[pooled.adjoint_double_layer] = combined), _TEST_OPERATOR_POOL_LOCK)
     return pooled
 end
 
@@ -65,6 +76,7 @@ function release_operator_storage!(operators::NamedTuple)
                 length(_TEST_OPERATOR_POOL) < 2 && (push!(_TEST_OPERATOR_POOL, backing); true)
             end
             kept === true && return nothing
+            lock(() -> delete!(_TEST_POOL_AUX_ZERO, backing.adjoint_double_layer), _TEST_OPERATOR_POOL_LOCK)
         end
         for key in _METAL_OPERATOR_KEYS
             Metal.unsafe_free!(getfield(backing, key))
