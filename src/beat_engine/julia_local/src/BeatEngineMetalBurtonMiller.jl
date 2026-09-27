@@ -362,6 +362,188 @@ function _metal_fused_pair_blocks_kernel!(
     return nothing
 end
 
+# Test (BLAB_TEST_FUSED_PACKED=1): the fused pair kernel with the tile-reduce path's load diet:
+# float4 points, normals and curls (`_metal_packed_pair_tables_for`), rule constants as a Val tuple and
+# both quadrature loops unrolled. The Burton-Miller combination per test point is unchanged.
+@inline function _test_fused_packed_test_point(acc, context, ::Val{Q}, rc, rv::Val{R}) where {Q,R}
+    lhs_re, lhs_im, rhs_re, rhs_im, g_total_re, g_total_im = acc
+    k, inv_four_pi, jac_scale, test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs,
+        points4, test_index, trial_index, inverse_k, curl_scale = context
+    T = typeof(k)
+    test_xi = _metal_rule_xi(rc, rv, Q)
+    test_eta = _metal_rule_eta(rc, rv, Q)
+    tb1 = one(k) - test_xi - test_eta
+    tb2 = test_xi
+    tb3 = test_eta
+    test_basis = SVector(tb1, tb2, tb3)
+    @inbounds p = points4[(test_index - Int32(1)) * Int32(R) + Int32(Q)]
+    x = p[1].value
+    y = p[2].value
+    z = p[3].value
+    test_weight = _metal_rule_w(rc, rv, Q)
+    z3 = zero(SVector{3,T})
+    trial_context = (x, y, z, test_weight * jac_scale, k, inv_four_pi,
+        test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs, points4, trial_index, Val(0))
+    s_re, s_im, a_re, a_im, d_re, d_im, h_re, h_im = _metal_packed_trial_fold(
+        (zero(k), zero(k), zero(k), zero(k), z3, z3, z3, z3), trial_context, Val(R), rc, rv)
+    rhs_re += test_basis * (-s_re + inverse_k * a_im)
+    rhs_im += test_basis * (-s_im - inverse_k * a_re)
+    g_total_re += s_re
+    g_total_im += s_im
+    u_re = -d_re + curl_scale * h_im
+    u_im = -d_im - curl_scale * h_re
+    lhs_re += SVector(
+        tb1 * u_re[1], tb2 * u_re[1], tb3 * u_re[1],
+        tb1 * u_re[2], tb2 * u_re[2], tb3 * u_re[2],
+        tb1 * u_re[3], tb2 * u_re[3], tb3 * u_re[3],
+    )
+    lhs_im += SVector(
+        tb1 * u_im[1], tb2 * u_im[1], tb3 * u_im[1],
+        tb1 * u_im[2], tb2 * u_im[2], tb3 * u_im[2],
+        tb1 * u_im[3], tb2 * u_im[3], tb3 * u_im[3],
+    )
+    return (lhs_re, lhs_im, rhs_re, rhs_im, g_total_re, g_total_im)
+end
+
+# BLAB_TEST_FUSED_PACKED=2: the test-point loop stays a runtime loop (rule values from the device
+# arrays, as the stock fused kernel does); only the trial fold is unrolled.
+@inline function _test_fused_packed_test_loop(acc, context, rule_points, rule_weights, rc, rv::Val{R}) where {R}
+    lhs_re, lhs_im, rhs_re, rhs_im, g_total_re, g_total_im = acc
+    k, inv_four_pi, jac_scale, test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs,
+        points4, test_index, trial_index, inverse_k, curl_scale = context
+    T = typeof(k)
+    z3 = zero(SVector{3,T})
+    test_q = Int32(1)
+    while test_q <= Int32(R)
+        @inbounds test_xi = rule_points[test_q]
+        @inbounds test_eta = rule_points[test_q + Int32(R)]
+        tb1 = one(k) - test_xi - test_eta
+        tb2 = test_xi
+        tb3 = test_eta
+        test_basis = SVector(tb1, tb2, tb3)
+        @inbounds p = points4[(test_index - Int32(1)) * Int32(R) + test_q]
+        @inbounds test_weight = rule_weights[test_q]
+        trial_context = (p[1].value, p[2].value, p[3].value, test_weight * jac_scale, k, inv_four_pi,
+            test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs, points4, trial_index, Val(0))
+        s_re, s_im, a_re, a_im, d_re, d_im, h_re, h_im = _metal_packed_trial_fold(
+            (zero(k), zero(k), zero(k), zero(k), z3, z3, z3, z3), trial_context, Val(R), rc, rv)
+        rhs_re += test_basis * (-s_re + inverse_k * a_im)
+        rhs_im += test_basis * (-s_im - inverse_k * a_re)
+        g_total_re += s_re
+        g_total_im += s_im
+        u_re = -d_re + curl_scale * h_im
+        u_im = -d_im - curl_scale * h_re
+        lhs_re += SVector(
+            tb1 * u_re[1], tb2 * u_re[1], tb3 * u_re[1],
+            tb1 * u_re[2], tb2 * u_re[2], tb3 * u_re[2],
+            tb1 * u_re[3], tb2 * u_re[3], tb3 * u_re[3],
+        )
+        lhs_im += SVector(
+            tb1 * u_im[1], tb2 * u_im[1], tb3 * u_im[1],
+            tb1 * u_im[2], tb2 * u_im[2], tb3 * u_im[2],
+            tb1 * u_im[3], tb2 * u_im[3], tb3 * u_im[3],
+        )
+        test_q += Int32(1)
+    end
+    return (lhs_re, lhs_im, rhs_re, rhs_im, g_total_re, g_total_im)
+end
+
+@inline _test_fused_packed_test_fold(acc, context, ::Val{0}, rc, rv) = acc
+@inline function _test_fused_packed_test_fold(acc, context, ::Val{N}, rc, rv) where {N}
+    acc = _test_fused_packed_test_fold(acc, context, Val(N - 1), rc, rv)
+    return _test_fused_packed_test_point(acc, context, Val(N), rc, rv)
+end
+
+function _test_fused_pair_blocks_packed_kernel!(
+    blocks, points4, normals4, areas, curls4, faces, elements, rule_points, rule_weights,
+    element_count::Int32, chunk_start::Int32, chunk_count::Int32, pair_stride::Int32,
+    k, inverse_k, face_count::Int32, rc, rv::Val{R},
+    pair_offsets, singular_trial_indices, skip_mode,
+    trial_sign_x, trial_sign_y, trial_sign_z, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
+    ::Val{ACC},
+    ::Val{LOOP},
+) where {R,ACC,LOOP}
+    position = thread_position_in_grid_2d()
+    test_position = Int32(position.x)
+    trial_local = Int32(position.y)
+    (test_position > element_count || trial_local > chunk_count) && return nothing
+    @inbounds test_index = Int32(elements[test_position])
+    @inbounds trial_index = Int32(elements[chunk_start + trial_local - Int32(1)])
+    base = test_position + element_count * (trial_local - Int32(1))
+    if _metal_pair_is_skipped(faces, face_count, test_index, trial_index, pair_offsets, singular_trial_indices, skip_mode)
+        ACC && return nothing
+        component = Int32(0)
+        while component < Int32(_METAL_FUSED_COMPONENTS)
+            @inbounds blocks[base + component * pair_stride] = zero(eltype(blocks))
+            component += Int32(1)
+        end
+        return nothing
+    end
+    T = typeof(k)
+    inv_four_pi = T(0.07957747154594767)
+    @inbounds tn = normals4[test_index]
+    @inbounds rn = normals4[trial_index]
+    test_nx = tn[1].value
+    test_ny = tn[2].value
+    test_nz = tn[3].value
+    trial_nx = trial_sign_x * rn[1].value
+    trial_ny = trial_sign_y * rn[2].value
+    trial_nz = trial_sign_z * rn[3].value
+    normal_product = test_nx * trial_nx + test_ny * trial_ny + test_nz * trial_nz
+    @inbounds jac_scale = T(4) * areas[test_index] * areas[trial_index]
+    trial_signs = SVector(trial_sign_x, trial_sign_y, trial_sign_z)
+    curl_scale = inverse_k * k * k * normal_product
+    context = (k, inv_four_pi, jac_scale, test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs,
+        points4, test_index, trial_index, inverse_k, curl_scale)
+    acc = (zero(SVector{9,T}), zero(SVector{9,T}), zero(SVector{3,T}), zero(SVector{3,T}), zero(k), zero(k))
+    lhs_re, lhs_im, rhs_re, rhs_im, g_total_re, g_total_im = LOOP ?
+        _test_fused_packed_test_loop(acc, context, rule_points, rule_weights, rc, rv) :
+        _test_fused_packed_test_fold(acc, context, rv, rc, rv)
+    @inbounds t1 = curls4[(test_index - Int32(1)) * Int32(3) + Int32(1)]
+    @inbounds t2 = curls4[(test_index - Int32(1)) * Int32(3) + Int32(2)]
+    @inbounds t3 = curls4[(test_index - Int32(1)) * Int32(3) + Int32(3)]
+    @inbounds q1 = curls4[(trial_index - Int32(1)) * Int32(3) + Int32(1)]
+    @inbounds q2 = curls4[(trial_index - Int32(1)) * Int32(3) + Int32(2)]
+    @inbounds q3 = curls4[(trial_index - Int32(1)) * Int32(3) + Int32(3)]
+    t11, t12, t13 = t1[1].value, t1[2].value, t1[3].value
+    t21, t22, t23 = t2[1].value, t2[2].value, t2[3].value
+    t31, t32, t33 = t3[1].value, t3[2].value, t3[3].value
+    r11 = trial_curl_sign_x * q1[1].value
+    r12 = trial_curl_sign_y * q1[2].value
+    r13 = trial_curl_sign_z * q1[3].value
+    r21 = trial_curl_sign_x * q2[1].value
+    r22 = trial_curl_sign_y * q2[2].value
+    r23 = trial_curl_sign_z * q2[3].value
+    r31 = trial_curl_sign_x * q3[1].value
+    r32 = trial_curl_sign_y * q3[2].value
+    r33 = trial_curl_sign_z * q3[3].value
+    curl_products = SVector(
+        t11 * r11 + t12 * r12 + t13 * r13,
+        t21 * r11 + t22 * r12 + t23 * r13,
+        t31 * r11 + t32 * r12 + t33 * r13,
+        t11 * r21 + t12 * r22 + t13 * r23,
+        t21 * r21 + t22 * r22 + t23 * r23,
+        t31 * r21 + t32 * r22 + t33 * r23,
+        t11 * r31 + t12 * r32 + t13 * r33,
+        t21 * r31 + t22 * r32 + t23 * r33,
+        t31 * r31 + t32 * r32 + t33 * r33,
+    )
+    lhs_re -= curl_products * (inverse_k * g_total_im)
+    lhs_im += curl_products * (inverse_k * g_total_re)
+    if ACC
+        _test_add_block!(blocks, base, pair_stride, Int32(0), lhs_re)
+        _test_add_block!(blocks, base, pair_stride, Int32(9), lhs_im)
+        _test_add_block!(blocks, base, pair_stride, Int32(18), rhs_re)
+        _test_add_block!(blocks, base, pair_stride, Int32(21), rhs_im)
+    else
+        _metal_store_block!(blocks, base, pair_stride, Int32(0), lhs_re)
+        _metal_store_block!(blocks, base, pair_stride, Int32(9), lhs_im)
+        _metal_store_block!(blocks, base, pair_stride, Int32(18), rhs_re)
+        _metal_store_block!(blocks, base, pair_stride, Int32(21), rhs_im)
+    end
+    return nothing
+end
+
 @inline function _test_add_block!(blocks, base::Int32, stride::Int32, offset::Int32, values::SVector{N,T}) where {N,T}
     i = 1
     while i <= N
@@ -539,6 +721,8 @@ function _launch_metal_fused_pair_kernels!(lhs, rhs_partial, q_neumann, cache::M
     dp0_count = Int32(cache.dp0_dof_count)
     drive_count = Int32(size(q_neumann, 2))
     timed = get(ENV, "BLAB_METAL_GATHER_TIMING", "0") == "1"
+    packed_mode = parse(Int, get(ENV, "BLAB_TEST_FUSED_PACKED", "0"))
+    packed = packed_mode > 0 ? _metal_packed_pair_tables_for(cache) : nothing
     timed && Metal.synchronize()
     stamp = time()
     for chunk in 1:tables.chunk_count
@@ -578,9 +762,23 @@ function _launch_metal_fused_pair_kernels!(lhs, rhs_partial, q_neumann, cache::M
             Val(parse(Int, get(ENV, "BLAB_TEST_FUSED_PROBE", "0"))),
             Val(transform_number > 1),
         )
+        if packed !== nothing
+            packed_args = (
+                tables.blocks, packed.points4, packed.normals4, cache.areas, packed.curls4, cache.faces, tables.elements,
+                cache.rule_points, cache.rule_weights,
+                Int32(element_count), Int32(chunk_start), Int32(chunk_count), pair_stride,
+                k, inv(k), Int32(cache.face_count), Val(packed.rule), Val(rule_count),
+                pair_offsets, singular_trial_indices, skip_mode,
+                trial_sign_x, trial_sign_y, trial_sign_z, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
+                Val(transform_number > 1), Val(packed_mode == 2),
+            )
+            chunk == 1 && transform_number == 1 && _test_pipeinfo("fused_pair_packed", _test_fused_pair_blocks_packed_kernel!, packed_args...)
+            Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _test_fused_pair_blocks_packed_kernel!(packed_args...)
+        else
         chunk == 1 && _test_pipeinfo("fused_pair", _metal_fused_pair_blocks_kernel!, pair_args...)
         Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_fused_pair_blocks_kernel!(pair_args...
         )
+        end
         stamp = _metal_gather_stage!("fused_pairs", timed, stamp)
       end
         _metal_launch(
