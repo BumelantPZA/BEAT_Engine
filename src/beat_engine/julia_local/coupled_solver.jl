@@ -14,6 +14,9 @@ include(joinpath(@__DIR__, "src", "BeatEngineCoupled.jl"))
 using .BeatEngineCoupled
 include(joinpath(@__DIR__, "src", "BeatEngineCoupledCondensed.jl"))
 using .BeatEngineCoupledCondensed
+
+include(joinpath(@__DIR__, "src", "BeatEngineCoupledPipeline.jl"))
+using .BeatEngineCoupledPipeline
 include(joinpath(@__DIR__, "src", "BeatEngineSpeakerRom.jl"))
 using .BeatEngineSpeakerRom
 
@@ -47,6 +50,30 @@ end
 const BEM_FIELD_EVALUATION_CACHES = Dict{String,Any}()
 const BEM_FIELD_EVALUATION_CACHE_ORDER = String[]
 const MAX_BEM_FIELD_EVALUATION_CACHES = Int(BeatEngineContract.WORKER["field_cache"]["max_entries"])
+
+const APPLE_ACCELERATE = "/System/Library/Frameworks/Accelerate.framework/Versions/A/Accelerate"
+const ACCELERATE_BLAS_ACTIVE = Ref(false)
+
+"""
+    use_accelerate_blas!()
+
+Route BLAS and LAPACK, Julia's dense calls and MUMPS's alike (both go through libblastrampoline),
+to Apple Accelerate, once per process. Metal solves keep the dense factorizations, the
+Burton-Miller combine and MUMPS on the host, where Accelerate runs them on the AMX units: on
+SAWMOD on an M1 Pro, OpenBLAS's ComplexF32 LU and trailing updates were the largest host cost.
+"""
+function use_accelerate_blas!()
+    ACCELERATE_BLAS_ACTIVE[] && return nothing
+    Sys.isapple() || return nothing
+    # Load MUMPS first: OpenBLAS32's lazy library forwards itself into libblastrampoline on its first
+    # dlopen, so loaded after the forward below it would put MUMPS's LP64 calls back on OpenBLAS32.
+    BeatEngineCoupledCondensed.BeatEngineMumps.mumps_library()
+    # "\x1a" tells libblastrampoline to drop the trailing underscore: zgemm_64_ -> zgemm$NEWLAPACK$ILP64.
+    BLAS.lbt_forward(APPLE_ACCELERATE; clear=true, suffix_hint="\x1a\$NEWLAPACK\$ILP64")
+    BLAS.lbt_forward(APPLE_ACCELERATE; clear=false, suffix_hint="\x1a\$NEWLAPACK")
+    ACCELERATE_BLAS_ACTIVE[] = true
+    return nothing
+end
 """
 Coupled outputs computed from BEM pressure and flux, interface pressure and flux, diaphragm
 velocity and voice-coil current only, never from interior FEM pressure. The only ones for which
@@ -820,7 +847,7 @@ end
 function metal_direct_assembly_available()
     return BeatEngineCore._normalized_metal_assembly_mode(nothing) != :host_staged &&
            BeatEngineCore._normalized_metal_singular_mode() == :native &&
-           BeatEngineCore._normalized_metal_regular_kernel_mode() == :pair_gather
+           BeatEngineCore._normalized_metal_regular_kernel_mode() in (:pair_gather, :pair_tilereduce)
 end
 
 function assemble_exterior_direct_metal(
@@ -871,6 +898,7 @@ function solve_exterior_request(request, system, unbounded_region; event_mode=fa
                 error("Exterior precision must be float32 or float64.")
     backend = Symbol(lowercase(String(get(options, "bem_backend", "cpu"))))
     backend in (:cpu, :cuda, :rocm, :metal) || error("Exterior BEM backend must be cpu, cuda, rocm, or metal.")
+    backend == :metal && use_accelerate_blas!()
     requested_assembly = lowercase(String(get(options, "burton_miller_assembly", "direct_system")))
     requested_assembly in ("direct_system", "operator_matrices") || error(
         "Exterior burton_miller_assembly must be direct_system or operator_matrices.",
@@ -2455,6 +2483,7 @@ function solve_request_impl(request; event_mode=false)
     bem_backend = Symbol(lowercase(String(get(solver_options, "bem_backend", "cpu"))))
     bem_backend in (:cpu, :cuda, :rocm, :metal) ||
         error("Unsupported coupled BEM backend: $bem_backend. Expected cpu, cuda, rocm, or metal.")
+    bem_backend == :metal && use_accelerate_blas!()
     symmetry_mode = BeatEngineCore.normalized_symmetry_mode(
         get(solver_options, "symmetry", "off"),
     )
@@ -2775,39 +2804,82 @@ function solve_request_impl(request; event_mode=false)
     rom_requested = any(
         String(output["quantity"]) in SPEAKER_ROM_QUANTITIES for output in outputs
     )
+    rank_experiment_requested = !isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing))
+    # BLAB_COUPLED_DEMAND_RECONSTRUCTION: skip the interior back substitution only when every
+    # requested output is known not to read interior FEM pressure.
+    reconstruct_interior = !(
+        use_condensed_solver &&
+        BeatEngineCoupledCondensed._demand_reconstruction_enabled(bem_backend) &&
+        !validation_diagnostics &&
+        !rank_experiment_requested &&
+        all(String(output["quantity"]) in INTERIOR_FREE_COUPLED_OUTPUTS for output in outputs)
+    )
+    frequencies = request["frequencies_hz"]
+    build_condensed_at = (index; prefetched_operators=nothing, on_operators_ready=nothing, dense_gate=nothing) ->
+        build_condensed_coupled_system(
+            fem_mesh,
+            bem_mesh,
+            interface_map,
+            FloatType(frequencies[index]),
+            sound_speed,
+            density;
+            quadrature_order=quadrature_order,
+            regular_quadrature_order=quadrature_selections[index].order,
+            singular_order=singular_order,
+            cache=coupled_cache,
+            validation_diagnostics=validation_diagnostics,
+            symmetry_mode=symmetry_mode,
+            bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
+            wall_impedances=fem_domains.wall_impedances,
+            transducers=transducers,
+            transducer_operators=transducer_operators,
+            prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
+            # ROM exports and the rank experiment read transducer surfaces from the Schur block.
+            allow_transducer_condensation=!rom_requested && !rank_experiment_requested,
+            prefetched_operators=prefetched_operators,
+            on_operators_ready=on_operators_ready,
+            dense_gate=dense_gate,
+        )
+    # Condensed Metal sweeps overlap consecutive frequencies (BeatEngineCoupledPipeline). The FEM
+    # lane also needs a solve that makes no MUMPS call: zero FEM right-hand sides (voltage drives
+    # only) and no interior reconstruction.
+    pipeline = if use_condensed_solver && bem_backend == :metal && Threads.nthreads() > 1 &&
+                  length(frequencies) > 1 && !rom_requested && !rank_experiment_requested
+        CondensedSweepPipeline(
+            length(frequencies);
+            fem_lane=!reconstruct_interior && all(excitation -> Symbol(excitation.kind) == :voltage, excitations),
+            build=(index, operators, on_ready, gate) ->
+                build_condensed_at(index; prefetched_operators=operators, on_operators_ready=on_ready, dense_gate=gate),
+            assemble=(index, flux_columns) -> condensed_metal_operators(
+                coupled_cache, bem_mesh, FloatType(frequencies[index]), sound_speed;
+                quadrature_order=quadrature_selections[index].order, singular_order=singular_order,
+                flux_columns=flux_columns,
+            ),
+            release_system=release_condensed_coupled_system!,
+            release_operators=BeatEngineCoupledCondensed.release_operator_storage!,
+        )
+    else
+        nothing
+    end
+    use_condensed_solver && clear_condensed_host_pool!()
     coupled_system = nothing
     try
-        for (frequency_index, frequency_value) in enumerate(request["frequencies_hz"])
+        for (frequency_index, frequency_value) in enumerate(frequencies)
             if cancel_requested()
                 cancelled = true
                 break
             end
+            # No collection during the frequency: its allocations are collected once, after the
+            # frequency's system is released (~0.05 s per frequency on SAWMOD, where the collector
+            # otherwise ran several times inside the host stages).
+            GC.enable(false)
             frequency_hz = FloatType(frequency_value)
             println(stderr, "Coupled $(precision_name)/$(bem_backend): assembling $(frequency_hz) Hz")
             assembly_started = time_ns()
-            coupled_system = if use_condensed_solver
-                build_condensed_coupled_system(
-                    fem_mesh,
-                    bem_mesh,
-                    interface_map,
-                    frequency_hz,
-                    sound_speed,
-                    density;
-                    quadrature_order=quadrature_order,
-                    regular_quadrature_order=quadrature_selections[frequency_index].order,
-                    singular_order=singular_order,
-                    cache=coupled_cache,
-                    validation_diagnostics=validation_diagnostics,
-                    symmetry_mode=symmetry_mode,
-                    bulk_loss_factor_by_vertex=fem_domains.bulk_loss_factor_by_vertex,
-                    wall_impedances=fem_domains.wall_impedances,
-                    transducers=transducers,
-                    transducer_operators=transducer_operators,
-                    prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
-                    # ROM exports and the rank experiment read transducer surfaces from the Schur block.
-                    allow_transducer_condensation=!rom_requested &&
-                        isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing)),
-                )
+            coupled_system = if !isnothing(pipeline)
+                pipeline_system!(pipeline, frequency_index)
+            elseif use_condensed_solver
+                build_condensed_at(frequency_index)
             else
                 build_coupled_system(
                     fem_mesh,
@@ -2834,15 +2906,6 @@ function solve_request_impl(request; event_mode=false)
                 )
             end
             assembly_s = (time_ns() - assembly_started) / 1.0e9
-            # BLAB_COUPLED_DEMAND_RECONSTRUCTION: skip the interior back substitution only when every
-            # requested output is known not to read interior FEM pressure.
-            reconstruct_interior = !(
-                use_condensed_solver &&
-                BeatEngineCoupledCondensed._demand_reconstruction_enabled(bem_backend) &&
-                !validation_diagnostics &&
-                isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing)) &&
-                all(String(output["quantity"]) in INTERIOR_FREE_COUPLED_OUTPUTS for output in outputs)
-            )
             solve_started = time_ns()
             solutions = use_condensed_solver ?
                         solve_condensed_coupled_excitations(
@@ -2852,6 +2915,7 @@ function solve_request_impl(request; event_mode=false)
                         ) :
                         solve_coupled_excitations(coupled_system, excitations)
             solve_s = (time_ns() - solve_started) / 1.0e9
+            isnothing(pipeline) || pipeline_solved!(pipeline, frequency_index)
             interface_error_sets = [
                 per_interface_errors(
                     solution,
@@ -2871,6 +2935,7 @@ function solve_request_impl(request; event_mode=false)
                 maximum(errors[2][index] for errors in interface_error_sets)
                 for index in eachindex(interfaces)
             ]
+            isnothing(pipeline) || pipeline_before_field!(pipeline, frequency_index)
             field_s = 0.0
             quantities = Dict{String,Any}[]
             rom_options = get(solver_options, "speaker_rom", Dict{String,Any}())
@@ -3054,7 +3119,12 @@ function solve_request_impl(request; event_mode=false)
                                   get(options, "excitation_weights", Any[]) :
                                   raw_weight_sweep[frequency_index]
                     if isempty(raw_weights)
-                        pressures = [
+                        # Metal evaluates every drive's field in one kernel pass.
+                        pressures = bem_backend == :metal ?
+                            BeatEngineCore.evaluate_galerkin_field_metal_multi(
+                                points, bem_mesh, [s.bem_pressure for s in solutions], [s.bem_neumann for s in solutions],
+                                coupled_system.wavenumber, coupled_system.field_cache,
+                            ) : [
                             if bem_backend == :cuda
                                 evaluate_galerkin_field_cuda(
                                     points,
@@ -3376,6 +3446,7 @@ function solve_request_impl(request; event_mode=false)
                     "replay_factorization_s" => coupled_system.timings.replay_factorization_s,
                 )),
             )
+            isnothing(pipeline) || pipeline_field_done!(pipeline, frequency_index)
             if validation_diagnostics
                 diagnostics["relative_residual"] = maximum(solution.relative_residual for solution in solutions)
                 diagnostics["all_bem_replay_error"] = maximum(
@@ -3406,8 +3477,12 @@ function solve_request_impl(request; event_mode=false)
             release_coupled_system!(coupled_system)
             coupled_system = nothing
             solved_count = frequency_index
+            GC.enable(true)
         end
     finally
+        GC.enable(true)
+        isnothing(pipeline) || release_pipeline!(pipeline)
+        use_condensed_solver && clear_condensed_host_pool!()
         if coupled_system !== nothing
             use_condensed_solver ? release_condensed_coupled_system!(coupled_system) :
             release_coupled_system!(coupled_system)
@@ -3427,6 +3502,8 @@ function reclaim_accelerator_memory!()
     catch
         nothing
     end
+    clear_condensed_host_pool!()
+    isdefined(BeatEngineCore, :release_metal_operator_pool!) && BeatEngineCore.release_metal_operator_pool!()
     GC.gc(true)
     try
         cuda = BeatEngineCore.cuda_module()
