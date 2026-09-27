@@ -130,6 +130,9 @@ function _evaluate_galerkin_field_metal_fast(
     eval_points, pressure, q_neumann, k::Float32, cache::MetalFieldEvaluationCache; return_device::Bool=false,
 )
     point_count = length(eval_points)
+    # Test (BLAB_TEST_FIELD_INFO=<file>): sizes and wall of each call.
+    info_path = get(ENV, "BLAB_TEST_FIELD_INFO", "")
+    started = time_ns()
     tables = _metal_fast_field_tables_for(cache)
     d_eval_points = MtlArray(_metal_eval_point_arrays(eval_points, Float32))
     pressure_on_device = pressure isa MtlArray
@@ -166,6 +169,8 @@ function _evaluate_galerkin_field_metal_fast(
         )
     end
     Metal.synchronize()
+    isempty(info_path) || open(io -> println(io, "points=", point_count, " sources=", cache.source_count, " chunks=", chunk_count,
+        " drives=", size(pressure, 2), " wall=", (time_ns() - started) / 1e9), info_path, "a")
     result = return_device ? d_potentials : ComplexF32.(Array(d_potentials))
     Metal.unsafe_free!(d_eval_points)
     pressure_on_device || Metal.unsafe_free!(d_pressure)

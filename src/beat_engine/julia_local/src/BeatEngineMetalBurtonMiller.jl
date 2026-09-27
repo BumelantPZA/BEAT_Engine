@@ -285,7 +285,8 @@ function _metal_fused_pair_blocks_kernel!(
     trial_curl_sign_x,
     trial_curl_sign_y,
     trial_curl_sign_z,
-) where {R}
+    ::Val{PROBE}=Val(0),
+) where {R,PROBE}
     position = thread_position_in_grid_2d()
     test_position = Int32(position.x)
     trial_local = Int32(position.y)
@@ -309,6 +310,16 @@ function _metal_fused_pair_blocks_kernel!(
         end
         return nothing
     end
+    # Test probes (BLAB_TEST_FUSED_PROBE, timing only): 1 = no store, 2 = no maths.
+    if PROBE == 2
+        f = Float32(test_index) * 1.0f-4 + Float32(trial_index) * 1.0f-5
+        lhs_re = SVector(f, f + 1, f + 2, f + 3, f + 4, f + 5, f + 6, f + 7, f + 8)
+        _metal_store_block!(blocks, base, pair_stride, Int32(0), lhs_re)
+        _metal_store_block!(blocks, base, pair_stride, Int32(9), lhs_re * 2.0f0)
+        _metal_store_block!(blocks, base, pair_stride, Int32(18), SVector(f, f + 1, f + 2))
+        _metal_store_block!(blocks, base, pair_stride, Int32(21), SVector(f, f + 2, f + 3))
+        return nothing
+    end
     lhs_re, lhs_im, rhs_re, rhs_im = _metal_regular_pair_fused_blocks(
         face_vertices,
         normals,
@@ -330,6 +341,11 @@ function _metal_fused_pair_blocks_kernel!(
         trial_curl_sign_y,
         trial_curl_sign_z,
     )
+    if PROBE == 1
+        total = sum(lhs_re) + sum(lhs_im) + sum(rhs_re) + sum(rhs_im)
+        total == -1.2345f-30 && @inbounds blocks[base] = total
+        return nothing
+    end
     _metal_store_block!(blocks, base, pair_stride, Int32(0), lhs_re)
     _metal_store_block!(blocks, base, pair_stride, Int32(9), lhs_im)
     _metal_store_block!(blocks, base, pair_stride, Int32(18), rhs_re)
@@ -501,7 +517,7 @@ function _launch_metal_fused_pair_kernels!(
     for chunk in 1:tables.chunk_count
         chunk_start = (chunk - 1) * chunk_size + 1
         chunk_count = min(chunk_size, element_count - chunk_start + 1)
-        Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_fused_pair_blocks_kernel!(
+        pair_args = (
             tables.blocks,
             cache.face_vertices,
             cache.normals,
@@ -529,6 +545,10 @@ function _launch_metal_fused_pair_kernels!(
             trial_curl_sign_x,
             trial_curl_sign_y,
             trial_curl_sign_z,
+            Val(parse(Int, get(ENV, "BLAB_TEST_FUSED_PROBE", "0"))),
+        )
+        chunk == 1 && _test_pipeinfo("fused_pair", _metal_fused_pair_blocks_kernel!, pair_args...)
+        Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _metal_fused_pair_blocks_kernel!(pair_args...
         )
         stamp = _metal_gather_stage!("fused_pairs", timed, stamp)
         _metal_launch(
@@ -874,8 +894,17 @@ function _launch_metal_fused_singular_kernels!(
     gather_tables = _normalized_metal_singular_writeback() == :gather ?
         _metal_singular_gather_tables(regular_cache, singular_cache, part_count) : nothing
     value_count = pair_count * part_count
+    timed = get(ENV, "BLAB_METAL_GATHER_TIMING", "0") == "1"
+    timed && Metal.synchronize()
+    stamp = time()
+    if timed && transform.label == :identity
+        _metal_gather_stage_timing["sing_info_pairs"] = pair_count
+        _metal_gather_stage_timing["sing_info_parts"] = part_count
+        _metal_gather_stage_timing["sing_info_rule_points"] = rule_point_count
+    end
     lhs_values = Metal.zeros(eltype(lhs), value_count, 9)
     rhs_values = Metal.zeros(eltype(lhs), value_count, 3)
+    stamp = _metal_gather_stage!("sing_alloc", timed, stamp)
     _metal_launch(
         _metal_singular_fused_bm_blocks_kernel!,
         value_count,
@@ -888,6 +917,7 @@ function _launch_metal_fused_singular_kernels!(
         Int32(rule_point_count), Int32(part_count),
         sx, sy, sz, csx, csy, csz,
     )
+    stamp = _metal_gather_stage!("sing_blocks", timed, stamp)
     if gather_tables === nothing
         _metal_launch(
             _metal_singular_fused_bm_scatter_kernel!,
@@ -931,6 +961,7 @@ function _launch_metal_fused_singular_kernels!(
         )
     end
     Metal.synchronize()
+    stamp = _metal_gather_stage!("sing_gather", timed, stamp)
     Metal.unsafe_free!(lhs_values)
     Metal.unsafe_free!(rhs_values)
     return nothing
@@ -1100,6 +1131,11 @@ function assemble_burton_miller_neumann_system_metal(
                 Metal.synchronize()
             end
             timing !== nothing && (timing["metal_fused_image_singular_kernel"] = image_elapsed)
+            if timing !== nothing
+                for (stage, elapsed) in _metal_gather_stage_timing
+                    startswith(stage, "sing_") && (timing["metal_fused_" * stage] = elapsed)
+                end
+            end
             image_singular_pairs = device_cache.image_singular_pair_count
         end
 

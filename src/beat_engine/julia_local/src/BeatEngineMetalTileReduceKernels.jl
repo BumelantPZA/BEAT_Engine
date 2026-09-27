@@ -248,8 +248,8 @@ end
 @inline function _metal_tilereduce_reduce!(
     blocks4, tg, slot_entry_offsets, slot_entries, slot_first::Int32, slot_count::Int32,
     tx::Int32, ty::Int32, trial_local::Int32, chunk_count::Int32, slot_total::Int32,
-    phase_offset::Int32, ::Val{SKIP}, accumulate::Int32=Int32(0),
-) where {SKIP}
+    phase_offset::Int32, ::Val{SKIP}, accumulate::Int32=Int32(0), ::Val{PR}=Val(0),
+) where {SKIP,PR}
     SKIP && return nothing
     slot_local = tx - Int32(1)
     while slot_local < slot_count
@@ -281,7 +281,10 @@ end
                 a3 += old[3].value
                 a4 += old[4].value
             end
-            @inbounds blocks4[block_index] = _metal_float4(a1, a2, a3, a4)
+            # Test probe 5 (timing only): no device store (the sentinel never matches).
+            if PR != 5 || a1 == -1.2345f-30
+                @inbounds blocks4[block_index] = _metal_float4(a1, a2, a3, a4)
+            end
         end
         slot_local += Int32(16)
     end
@@ -326,7 +329,8 @@ function _metal_tilereduce_pair_kernel!(
     combv::Val{COMB},
     beta_re,
     beta_im,
-) where {RC,R,TY,SKIP,SIMDBAR,COMB}
+    probev::Val{PROBE}=Val(0),
+) where {RC,R,TY,SKIP,SIMDBAR,COMB,PROBE}
     tg = MtlThreadGroupArray(Float32, (16, TY, 12))
     tpos = thread_position_in_threadgroup()
     gpos = threadgroup_position_in_grid()
@@ -353,7 +357,15 @@ function _metal_tilereduce_pair_kernel!(
         if mask_on != Int32(0)
             @inbounds rigid_trial = element_flux_mask[trial_index] == Int32(0)
         end
-        if !_metal_pair_is_skipped(
+        # Test probes (BLAB_TEST_TR_PROBE, timing only, wrong results): 2 = no pair maths,
+        # 3 = no sin/cos, 4 = no adjacency/singular skip test, 1 = maths only (no reduction).
+        if PROBE == 2 || PROBE == 5 || PROBE == 6
+            f = Float32(test_index) * 1.0f-4 + Float32(trial_index) * 1.0f-5
+            slp_re = SVector(f, f + 1, f + 2); slp_im = slp_re * 2.0f0
+            adj_re = slp_re * 3.0f0; adj_im = slp_re * 4.0f0
+            dlp_re = SVector(f, f + 1, f + 2, f + 3, f + 4, f + 5, f + 6, f + 7, f + 8)
+            dlp_im = dlp_re * 2.0f0; hyp_re = dlp_re * 3.0f0; hyp_im = dlp_re * 4.0f0
+        elseif PROBE == 4 || !_metal_pair_is_skipped(
             faces,
             face_count,
             test_index,
@@ -365,12 +377,21 @@ function _metal_tilereduce_pair_kernel!(
             slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im = _metal_regular_pair_blocks_packed(
                 points4, normals4, areas, curls4, test_index, trial_index, k, rc, rv,
                 trial_sign_x, trial_sign_y, trial_sign_z, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
+                Val(PROBE == 3 ? 3 : 0),
             )
         end
+    end
+    if PROBE == 1
+        total = sum(slp_re) + sum(slp_im) + sum(adj_re) + sum(adj_im) + sum(dlp_re) + sum(dlp_im) + sum(hyp_re) + sum(hyp_im)
+        if test_position <= element_count && trial_local <= chunk_count
+            @inbounds blocks4[test_position + (trial_local - Int32(1)) * element_count] = _metal_float4(total, total, total, total)
+        end
+        return nothing
     end
     @inbounds slot_first = Int32(tile_slot_offsets[tile])
     @inbounds slot_count = Int32(tile_slot_offsets[tile + Int32(1)]) - slot_first
 
+    PROBE == 6 && (accumulate = Int32(0))
     if COMB
         # BLAB_TEST_COMBINED_BM: C = -S - βK' (3 test rows) and A = -D + βH (3 x 3) in two passes.
         # Phase 0: (C re, C im, A re/im of trial basis 1); phase 1: A re/im of trial bases 2, 3.
@@ -382,14 +403,14 @@ function _metal_tilereduce_pair_kernel!(
             SVector(a_re[1], a_re[2], a_re[3]), SVector(a_im[1], a_im[2], a_im[3]))
         _metal_tilereduce_barrier(barv)
         _metal_tilereduce_reduce!(blocks4, tg, slot_entry_offsets, slot_entries, slot_first, slot_count,
-            tx, ty, trial_local, chunk_count, slot_total, Int32(0), skipv, accumulate)
+            tx, ty, trial_local, chunk_count, slot_total, Int32(0), skipv, accumulate, Val(PROBE))
         _metal_tilereduce_barrier(barv)
         _metal_tilereduce_put!(tg, tx, ty,
             SVector(a_re[4], a_re[5], a_re[6]), SVector(a_im[4], a_im[5], a_im[6]),
             SVector(a_re[7], a_re[8], a_re[9]), SVector(a_im[7], a_im[8], a_im[9]))
         _metal_tilereduce_barrier(barv)
         _metal_tilereduce_reduce!(blocks4, tg, slot_entry_offsets, slot_entries, slot_first, slot_count,
-            tx, ty, trial_local, chunk_count, slot_total, group_stride, skipv, accumulate)
+            tx, ty, trial_local, chunk_count, slot_total, group_stride, skipv, accumulate, Val(PROBE))
         return nothing
     end
 
@@ -679,9 +700,11 @@ function _launch_metal_tilereduce_transforms!(operators, cache::MetalRegularAsse
         chunk_start = (chunk - 1) * chunk_size + 1
         chunk_count = min(chunk_size, element_count - chunk_start + 1)
         for (transform_index, transform) in enumerate(transforms)
+            # Test (BLAB_TEST_TR_FIRST_ONLY=1, timing only): the identity transform alone.
+            transform_index > 1 && get(ENV, "BLAB_TEST_TR_FIRST_ONLY", "0") == "1" && break
             (pair_offsets, singular_trial_indices, skip_mode, trial_sign_x, trial_sign_y, trial_sign_z,
              trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z) = transform
-            Metal.@metal threads=(_METAL_TILEREDUCE_TX, ty) groups=(tables.tile_count, cld(chunk_count, ty)) _metal_tilereduce_pair_kernel!(
+            pair_args = (
                 tables.blocks4,
                 packed.points4,
                 packed.normals4,
@@ -719,7 +742,10 @@ function _launch_metal_tilereduce_transforms!(operators, cache::MetalRegularAsse
             Val(!isnothing(combined)),
             beta_re,
             beta_im,
+            Val(parse(Int, get(ENV, "BLAB_TEST_TR_PROBE", "0"))),
             )
+            chunk == 1 && transform_index == 1 && _test_pipeinfo("tilereduce_pair", _metal_tilereduce_pair_kernel!, pair_args...)
+            Metal.@metal threads=(_METAL_TILEREDUCE_TX, ty) groups=(tables.tile_count, cld(chunk_count, ty)) _metal_tilereduce_pair_kernel!(pair_args...)
         end
         stamp = _metal_gather_stage!("pairs", timed, stamp)
         if !isnothing(combined)

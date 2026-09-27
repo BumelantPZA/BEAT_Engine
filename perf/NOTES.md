@@ -420,3 +420,40 @@ chain (~0.45) and the GPU lane (~0.33 + interlocks), so the next gain needs the 
 - MODE 4 (`BLAB_METAL_FIELD_FAST=4`): mode 3 with a precise sqrt for the distance (the phase k*r
   reaches ~1e3 rad at 20 kHz, 3 m). Same speed, now the app test setting. Precise sin/cos on top
   (tried): no gain, field 0.08 -> 0.15 s. Kahan accumulation: not measured (removed).
+
+### Round 15 (2026-09-27): GPU operator timing study (SAWMOD and prototype2)
+Tools (all test-only, off by default): `BLAB_TEST_GPU_MICRO=<file>` + `_VARIANTS="label:K=V,K=V;..."`
++ `_REPS`: at the first assembly of each wavenumber the worker reruns that assembly per variant alone
+on the GPU and logs every stage (`scratchpad/msum.py` summarizes). `BLAB_TEST_PIPEINFO=<file>`: compiled
+pipeline limits (maxThreads < 1024 = register-limited occupancy). `BLAB_TEST_TR_PROBE` (tile-reduce
+pair kernel: 1 maths only, 2 no maths, 3 no sin/cos, 4 no skip test, 5 no maths + no store, 6 no
+maths + no image read-modify-write), `BLAB_TEST_TR_FIRST_ONLY=1` (identity transform only),
+`BLAB_TEST_FUSED_PROBE` (exterior fused pair kernel: 1 no store, 2 no maths), fused singular sub-stages
+under `BLAB_METAL_GATHER_TIMING=1`, `BLAB_TEST_FIELD_INFO=<file>` (field call sizes and walls).
+Probes give wrong results: timing only.
+
+SAWMOD (6054 elements, 3-point rule, 3110 P1, xy symmetry = 4 transforms), alone on the GPU, ms per
+frequency, same at 200 Hz / 5 kHz / 20 kHz: **operators 250** = pair kernel 214 + gathers 20 (A 14.5,
+C 5.5) + singular 12 + image singular 2.3 + operator zeroing 2.8. Field: 3 calls (one per excitation)
+x 28 ms = 84 (7322 points x 72648 sources).
+- Pair kernel split: maths only 103-121, reduction only 86-98 (roughly additive). No sin/cos -6. Per
+  transform: maths ~32, reduction ~21. Reduction without any device store -3, without the image
+  read-modify-write -11: the reduction cost is threadgroup memory + barriers + slot loops.
+- Occupancy: tile-reduce pair kernel maxThreads 512 of 1024 (12 KB threadgroup memory); maths-only 576,
+  reduction-only 832; no-skip variant 448 and +35 % time (same work): occupancy-bound maths.
+- TY=8: 202 vs 214 (-12 ms, free); TY=4 worse. Singular parts 2/8/16/32: none better than 4.
+- **End-to-end ceiling:** 50-freq pipelined sweep with the operators 2.5x faster (identity only):
+  0.515 -> 0.496 s/freq (4 %). On the M1 Pro, SAWMOD is CPU-chain bound (MUMPS -> LU); the GPU lane
+  (ops 0.25 + field 0.08) hides behind it. GPU work pays on SAWMOD only on Macs with a weaker GPU
+  relative to the CPU, or after the CPU chain shrinks.
+
+prototype2 quarter (1233 elements, 6-point rule = 36 evaluations per pair, 677 P1, 4 transforms),
+exterior fused path (upstream's kernel: no packed loads, no tile reduction, gathers per transform):
+**assembly 49** = pairs 22 + lhs gather 11 + rhs gather 6 + singular 8.1 + image singular 3.6 (of which
+value-buffer zeroing 1.4, Sauter-Schwab blocks 8.6, gathers 1.6; 15377 adjacent pairs, 4 parts) +
+alloc/identity/row weights/rhs reduce ~3.5. Field 1 call, 12.6 ms (7322 x 29592).
+- Pair kernel is maths-bound: no store -2 ms, no maths 5.6 ms. maxThreads 384 (register-limited).
+  Tile 16x16/32x8/8x32/32x4 and chunk budget 128/512/2048 MB: all within 0.5 ms.
+- **End-to-end ceiling:** 50-freq sweep with the pair maths removed: 0.073 -> 0.057 s/freq (1:1).
+  prototype2 is GPU-bound; every GPU millisecond counts.
+Plan with five targets: `perf/GPU_PLAN.md`.

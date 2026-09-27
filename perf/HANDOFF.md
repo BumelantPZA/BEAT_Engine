@@ -22,6 +22,13 @@ Explain accuracy to the user in plain terms (dB change and seconds saved), not m
   off at 10-20 kHz at the quietest points of the 60 dB window (Float32 summation). A max-dB limit of
   0.01 there is below what Float32 can deliver; compare against stock, not against zero.
 
+## Status after round 15 (2026-09-27): GPU timing study done, plan in perf/GPU_PLAN.md
+- Operators alone: SAWMOD 250 ms (pair kernel 214 = maths ~120 + in-group reduction ~90), field 84;
+  prototype2 quarter 49 ms (pairs 22, gathers 17, singular 12), field 12.6. Kernels are
+  occupancy-limited (512 / 384 threads per group).
+- End-to-end: prototype2 is GPU-bound (1:1); SAWMOD on the M1 Pro gains at most ~4 % from faster GPU
+  operators (CPU chain MUMPS -> LU is longer). Five targets T1-T5 in GPU_PLAN.md; the user picks.
+
 ## Status after round 14 (2026-09-27) and next step
 - App path SAWMOD ~24 s warm (stock Metal 131 s); prototype2 quarter 13.9 s (stock 20.5 s). Tags up to
   `metal-test-round14`. App patches in `perf/app_patches/` (user applies; field mode now 4).

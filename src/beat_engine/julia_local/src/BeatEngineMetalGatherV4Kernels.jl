@@ -484,8 +484,13 @@ end
         radius = radius2 * inv_radius
         phase = k * radius
         green_scale = inv_radius * inv_four_pi * (test_weight_scale * trial_weight)
-        green_re = _metal_fast_cos(phase) * green_scale
-        green_im = _metal_fast_sin(phase) * green_scale
+        if context[16] === Val(3)   # test probe (BLAB_TEST_TR_PROBE=3): no sin/cos, timing only
+            green_re = (one(k) - phase * phase * 0.5f0) * green_scale
+            green_im = phase * green_scale
+        else
+            green_re = _metal_fast_cos(phase) * green_scale
+            green_im = _metal_fast_sin(phase) * green_scale
+        end
         grad_re = -green_re * inv_radius - green_im * k
         grad_im = green_re * k - green_im * inv_radius
         test_dot = -(dx * test_nx + dy * test_ny + dz * test_nz) * inv_radius
@@ -507,6 +512,7 @@ end
     slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im, g_total_re, g_total_im = acc
     k, inv_four_pi, jac_scale, test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs,
         points4, test_index, trial_index = context
+    probe = context[14]
     T = typeof(k)
     test_xi = _metal_rule_xi(rc, rv, Q)
     test_eta = _metal_rule_eta(rc, rv, Q)
@@ -528,7 +534,7 @@ end
     h_re = zero(SVector{3,T})
     h_im = zero(SVector{3,T})
     trial_context = (x, y, z, test_weight * jac_scale, k, inv_four_pi,
-        test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs, points4, trial_index)
+        test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs, points4, trial_index, probe)
     s_re, s_im, a_re, a_im, d_re, d_im, h_re, h_im = _metal_packed_trial_fold(
         (s_re, s_im, a_re, a_im, d_re, d_im, h_re, h_im), trial_context, Val(R), rc, rv)
     slp_re += test_basis * s_re
@@ -570,6 +576,7 @@ end
     points4, normals4, areas, curls4,
     test_index::Int32, trial_index::Int32, k, rc, rv::Val{R},
     trial_sign_x, trial_sign_y, trial_sign_z, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
+    probe::Val=Val(0),
 ) where {R}
     T = typeof(k)
     inv_four_pi = T(0.07957747154594767)
@@ -586,7 +593,7 @@ end
     @inbounds jac_scale = T(4) * areas[test_index] * areas[trial_index]
     trial_signs = SVector(trial_sign_x, trial_sign_y, trial_sign_z)
     context = (k, inv_four_pi, jac_scale, test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs,
-        points4, test_index, trial_index)
+        points4, test_index, trial_index, probe)
     acc = (zero(SVector{3,T}), zero(SVector{3,T}), zero(SVector{3,T}), zero(SVector{3,T}),
         zero(SVector{9,T}), zero(SVector{9,T}), zero(SVector{9,T}), zero(SVector{9,T}), zero(k), zero(k))
     slp_re, slp_im, adj_re, adj_im, dlp_re, dlp_im, hyp_re, hyp_im, g_total_re, g_total_im =

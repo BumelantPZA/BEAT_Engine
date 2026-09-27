@@ -212,3 +212,66 @@ function _metal_launch(kernel, count::Integer, args...; groupsize::Integer=_meta
     Metal.@metal threads=groupsize groups=cld(count, groupsize) kernel(args...)
     return nothing
 end
+
+# Test (BLAB_TEST_GPU_MICRO=<file>): at the first assembly of each wavenumber, rerun that assembly
+# under every variant of BLAB_TEST_GPU_MICRO_VARIANTS ("label:K=V,K=V;label2:K=V", "base:" = as is)
+# BLAB_TEST_GPU_MICRO_REPS times (after one warm call) and append one line per call:
+# "label k rep wall=<s> <stage>=<s> ...". `call(timing)` assembles with a timing Dict and releases.
+const _TEST_GPU_MICRO_DONE = Set{Tuple{String,Float64}}()
+function _test_gpu_micro(call, k, cache=nothing)
+    path = get(ENV, "BLAB_TEST_GPU_MICRO", "")
+    isempty(path) && return nothing
+    key = (path, Float64(k))
+    key in _TEST_GPU_MICRO_DONE && return nothing
+    push!(_TEST_GPU_MICRO_DONE, key)
+    cache isa MetalRegularAssemblyCache && open(path, "a") do io
+        println(io, "# info elements=", length(cache.element_indices), " faces=", cache.face_count, " rule=", cache.rule_count,
+            " p1=", cache.p1_dof_count, " dp0=", cache.dp0_dof_count, " images=", length(cache.image_transforms),
+            " image_singular_pairs=", cache.image_singular_pair_count)
+    end
+    reps = parse(Int, get(ENV, "BLAB_TEST_GPU_MICRO_REPS", "6"))
+    variants = split(get(ENV, "BLAB_TEST_GPU_MICRO_VARIANTS", "base:"), ';'; keepempty=false)
+    for variant in variants
+        label, settings = split(variant, ':'; limit=2)
+        saved = Dict{String,Union{Nothing,String}}()
+        for kv in split(settings, ','; keepempty=false)
+            name, value = split(kv, '='; limit=2)
+            saved[name] = get(ENV, name, nothing)
+            ENV[name] = value
+        end
+        try
+            for rep in 0:reps
+                timing = Dict{String,Any}()
+                Metal.synchronize()
+                wall = @elapsed begin
+                    call(timing)
+                    Metal.synchronize()
+                end
+                rep == 0 && continue
+                open(path, "a") do io
+                    println(io, label, " k=", round(Float64(k); digits=4), " rep=", rep, " wall=", round(wall; digits=5), " ",
+                        join(("$(n)=$(round(Float64(v); digits=5))" for (n, v) in sort!(collect(timing)) if v isa Real), " "))
+                end
+            end
+        finally
+            for (name, value) in saved
+                value === nothing ? delete!(ENV, name) : (ENV[name] = value)
+            end
+        end
+    end
+    return nothing
+end
+
+# Test (BLAB_TEST_PIPEINFO=<file>): compiled pipeline limits of a kernel (register use shows as
+# maxThreads < 1024), one line per call.
+function _test_pipeinfo(label, f, args...)
+    path = get(ENV, "BLAB_TEST_PIPEINFO", "")
+    isempty(path) && return nothing
+    kernel = Metal.@metal launch=false f(args...)
+    p = kernel.pipeline
+    open(path, "a") do io
+        println(io, label, " maxThreads=", Int(p.maxTotalThreadsPerThreadgroup), " width=", Int(p.threadExecutionWidth),
+            " tgmem=", Int(p.staticThreadgroupMemoryLength))
+    end
+    return nothing
+end

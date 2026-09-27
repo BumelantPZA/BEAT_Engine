@@ -3046,7 +3046,12 @@ them for this frequency, so a sweep can assemble frequency i+1 while frequency i
 # Burton-Miller, flux skip), which reach the kernels through BeatEngineCore globals: callers must
 # never run two of these at once. Returns the host operators, the row weights still to apply and
 # whether the operators are combined.
-function _test_metal_operators(prepared, bem_mesh, wavenumber, singular_order, flux_columns)
+function _test_metal_operators(prepared, bem_mesh, wavenumber, singular_order, flux_columns; timing=_test_asm_timing())
+    # Test (BLAB_TEST_GPU_MICRO): repeated assemblies of this wavenumber under variants, once.
+    BeatEngineCore._test_gpu_micro(wavenumber, prepared.device_cache) do t
+        assembled = _test_metal_operators(prepared, bem_mesh, wavenumber, singular_order, flux_columns; timing=t)
+        BeatEngineCore.release_operator_storage!(assembled.operators)
+    end
     # Metal assembles the four operators on the GPU; the condensed algebra
     # below is CPU-only, so bring them down and free the device copies.
     host_row_weights = get(ENV, "BLAB_TEST_HOST_ROW_WEIGHTS", "0") == "1" &&
@@ -3074,7 +3079,7 @@ function _test_metal_operators(prepared, bem_mesh, wavenumber, singular_order, f
             singular_cache=prepared.singular_cache,
             device_singular_cache=prepared.device_singular_cache,
             symmetry_mode=prepared.symmetry_mode,
-            timing=_test_asm_timing(),
+            timing=timing,
         )
     finally
         BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = false

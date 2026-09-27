@@ -870,6 +870,13 @@ function assemble_exterior_direct_metal(
     # The fused Metal assembler is the Metal counterpart of the direct CUDA
     # assembler: A and every excitation's b are formed on the GPU without
     # materializing S, D, D' or H.
+    # Test (BLAB_TEST_GPU_MICRO): repeated fused assemblies of this wavenumber under variants, once.
+    BeatEngineCore._test_gpu_micro(wavenumber, get(kwargs, :device_cache, nothing)) do t
+        micro = assemble_burton_miller_neumann_system_metal(
+            mesh, p1_space, dp0_space, reduce(hcat, neumann_values), wavenumber, rule; kwargs..., timing=t,
+        )
+        release_metal_burton_miller_system!(micro)
+    end
     started = time_ns()
     # Test (BLAB_TEST_FUSED_TIMING=<file>): the fused assembler's own stage split, one line per call.
     test_timing_file = get(ENV, "BLAB_TEST_FUSED_TIMING", "")
