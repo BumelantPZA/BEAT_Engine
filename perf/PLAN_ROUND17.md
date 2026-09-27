@@ -184,7 +184,7 @@ Accuracy is maxdB against `base`, the stock app environment, under the HANDOFF p
   - M1 shows the CPU does not lead. In that case, park it as a CPU-bound-Mac item.
 
 ### R17-4 Singular kernels: load diet, one launch per pair type
-*[S3 2026-09-27: DONE for prototype2 (`BLAB_TEST_SING_PACKED=2`), 512 threads (stock 384); singular 7.8 -> 2.7 ms, image 3.5 -> 2.9 ms; V-P -5 / -13 ms/freq; 0.0015 dB vs unpacked, above the 0.001 gate: user decision. Coupled SAWMOD kernels not done (M1: CPU leads).]*
+*[S3 2026-09-27: DONE for prototype2 (`BLAB_TEST_SING_PACKED=2`), 512 threads (stock 384); singular 7.8 -> 2.7 ms, image 3.5 -> 2.9 ms; V-P -5 / -13 ms/freq; 0.0015 dB vs unpacked, above the 0.001 gate: approved by the user for the app patch. Coupled SAWMOD kernels not done (M1: CPU leads).]*
 - **Helps:**
   - prototype2: singular 8.8 + image singular 4.2 = 13.0 ms/freq, 22 % of the stage sum.
   - SAWMOD GPU lane: singular 12 + image 2.3 ms.

@@ -27,7 +27,7 @@ Explain accuracy to the user in plain terms (dB change and seconds saved), not m
 - R17-2 done: `BLAB_METAL_PIPELINE=1` (bit-identical; the overlap model underrates the solve). R17-5 done:
   `SING_SPLIT=0.4` (0.0001 dB), `POOL_ZERO2=1` (SAWMOD bit-identical, gain in noise).
 - R17-4 done for prototype2: `SING_PACKED=2`, 512 threads, singular 7.8 -> 2.7 ms; 0.0015 dB vs unpacked
-  (above the 0.001 gate, closer to stock than unpacked): **ask the user before enabling**.
+  (above the 0.001 gate, closer to stock than unpacked): user approved it for the app patch (2026-09-27).
 - R17-7 skipped (M4: no-loads probe -8 % < 15 %). M4 table in NOTES.
 - Cross-code exact checks: `BLAB_TEST_SAVE_RESULTS=<file>` + `perf/cmp_results.py`.
 - App patch draft `perf/app_patches/round17_engine_distribution.diff` (after round 16's); not applied.

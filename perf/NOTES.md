@@ -26,7 +26,7 @@ gather is unchanged. 1 = vertices reloaded per point, 2 = loaded once, 3 = 2 wit
 time. All three 512 threads; 2 and 3 same speed. Same source arithmetic, but 1e-6 relative differences
 (Float32 fast-math codegen, not unrolling: 3 gives the same 0.0024 dB vs r16 at 12 f). Packed is slightly
 *closer* to stock than unpacked (0.0018 vs 0.0021 dB proto2q, 0.0013 vs 0.0015 full), so it is Float32
-noise, but the step gate was 0.001 dB: needs the user's yes.
+noise, but the step gate was 0.001 dB. The user approved it for the app patch (2026-09-27).
 
 **New hooks.** `BLAB_TEST_SING_PROBE` (1 no store, 2 no maths), `BLAB_TEST_FIELD_PROBE` (1 no cis, 2 fixed
 source), PIPEINFO lines `sing_fused_bm`, `sing_packed_n<N>`, `field_fast`, `field_multi_nd<N>`;
