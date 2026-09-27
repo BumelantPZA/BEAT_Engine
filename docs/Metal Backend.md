@@ -493,7 +493,19 @@ state), and any CPU-heavy stage beside MUMPS loses to contention on an M1 Pro.
 
 #### Measured sweep speed
 
-MEASUREMENTS_PLACEHOLDER
+Apple M1 Pro (8 performance + 2 efficiency cores, 16-core GPU), 10 Julia
+threads, `scripts/benchmark_worker.py` with two sweeps in one warm worker; the
+second sweep's wall time, two runs per configuration. Accuracy is the worst
+level error within 30 dB of each output's peak.
+
+| Workload | `main` Metal | This backend | Peak memory | Accuracy |
+| --- | --- | --- | --- | --- |
+| `Multi_region_SAWMOD`, coupled, xy symmetry, 50 frequencies (20 Hz - 20 kHz, log) | 135.9-137.6 s | 25.4-26.0 s (5.3x) | 3.8 GB -> 6.1-6.5 GB | 0.0014 dB against `main` CPU Float64 (`main` Metal: 0.0009 dB) |
+| Waveguide, exterior-only system, quarter symmetry, 200 frequencies | 19.2-20.0 s | 9.7-10.4 s (2.0x) | 1.4 GB -> 1.5 GB | 0.0017 dB against `main` Metal |
+| `test_meshes/sample.msh`, source request, 12 frequencies | 1.9-2.3 s | 1.6-2.2 s | unchanged | 0.0005 dB against `main` Metal |
+
+`main` CPU Float64 takes 1,177 s on the SAWMOD sweep. The memory increase on
+SAWMOD is the pools and the frequency built ahead by the pipeline.
 
 ### Interior solver: UMFPACK, and the Accelerate path that was removed
 

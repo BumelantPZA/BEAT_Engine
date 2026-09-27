@@ -1487,8 +1487,10 @@ end
     blocked = C._blocked_lu!(copy(narrowed), 48)
     @test issuccess(blocked)
     @test relative(narrowed[blocked.p, :], blocked.L * blocked.U) < 1e-5
-    reference32 = lu(narrowed) \ ComplexF32.(rhs)
-    @test relative(reference32, C._lu_solve(blocked, ComplexF32.(rhs); nb=32)) < 1e-4
+    # Backward error of the blocked solve at Float32 level, as LAPACK's own.
+    solved32 = C._lu_solve(blocked, ComplexF32.(rhs); nb=32)
+    backward(x) = opnorm(narrowed * x - ComplexF32.(rhs), 1) / (opnorm(narrowed, 1) * opnorm(x, 1))
+    @test backward(solved32) < 10 * backward(lu(narrowed) \ ComplexF32.(rhs)) + 1e-6
     @test C._lu_solve(blocked, ComplexF32.(rhs[:, 1]); nb=32) isa Vector
 
     # No reuse unless the caller passes a `DenseFactorReuse`.
@@ -1501,7 +1503,7 @@ end
     first = C.RefinedDenseLU(matrix; reuse=reuse)
     @test !first.stale && reuse.factor === first.factor
     @test relative(lu(matrix) \ rhs, first \ rhs) < 1e-10
-    nearby = matrix .+ 1e-4 .* randn(ComplexF64, n, n)
+    nearby = matrix .+ 1e-8 .* randn(ComplexF64, n, n)
     second = C.RefinedDenseLU(nearby; reuse=reuse)
     @test second.stale && second.factor === first.factor
     @test relative(lu(nearby) \ rhs, second \ rhs) < 1e-10

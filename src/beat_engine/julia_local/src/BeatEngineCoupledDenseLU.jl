@@ -5,6 +5,22 @@
 
 const DENSE_REFINEMENT_MAX_ITERATIONS = 10
 
+# A sweep's last fresh ComplexF32 factor, reused as a GMRES preconditioner at later frequencies
+# while the previous stale solve needed at most `DENSE_STALE_REUSE_MAX_ITERATIONS` iterations. A
+# stale solve that has not reached the Float64 backward error after
+# `DENSE_STALE_GMRES_MAX_ITERATIONS` iterations factors afresh and ends reuse for the rest of the
+# sweep: a sweep ascends and the iterations grow with frequency, so on SAWMOD reuse covers
+# 23 Hz - 0.9 kHz and saves the Float32 LU there. The condensed cache owns one per request.
+const DENSE_STALE_GMRES_MAX_ITERATIONS = 15
+const DENSE_STALE_REUSE_MAX_ITERATIONS = 8
+
+mutable struct DenseFactorReuse
+    factor::Union{Nothing,LinearAlgebra.LU{ComplexF32,Matrix{ComplexF32},Vector{LinearAlgebra.BlasInt}}}
+    last_iterations::Int
+    disabled::Bool
+end
+DenseFactorReuse() = DenseFactorReuse(nothing, 0, false)
+
 """
     RefinedDenseLU(matrix)
 
@@ -154,21 +170,6 @@ function _materialize_correction!(refined)
     return refined
 end
 
-# A sweep's last fresh ComplexF32 factor, reused as a GMRES preconditioner at later frequencies
-# while the previous stale solve needed at most `DENSE_STALE_REUSE_MAX_ITERATIONS` iterations. A
-# stale solve that has not reached the Float64 backward error after
-# `DENSE_STALE_GMRES_MAX_ITERATIONS` iterations factors afresh and ends reuse for the rest of the
-# sweep: a sweep ascends and the iterations grow with frequency, so on SAWMOD reuse covers
-# 23 Hz - 0.9 kHz and saves the Float32 LU there. The condensed cache owns one per request.
-const DENSE_STALE_GMRES_MAX_ITERATIONS = 15
-const DENSE_STALE_REUSE_MAX_ITERATIONS = 8
-
-mutable struct DenseFactorReuse
-    factor::Union{Nothing,LinearAlgebra.LU{ComplexF32,Matrix{ComplexF32},Vector{LinearAlgebra.BlasInt}}}
-    last_iterations::Int
-    disabled::Bool
-end
-DenseFactorReuse() = DenseFactorReuse(nothing, 0, false)
 
 # `opnorm(matrix, Inf)` and `maximum(abs, matrix)` in one threaded pass. `opnorm` walks the column-major matrix row by row (~95 ms at n = 3116); here each
 # task owns a block of rows and sweeps it column by column, so every row sum adds the same terms

@@ -2804,14 +2804,14 @@ function solve_request_impl(request; event_mode=false)
     rom_requested = any(
         String(output["quantity"]) in SPEAKER_ROM_QUANTITIES for output in outputs
     )
-    rank_experiment = !isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing))
+    rank_experiment_requested = !isnothing(get(solver_options, "speaker_rom_rank_experiment", nothing))
     # BLAB_COUPLED_DEMAND_RECONSTRUCTION: skip the interior back substitution only when every
     # requested output is known not to read interior FEM pressure.
     reconstruct_interior = !(
         use_condensed_solver &&
         BeatEngineCoupledCondensed._demand_reconstruction_enabled(bem_backend) &&
         !validation_diagnostics &&
-        !rank_experiment &&
+        !rank_experiment_requested &&
         all(String(output["quantity"]) in INTERIOR_FREE_COUPLED_OUTPUTS for output in outputs)
     )
     frequencies = request["frequencies_hz"]
@@ -2835,7 +2835,7 @@ function solve_request_impl(request; event_mode=false)
             transducer_operators=transducer_operators,
             prescribed_bem_normal_velocity=prescribed_bem_normal_velocity,
             # ROM exports and the rank experiment read transducer surfaces from the Schur block.
-            allow_transducer_condensation=!rom_requested && !rank_experiment,
+            allow_transducer_condensation=!rom_requested && !rank_experiment_requested,
             prefetched_operators=prefetched_operators,
             on_operators_ready=on_operators_ready,
             dense_gate=dense_gate,
@@ -2844,7 +2844,7 @@ function solve_request_impl(request; event_mode=false)
     # lane also needs a solve that makes no MUMPS call: zero FEM right-hand sides (voltage drives
     # only) and no interior reconstruction.
     pipeline = if use_condensed_solver && bem_backend == :metal && Threads.nthreads() > 1 &&
-                  length(frequencies) > 1 && !rom_requested && !rank_experiment
+                  length(frequencies) > 1 && !rom_requested && !rank_experiment_requested
         CondensedSweepPipeline(
             length(frequencies);
             fem_lane=!reconstruct_interior && all(excitation -> Symbol(excitation.kind) == :voltage, excitations),

@@ -342,7 +342,7 @@ end
 # Per frequency a small kernel combines them with k and adds the G1 part of each pair on the regular
 # R x R rule (part 1 only), so the gathers are unchanged.
 # Per singular cache (keyed by its `gather_tables` Ref, like the packed tables) and transform.
-const _metal_singular_static = WeakKeyDict{Any,Dict{Tuple{Symbol,Int},Any}}()
+const _metal_singular_static_parts = WeakKeyDict{Any,Dict{Tuple{Symbol,Int},Any}}()
 const _metal_singular_static_lock = ReentrantLock()
 const _METAL_SINGULAR_STATIC_COMPONENTS = 25
 
@@ -431,7 +431,7 @@ end
 function _metal_singular_static(regular_cache, singular_cache, transform, part_count)
     key = (transform.label, part_count)
     lock(_metal_singular_static_lock) do
-        per_cache = get!(() -> Dict{Tuple{Symbol,Int},Any}(), _metal_singular_static, singular_cache.gather_tables)
+        per_cache = get!(() -> Dict{Tuple{Symbol,Int},Any}(), _metal_singular_static_parts, singular_cache.gather_tables)
         get!(per_cache, key) do
             pair_count = singular_cache.pair_count
             static = Metal.zeros(Float32, pair_count * part_count * _METAL_SINGULAR_STATIC_COMPONENTS)
@@ -614,7 +614,7 @@ function _release_metal_fused_singular_tables!(singular_cache)
         Metal.unsafe_free!(tables.rule_points4)
         Metal.unsafe_free!(tables.vertices4)
     end
-    static = lock(() -> pop!(_metal_singular_static, key, nothing), _metal_singular_static_lock)
+    static = lock(() -> pop!(_metal_singular_static_parts, key, nothing), _metal_singular_static_lock)
     static === nothing || foreach(Metal.unsafe_free!, values(static))
     return nothing
 end
