@@ -27,6 +27,7 @@ function _assemble_regular_galerkin_operators_metal_native(
     singular_cache,
     metal_singular_cache,
     symmetry_mode::Symbol,
+    options::MetalAssemblyOptions,
 ) where {T<:AbstractFloat}
     normalized_mode = normalized_symmetry_mode(symmetry_mode)
     native_cache = cache === nothing ? build_metal_regular_assembly_cache(
@@ -42,11 +43,20 @@ function _assemble_regular_galerkin_operators_metal_native(
     native_cache.symmetry_mode == normalized_mode ||
         error("Metal assembly cache symmetry mode $(native_cache.symmetry_mode) does not match requested $(normalized_mode).")
     singular_mode = _normalized_metal_singular_mode()
+    regular_kernel_mode = something(options.regular_kernel_mode, _normalized_metal_regular_kernel_mode())
+    combined = !isnothing(options.bm_coupling)
+    combined && !metal_combined_assembly_supported(regular_kernel_mode) && error(
+        "Combined Metal Burton-Miller assembly needs the pair_tilereduce kernels, " *
+        "BLAB_METAL_SINGULAR_MODE=native and BLAB_METAL_SINGULAR_WRITEBACK=gather.",
+    )
 
     operators = nothing
     storage = metal_operator_storage_mode()
     allocation_elapsed = @elapsed begin
-        operators = (
+        p1n, dp0n = p1_space.global_dof_count, dp0_space.global_dof_count
+        pooled = storage == Metal.SharedStorage ?
+                 _take_pooled_operators(((p1n, dp0n), (p1n, p1n), (p1n, dp0n), (p1n, p1n)), combined) : nothing
+        operators = !isnothing(pooled) ? pooled : (
             single_layer=Metal.zeros(Complex{T}, p1_space.global_dof_count, dp0_space.global_dof_count; storage=storage),
             double_layer=Metal.zeros(Complex{T}, p1_space.global_dof_count, p1_space.global_dof_count; storage=storage),
             adjoint_double_layer=Metal.zeros(Complex{T}, p1_space.global_dof_count, dp0_space.global_dof_count; storage=storage),
@@ -56,7 +66,6 @@ function _assemble_regular_galerkin_operators_metal_native(
     end
     timing !== nothing && (timing["metal_native_operator_alloc"] = allocation_elapsed)
 
-    regular_kernel_mode = _normalized_metal_regular_kernel_mode()
     # In host singular mode the image regular kernels must integrate every
     # image pair with the regular rule (skip_mode 2), because the CPU image
     # correction is a Duffy-minus-regular delta. In native mode they skip the
@@ -70,10 +79,14 @@ function _assemble_regular_galerkin_operators_metal_native(
             _launch_metal_regular_atomic_kernels!(operators, native_cache, k)
         elseif regular_kernel_mode == :pair_gather
             _launch_metal_regular_gather_kernels!(operators, native_cache, k)
+        elseif regular_kernel_mode == :pair_tilereduce
+            # Also runs every symmetry image, summed in the same pair blocks.
+            _launch_metal_tilereduce_kernels!(operators, native_cache, k, skip_image_singular, options)
         else
             _launch_metal_regular_entry_kernels!(operators, native_cache, k)
         end
         for (transform, image_cache) in zip(native_cache.image_transforms, native_cache.image_singular_caches)
+            regular_kernel_mode == :pair_tilereduce && break
             if regular_kernel_mode == :pair_owned
                 _launch_metal_symmetry_regular_pair_kernels!(
                     operators,
@@ -135,8 +148,8 @@ function _assemble_regular_galerkin_operators_metal_native(
             end
         end
         timing !== nothing && (timing["metal_native_singular_cache"] = cache_elapsed)
-        singular_launch! = regular_kernel_mode in (:pair_atomic, :pair_gather) ?
-            _launch_metal_singular_block_scatter_kernels! :
+        singular_launch! = regular_kernel_mode in (:pair_atomic, :pair_gather, :pair_tilereduce) ?
+            (args...) -> _launch_metal_singular_block_scatter_kernels!(args...; bm_coupling=options.bm_coupling) :
             _launch_metal_singular_block_gather_kernels!
         singular_elapsed = @elapsed begin
             singular_launch!(operators, native_cache, device_singular_cache, k)
@@ -172,7 +185,7 @@ function _assemble_regular_galerkin_operators_metal_native(
         timing !== nothing && (timing["metal_host_singular_corrections"] = host_elapsed)
         singular_pairs = correction_cache.pair_count
     end
-    weight_elapsed = @elapsed _apply_metal_operator_p1_row_weights!(operators, mesh, normalized_mode)
+    weight_elapsed = @elapsed (options.apply_row_weights && _apply_metal_operator_p1_row_weights!(operators, mesh, normalized_mode))
     timing !== nothing && (timing["metal_native_symmetry_row_weights"] = weight_elapsed)
     total_pairs = length(indices) * length(indices)
     image_count = length(native_cache.image_transforms)
@@ -180,7 +193,8 @@ function _assemble_regular_galerkin_operators_metal_native(
     color_count = length(native_cache.color_offsets) - 1
     kernel_name = regular_kernel_mode == :pair_owned ? "colored_pair_owned" :
         regular_kernel_mode == :pair_atomic ? "fused_pair_atomic" :
-        regular_kernel_mode == :pair_gather ? "chunked_pair_gather" : "entry_owned"
+        regular_kernel_mode == :pair_gather ? "chunked_pair_gather" :
+        regular_kernel_mode == :pair_tilereduce ? "chunked_pair_tilereduce" : "entry_owned"
     mode_name = "metal_native_" * kernel_name * (singular_mode == :native ? "" : "_host_singular")
     return merge(
         operators,
@@ -200,6 +214,7 @@ function _assemble_regular_galerkin_operators_metal_native(
                 2 * (image_count + 1) * color_count^2 :
                 regular_kernel_mode == :pair_atomic ? (image_count + 1) :
                 regular_kernel_mode == :pair_gather ? 3 * (image_count + 1) * _metal_gather_chunk_count(native_cache) :
+                regular_kernel_mode == :pair_tilereduce ? (image_count + 3) * _metal_tilereduce_tables_for(native_cache).chunk_count :
                 2 * (image_count + 1),
             regular_kernel_mode=mode_name,
             regular_assembly_mode=Symbol(mode_name),
@@ -225,8 +240,10 @@ function assemble_regular_galerkin_operators_metal_regular(
     metal_singular_cache=nothing,
     assembly_mode=nothing,
     symmetry_mode::Symbol=:off,
+    options::Union{Nothing,MetalAssemblyOptions}=nothing,
 ) where {T<:AbstractFloat}
     _require_metal!()
+    options = something(options, MetalAssemblyOptions())
     k = outgoing_wavenumber(k)
     return_device || error("Metal assembly requires return_device=true.")
     accelerator_quadrature || error("Metal assembly requires accelerator_quadrature=true.")
@@ -247,8 +264,11 @@ function assemble_regular_galerkin_operators_metal_regular(
             singular_cache=singular_cache,
             metal_singular_cache=metal_singular_cache,
             symmetry_mode=symmetry_mode,
+            options=options,
         )
     end
+    isnothing(options.bm_coupling) && isnothing(options.flux_mask) && options.apply_row_weights ||
+        error("Combined operators, flux masks and host row weights need native Metal assembly.")
     metal_singular_cache === nothing ||
         error("Native Metal singular-correction caches are not supported by the host-staged backend.")
 

@@ -660,7 +660,8 @@ function _launch_metal_singular_block_scatter_kernels!(
     regular_cache::MetalRegularAssemblyCache,
     singular_cache::MetalSingularCorrectionCache,
     k,
-    transform::SymmetryTransform=SymmetryTransform(:identity, SVector{3,Int}(1, 1, 1), 1),
+    transform::SymmetryTransform=SymmetryTransform(:identity, SVector{3,Int}(1, 1, 1), 1);
+    bm_coupling::Union{Nothing,ComplexF32}=nothing,
 )
     pair_count = singular_cache.pair_count
     pair_count == 0 && return nothing
@@ -694,6 +695,7 @@ function _launch_metal_singular_block_scatter_kernels!(
         sx, sy, sz, csx, csy, csz,
     )
     if gather_tables === nothing
+        isnothing(bm_coupling) || error("Combined Metal assembly needs BLAB_METAL_SINGULAR_WRITEBACK=gather.")
         _metal_launch(
             _metal_singular_block_scatter_kernel!,
             pair_count,
@@ -705,6 +707,24 @@ function _launch_metal_singular_block_scatter_kernels!(
             singular_cache.test_indices, singular_cache.trial_indices,
             regular_cache.p1_dofs, regular_cache.element_dp0_dofs,
             pair_count, part_count, regular_cache.p1_dof_count, regular_cache.face_count,
+        )
+    elseif !isnothing(bm_coupling)
+        beta = bm_coupling
+        row_map = gather_tables.p1_dp0
+        _metal_launch(
+            _metal_singular_combined_gather_kernel!,
+            row_map.entry_count,
+            operators.single_layer, slp_values, adjoint_values, -1.0f0, -real(beta), -imag(beta),
+            row_map.entry_indices, row_map.contrib_offsets, row_map.contrib_values,
+            row_map.entry_count, pair_count, part_count,
+        )
+        block_map = gather_tables.p1_p1
+        _metal_launch(
+            _metal_singular_combined_gather_kernel!,
+            block_map.entry_count,
+            operators.double_layer, dlp_values, hypersingular_values, -1.0f0, real(beta), imag(beta),
+            block_map.entry_indices, block_map.contrib_offsets, block_map.contrib_values,
+            block_map.entry_count, pair_count, part_count,
         )
     else
         # One thread per touched cell instead of one per pair: no atomics, and

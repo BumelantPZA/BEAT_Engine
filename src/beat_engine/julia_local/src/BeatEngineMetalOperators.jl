@@ -10,6 +10,56 @@
 
 const _METAL_OPERATOR_KEYS = (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
 
+# Released operator buffers are kept for the next assembly of the same shape instead of freed, and
+# zeroed on the GPU there: allocating and faulting in four dense operators cost ~0.02 s per
+# frequency. Two sets, so a sweep can assemble the next frequency while it still holds the current
+# one's operators.
+const _METAL_OPERATOR_POOL = Any[]
+const _METAL_OPERATOR_POOL_LOCK = ReentrantLock()
+const _METAL_OPERATOR_POOL_SIZE = 2
+# A combined assembly writes only `single_layer` and `double_layer`, so a pooled set whose other two
+# buffers are known to be zero needs only the written two zeroed. Keyed by the set's
+# `adjoint_double_layer` buffer.
+const _METAL_POOL_AUXILIARY_ZERO = IdDict{Any,Bool}()
+
+"""
+    release_metal_operator_pool!()
+
+Free the pooled operator buffers (up to `_METAL_OPERATOR_POOL_SIZE` dense operator sets). The
+worker calls it when it reclaims accelerator memory.
+"""
+function release_metal_operator_pool!()
+    pooled = lock(_METAL_OPERATOR_POOL_LOCK) do
+        sets = copy(_METAL_OPERATOR_POOL)
+        empty!(_METAL_OPERATOR_POOL)
+        empty!(_METAL_POOL_AUXILIARY_ZERO)
+        sets
+    end
+    for set in pooled, key in _METAL_OPERATOR_KEYS
+        Metal.unsafe_free!(getfield(set, key))
+    end
+    return nothing
+end
+
+function _take_pooled_operators(sizes, combined::Bool)
+    pooled = lock(_METAL_OPERATOR_POOL_LOCK) do
+        isempty(_METAL_OPERATOR_POOL) ? nothing : pop!(_METAL_OPERATOR_POOL)
+    end
+    isnothing(pooled) && return nothing
+    if map(key -> size(getfield(pooled, key)), _METAL_OPERATOR_KEYS) != sizes
+        lock(() -> delete!(_METAL_POOL_AUXILIARY_ZERO, pooled.adjoint_double_layer), _METAL_OPERATOR_POOL_LOCK)
+        foreach(key -> Metal.unsafe_free!(getfield(pooled, key)), _METAL_OPERATOR_KEYS)
+        return nothing
+    end
+    auxiliary_zero = combined &&
+        lock(() -> get(_METAL_POOL_AUXILIARY_ZERO, pooled.adjoint_double_layer, false), _METAL_OPERATOR_POOL_LOCK)
+    keys = auxiliary_zero ? (:single_layer, :double_layer) : _METAL_OPERATOR_KEYS
+    foreach(key -> fill!(getfield(pooled, key), zero(eltype(getfield(pooled, key)))), keys)
+    # After this assembly the other two buffers stay zero only if it is a combined one.
+    lock(() -> (_METAL_POOL_AUXILIARY_ZERO[pooled.adjoint_double_layer] = combined), _METAL_OPERATOR_POOL_LOCK)
+    return pooled
+end
+
 """
     release_operator_storage!(operators)
 
@@ -23,6 +73,11 @@ tuple while host views over it are still in use leaves those views dangling.
 function release_operator_storage!(operators::NamedTuple)
     backing = get(operators, :metal_backing, nothing)
     if backing !== nothing
+        kept = lock(_METAL_OPERATOR_POOL_LOCK) do
+            length(_METAL_OPERATOR_POOL) < _METAL_OPERATOR_POOL_SIZE && (push!(_METAL_OPERATOR_POOL, backing); true)
+        end
+        kept === true && return nothing
+        lock(() -> delete!(_METAL_POOL_AUXILIARY_ZERO, backing.adjoint_double_layer), _METAL_OPERATOR_POOL_LOCK)
         for key in _METAL_OPERATOR_KEYS
             Metal.unsafe_free!(getfield(backing, key))
         end

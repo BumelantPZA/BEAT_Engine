@@ -928,3 +928,43 @@ function _metal_add_host_singular_corrections!(
     end
     return image_singular_pairs
 end
+
+# `_metal_singular_pair_gather_kernel!` into one combined Burton-Miller operator:
+# target += f * first + g * second (f real, g complex).
+function _metal_singular_combined_gather_kernel!(
+    target,
+    first_values,
+    second_values,
+    first_scale,
+    second_re,
+    second_im,
+    entry_indices,
+    contrib_offsets,
+    contrib_values,
+    entry_count,
+    pair_count,
+    part_count,
+)
+    index = _metal_global_linear_index()
+    index > entry_count && return nothing
+    @inbounds begin
+        position = Int(contrib_offsets[index])
+        position_stop = Int(contrib_offsets[index + 1]) - 1
+        first_sum = zero(eltype(first_values))
+        second_sum = zero(eltype(second_values))
+        while position <= position_stop
+            value_index = Int(contrib_values[position])
+            part = 1
+            while part <= part_count
+                first_sum += first_values[value_index]
+                second_sum += second_values[value_index]
+                value_index += pair_count
+                part += 1
+            end
+            position += 1
+        end
+        entry_index = Int(entry_indices[index])
+        target[entry_index] += first_scale * first_sum + Complex(second_re, second_im) * second_sum
+    end
+    return nothing
+end

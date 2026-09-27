@@ -1227,6 +1227,7 @@ function assemble_regular_galerkin_operators(
     device_image_near_correction_cache=nothing,
     rocm_assembly_mode=nothing,
     metal_assembly_mode=nothing,
+    metal_options=nothing,
     symmetry_mode::Symbol=:off,
 ) where {T<:AbstractFloat}
     if backend == :cpu
@@ -1316,6 +1317,7 @@ function assemble_regular_galerkin_operators(
             metal_singular_cache=device_singular_cache,
             assembly_mode=metal_assembly_mode,
             symmetry_mode=symmetry_mode,
+            options=metal_options,
         )
     end
 
