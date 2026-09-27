@@ -22,6 +22,17 @@ Explain accuracy to the user in plain terms (dB change and seconds saved), not m
   off at 10-20 kHz at the quietest points of the 60 dB window (Float32 summation). A max-dB limit of
   0.01 there is below what Float32 can deliver; compare against stock, not against zero.
 
+## Status round 17 S3 (2026-09-27, NOTES "Round 17 S3")
+- prototype2 quarter, 200 freqs: stock 0.070, r16 0.054, **S3 0.040 s/freq** (-26 %), 0.0019 dB vs stock.
+- R17-2 done: `BLAB_METAL_PIPELINE=1` (bit-identical; the overlap model underrates the solve). R17-5 done:
+  `SING_SPLIT=0.4` (0.0001 dB), `POOL_ZERO2=1` (SAWMOD bit-identical, gain in noise).
+- R17-4 done for prototype2: `SING_PACKED=2`, 512 threads, singular 7.8 -> 2.7 ms; 0.0015 dB vs unpacked
+  (above the 0.001 gate, closer to stock than unpacked): **ask the user before enabling**.
+- R17-7 skipped (M4: no-loads probe -8 % < 15 %). M4 table in NOTES.
+- Cross-code exact checks: `BLAB_TEST_SAVE_RESULTS=<file>` + `perf/cmp_results.py`.
+- App patch draft `perf/app_patches/round17_engine_distribution.diff` (after round 16's); not applied.
+- Next: SAWMOD CPU chain (R17-3 micro, R17-6), per M1. quick.py still running (user stops it).
+
 ## Status round 17 S2 (2026-09-27, NOTES "Round 17 S2")
 - R17-1 **stopped after steps 1-3**: user declined extending BeatEngineMetalBundle (deps + julia_metal re-resolve).
   R17-1c declined too. R17-1b not needed (Y ~4.5 s).

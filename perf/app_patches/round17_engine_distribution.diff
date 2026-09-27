@@ -1,0 +1,18 @@
+--- a/src/blab/solvers/engine_distribution.py
++++ b/src/blab/solvers/engine_distribution.py
+@@ -104,6 +104,17 @@
+         "BLAB_TEST_FUSED_IMAGE_ACC": "1",
+         "BLAB_TEST_FUSED_PACKED": "2",
+         "BLAB_TEST_FIELD_MULTI": "1",
++        # Round 17 S3 (DRAFT, apply after round16_engine_distribution.diff). Exterior-only projects:
++        # overlap the host solve with the next assembly (the auto model misjudges the solve at 1.9 ms
++        # vs ~8 ms; bit-identical), the split singular rule below k h = 0.4 (0.0001 dB), and the packed
++        # singular kernel (0.0015 dB vs unpacked; USER DECISION PENDING, the step gate was 0.001 dB).
++        # prototype2 quarter, 200 freqs: 0.054 -> 0.040 s/freq; stock 0.070. 0.0019 dB vs stock.
++        # The operator pool zeroes only the buffers a combined BM assembly writes (SAWMOD, bit-identical).
++        "BLAB_METAL_PIPELINE": "1",
++        "BLAB_TEST_SING_SPLIT": "0.4",
++        "BLAB_TEST_SING_PACKED": "2",
++        "BLAB_TEST_POOL_ZERO2": "1",
+     }
+ }

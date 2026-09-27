@@ -156,6 +156,7 @@ Accuracy is maxdB against `base`, the stock app environment, under the HANDOFF p
 - **R17-1c (app change, Q1):** pre-start the worker and run a warm-up solve when a project opens. That hides the rest of the cold start whenever the user waits about a minute before solving.
 
 ### R17-2 prototype2: close the gap between GPU work and wall time (exterior pipeline)
+*[S3 2026-09-27: DONE, switch only. `BLAB_METAL_PIPELINE=1` confirmed on V-P, bit-identical to r16: proto2q 50 0.057 -> 0.047, proto2 full 0.241 -> 0.240 s/freq. The model's solve estimate (1.9 ms vs ~8 ms) left as is.]*
 - **Helps:** prototype2 and every exterior-only project.
 - **Gain:** at most 6-8 ms/freq (58-60 wall minus the 52.4 stage sum), i.e. up to -10-13 %, or -1.2-1.6 s per 200 freqs. M2 gives the real number.
 - **Accuracy:** exact. The sweep keeps the BLAS thread count the same with or without overlap (comment at `coupled_solver.jl` ~l.1089).
@@ -183,6 +184,7 @@ Accuracy is maxdB against `base`, the stock app environment, under the HANDOFF p
   - M1 shows the CPU does not lead. In that case, park it as a CPU-bound-Mac item.
 
 ### R17-4 Singular kernels: load diet, one launch per pair type
+*[S3 2026-09-27: DONE for prototype2 (`BLAB_TEST_SING_PACKED=2`), 512 threads (stock 384); singular 7.8 -> 2.7 ms, image 3.5 -> 2.9 ms; V-P -5 / -13 ms/freq; 0.0015 dB vs unpacked, above the 0.001 gate: user decision. Coupled SAWMOD kernels not done (M1: CPU leads).]*
 - **Helps:**
   - prototype2: singular 8.8 + image singular 4.2 = 13.0 ms/freq, 22 % of the stage sum.
   - SAWMOD GPU lane: singular 12 + image 2.3 ms.
@@ -198,6 +200,7 @@ Accuracy is maxdB against `base`, the stock app environment, under the HANDOFF p
 - **Stop if:** PIPEINFO already reaches >= 768 threads and the no-maths probe is < 30 % faster, or the first variant doesn't save >= 2 ms/freq on proto2q.
 
 ### R17-5 Switch on cheap existing items (after re-measuring)
+*[S3 2026-09-27: DONE. `SING_SPLIT=0.4` kept (-2-3 ms/freq at 200 freqs, 0.0001 dB; 0.6 same speed, 0.0004 dB). COMBINED_BM zeroing fixed as `BLAB_TEST_POOL_ZERO2=1`, SAWMOD bit-identical, gain inside SAWMOD noise. TY8 not re-tested.]*
 - **Items:**
   - `BLAB_TEST_SING_SPLIT=0.4/0.6` (exterior). T5 measured ~2-3 ms/freq on the low-frequency part and 0.0004 dB at 0.6, which is in the "may be switched on" band.
   - `BLAB_METAL_TILEREDUCE_TY=8`: SAWMOD GPU -9 ms alone, bit-identical. New reason to retry: R16 judged it inside the noise with 1 round and before FIELD_MULTI; M1 has 3 rounds.
@@ -222,6 +225,7 @@ Accuracy is maxdB against `base`, the stock app environment, under the HANDOFF p
 - **Stop if:** the guide forbids it, or the micro saves < 5 ms.
 
 ### R17-7 Field kernel: two points per thread (gated by a probe)
+*[S3 2026-09-27: SKIPPED. M4: FIELD_PROBE=2 (no loads) only 8 % faster (< 15 %); no cis 10 %; field kernels already at 1024 threads.]*
 - **Helps:** the prototype2 field (12.6 ms/freq) and SAWMOD's field (~40 ms, GPU lane).
 - **Gain:**
   - 216.7 M (point, source) evaluations in 12.6 ms is ~17 G/s. On the 16-core GPU (~2.65 T lane-cycles/s) that is ~150 lane-cycles per evaluation, which looks mostly ALU-bound.

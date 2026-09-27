@@ -1,5 +1,40 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
+## Round 17 S3 (2026-09-27): prototype2 GPU lane (R17-2, R17-5, M4, R17-4; R17-7 skipped)
+All configs carry the round 16 exterior switches (r16). Checkpoint tag metal-test-round17-pre-s3.
+| Step | Config | proto2q s/freq | proto2 full s/freq | maxdB |
+|---|---|---|---|---|
+| R17-2 | r16 -> `BLAB_METAL_PIPELINE=1` (50 f / 12 f, 2 rounds) | 0.057 -> 0.047 | 0.241 -> 0.240 | 0 vs r16 (all values identical) |
+| R17-5 | pipe1 -> `SING_SPLIT=0.4` / `0.6` (200 f, 2 rounds) | 0.045-0.046 -> 0.043 / 0.043-0.044 | | 0.0001 / 0.0004 vs pipe1 |
+| R17-5 | SAWMOD 12 f: `BLAB_TEST_POOL_ZERO2=1` (COMBINED_BM zeroes 2 of 4 buffers) | SAWMOD 0.814 -> 0.804 (noise) | | 0, bit-identical |
+| R17-4 | pipe1+split4 -> `SING_PACKED=2` (V-P) | 0.046 -> 0.041 | 0.235 -> 0.222 | 0.0015 / 0.0009 vs unpacked |
+| all | 200 f, 2 rounds: stock / r16 / pipe1+split4+packed2 | 0.070 / 0.054 / **0.040** | | 0.0019 vs stock (r16 0.0022) |
+
+**M4 probes** (proto2q 12 f, 2 rounds, r16, synced stage timers; probes give wrong results by design):
+| kernel | maxThreads | base ms | per-probe ms |
+|---|---|---|---|
+| `_metal_singular_fused_bm_blocks_kernel!` (sing_blocks) | 384 | 8.6 | no store 8.5, no maths 1.15 (-87 %) |
+| image singular (same launch, image transforms) | | 3.5 | no maths 2.45 |
+| `_metal_fast_field_kernel!` (field_s) | 1024 | 14.3 | no cis 12.9 (-10 %), no loads 13.2 (-8 %) |
+| `_test_multi_field_kernel!` (SAWMOD, nd 3) | 1024 | | not probed |
+R17-4 gate passed (384 < 768, no maths -87 %). R17-7 gate failed (no loads -8 % < 15 %): skipped.
+
+**R17-4 details.** `BLAB_TEST_SING_PACKED` (Float32): pairs grouped once per singular cache by rule length
+(prototype2 has 512 / 1280 / 1536 points), one launch per group with point and part counts as Vals, float4
+rule points (test xi, eta, trial xi, eta), float4 vertices / normals / curls; stock output layout, so the
+gather is unchanged. 1 = vertices reloaded per point, 2 = loaded once, 3 = 2 with the loop bound read at run
+time. All three 512 threads; 2 and 3 same speed. Same source arithmetic, but 1e-6 relative differences
+(Float32 fast-math codegen, not unrolling: 3 gives the same 0.0024 dB vs r16 at 12 f). Packed is slightly
+*closer* to stock than unpacked (0.0018 vs 0.0021 dB proto2q, 0.0013 vs 0.0015 full), so it is Float32
+noise, but the step gate was 0.001 dB: needs the user's yes.
+
+**New hooks.** `BLAB_TEST_SING_PROBE` (1 no store, 2 no maths), `BLAB_TEST_FIELD_PROBE` (1 no cis, 2 fixed
+source), PIPEINFO lines `sing_fused_bm`, `sing_packed_n<N>`, `field_fast`, `field_multi_nd<N>`;
+`BLAB_TEST_SAVE_RESULTS=<file>` (every emitted result as a JSON line) + `perf/cmp_results.py a b` (exact /
+maxrel / maxdB across jobs, e.g. old code vs new code: probes off were bit-identical on proto2q and SAWMOD).
+Pitfall: `quick.py` compares only within a job and dumps no outputs; use SAVE_RESULTS for cross-code checks.
+App patch draft: `perf/app_patches/round17_engine_distribution.diff` (after round 16's).
+
 ## Round 17 S2 (2026-09-27): R17-1 split done, bundle not extended (user declined the dependency change)
 Gate: M3 X ~60/45 s >= 15 s, so R17-1 went ahead; Y ~4.5 s < 10 s, so no R17-1b micro. R17-1c declined.
 Done (commit 55db2b5): `julia_local/BeatEngineCoupledWorker.jl` = the coupled engine as a module (exports
