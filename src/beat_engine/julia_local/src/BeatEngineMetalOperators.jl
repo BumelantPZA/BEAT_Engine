@@ -10,53 +10,70 @@
 
 const _METAL_OPERATOR_KEYS = (:single_layer, :double_layer, :adjoint_double_layer, :hypersingular)
 
-# Test (BLAB_TEST_OP_POOL=1): released operator buffers are kept for the next assembly of the same
-# shape instead of freed, and zeroed on the GPU there (allocation was ~0.02 s/freq). Two sets: with
-# the test prefetch, frequency i+1's operators are assembled while frequency i's are still held.
-const _TEST_OPERATOR_POOL = Any[]
-const _TEST_OPERATOR_POOL_LOCK = ReentrantLock()
-_test_operator_pool_enabled() = get(ENV, "BLAB_TEST_OP_POOL", "0") == "1"
-# Test (BLAB_TEST_POOL_ZERO2=1): a combined Burton-Miller assembly (BLAB_TEST_COMBINED_BM) writes only
-# `single_layer` and `double_layer`, so a pooled set whose other two buffers were zeroed and then only
-# used by combined assemblies needs just the two written ones zeroed. Keyed by the
-# `adjoint_double_layer` buffer: true while that set's adjoint and hypersingular buffers are known zero.
-const _TEST_POOL_AUX_ZERO = IdDict{Any,Bool}()
-function _test_take_pooled_operators(sizes)
-    _test_operator_pool_enabled() || return nothing
-    pooled = lock(_TEST_OPERATOR_POOL_LOCK) do
-        isempty(_TEST_OPERATOR_POOL) ? nothing : pop!(_TEST_OPERATOR_POOL)
+"""
+    MetalAssemblyOptions(; bm_coupling=nothing, flux_mask=nothing, apply_row_weights=true)
+
+Per-assembly options for a caller that consumes the operators on the host and forms the
+Burton-Miller system itself (the condensed coupled builder).
+
+- `bm_coupling`: the Burton-Miller coupling `β`. When set, the kernels write the combined
+  operators `A = -D + βH` into `double_layer` and `C = -S - βK'` into `single_layer`, as the
+  CUDA backend's combined assembly does; `adjoint_double_layer` and `hypersingular` stay zero.
+  Needs `metal_combined_assembly_supported()`.
+- `flux_mask`: an `Int32` device vector over the DP0 columns. Columns marked 0 carry no flux, so
+  the tile-reduce S/K' gather skips them; the caller must not read them.
+- `apply_row_weights`: `false` leaves the symmetry row weights to the caller, which can fold them
+  into its own pass over the operators instead of a separate GPU pass.
+"""
+Base.@kwdef struct MetalAssemblyOptions
+    bm_coupling::Union{Nothing,ComplexF32} = nothing
+    flux_mask::Any = nothing
+    apply_row_weights::Bool = true
+end
+
+"""
+    metal_combined_assembly_supported()
+
+Whether non-default `MetalAssemblyOptions` are available with the current settings: only native
+assembly with the `pair_tilereduce` kernels and the native gather write-back of the singular pairs
+forms the combined operators and honours the flux mask.
+"""
+metal_combined_assembly_supported() =
+    _normalized_metal_assembly_mode(nothing) == :native &&
+    _normalized_metal_regular_kernel_mode() == :pair_tilereduce &&
+    _normalized_metal_singular_mode() == :native &&
+    _normalized_metal_singular_writeback() == :gather
+
+# Released operator buffers are kept for the next assembly of the same shape instead of freed, and
+# zeroed on the GPU there: allocating and faulting in four dense operators cost ~0.02 s per
+# frequency. Two sets, so a sweep can assemble the next frequency while it still holds the current
+# one's operators.
+const _METAL_OPERATOR_POOL = Any[]
+const _METAL_OPERATOR_POOL_LOCK = ReentrantLock()
+const _METAL_OPERATOR_POOL_SIZE = 2
+# A combined assembly writes only `single_layer` and `double_layer`, so a pooled set whose other two
+# buffers are known to be zero needs only the written two zeroed. Keyed by the set's
+# `adjoint_double_layer` buffer.
+const _METAL_POOL_AUXILIARY_ZERO = IdDict{Any,Bool}()
+
+function _take_pooled_operators(sizes, combined::Bool)
+    pooled = lock(_METAL_OPERATOR_POOL_LOCK) do
+        isempty(_METAL_OPERATOR_POOL) ? nothing : pop!(_METAL_OPERATOR_POOL)
     end
     isnothing(pooled) && return nothing
     if map(key -> size(getfield(pooled, key)), _METAL_OPERATOR_KEYS) != sizes
-        lock(() -> delete!(_TEST_POOL_AUX_ZERO, pooled.adjoint_double_layer), _TEST_OPERATOR_POOL_LOCK)
+        lock(() -> delete!(_METAL_POOL_AUXILIARY_ZERO, pooled.adjoint_double_layer), _METAL_OPERATOR_POOL_LOCK)
         foreach(key -> Metal.unsafe_free!(getfield(pooled, key)), _METAL_OPERATOR_KEYS)
         return nothing
     end
-    combined = get(ENV, "BLAB_TEST_POOL_ZERO2", "0") == "1" && !isnothing(_TEST_COMBINED_BM[])
-    aux_zero = combined && lock(() -> get(_TEST_POOL_AUX_ZERO, pooled.adjoint_double_layer, false), _TEST_OPERATOR_POOL_LOCK)
-    keys = aux_zero ? (:single_layer, :double_layer) : _METAL_OPERATOR_KEYS
+    auxiliary_zero = combined &&
+        lock(() -> get(_METAL_POOL_AUXILIARY_ZERO, pooled.adjoint_double_layer, false), _METAL_OPERATOR_POOL_LOCK)
+    keys = auxiliary_zero ? (:single_layer, :double_layer) : _METAL_OPERATOR_KEYS
     foreach(key -> fill!(getfield(pooled, key), zero(eltype(getfield(pooled, key)))), keys)
     # After this assembly the other two buffers stay zero only if it is a combined one.
-    lock(() -> (_TEST_POOL_AUX_ZERO[pooled.adjoint_double_layer] = combined), _TEST_OPERATOR_POOL_LOCK)
+    lock(() -> (_METAL_POOL_AUXILIARY_ZERO[pooled.adjoint_double_layer] = combined), _METAL_OPERATOR_POOL_LOCK)
     return pooled
 end
-
-# Test (BLAB_TEST_HOST_ROW_WEIGHTS=1): set by the condensed builder around its own assembly, which
-# then folds the symmetry row weights into its host Burton-Miller combine instead of a GPU pass.
-const _TEST_DEFER_ROW_WEIGHTS = Ref(false)
-
-# Test (BLAB_TEST_FLUX_SKIP=1): Int32 device mask over DP0 columns, set by the condensed builder
-# around its own assembly. The tile-reduce S/K' gather skips columns whose face carries no flux
-# (the builder only multiplies S/K' by flux matrices whose rows there are zero).
-const _TEST_FLUX_MASK = Ref{Any}(nothing)
-const _TEST_FLUX_MASK_DUMMY = Ref{Any}(nothing)
-
-# Test (BLAB_TEST_COMBINED_BM=1): the Burton-Miller coupling β (Complex{Float32}), set by the
-# condensed builder around its own assembly. The tile-reduce kernels and the singular gather then
-# write A = -D + βH into `double_layer` and C = -S - βK' into `single_layer` (CUDA's combined
-# assembly); `adjoint_double_layer` and `hypersingular` stay zero. Row weights and identity terms
-# are the builder's.
-const _TEST_COMBINED_BM = Ref{Any}(nothing)
 
 """
     release_operator_storage!(operators)
@@ -71,13 +88,11 @@ tuple while host views over it are still in use leaves those views dangling.
 function release_operator_storage!(operators::NamedTuple)
     backing = get(operators, :metal_backing, nothing)
     if backing !== nothing
-        if _test_operator_pool_enabled()
-            kept = lock(_TEST_OPERATOR_POOL_LOCK) do
-                length(_TEST_OPERATOR_POOL) < 2 && (push!(_TEST_OPERATOR_POOL, backing); true)
-            end
-            kept === true && return nothing
-            lock(() -> delete!(_TEST_POOL_AUX_ZERO, backing.adjoint_double_layer), _TEST_OPERATOR_POOL_LOCK)
+        kept = lock(_METAL_OPERATOR_POOL_LOCK) do
+            length(_METAL_OPERATOR_POOL) < _METAL_OPERATOR_POOL_SIZE && (push!(_METAL_OPERATOR_POOL, backing); true)
         end
+        kept === true && return nothing
+        lock(() -> delete!(_METAL_POOL_AUXILIARY_ZERO, backing.adjoint_double_layer), _METAL_OPERATOR_POOL_LOCK)
         for key in _METAL_OPERATOR_KEYS
             Metal.unsafe_free!(getfield(backing, key))
         end

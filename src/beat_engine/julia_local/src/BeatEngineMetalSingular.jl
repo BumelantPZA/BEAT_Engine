@@ -82,6 +82,7 @@ function release_metal_singular_correction_cache!(cache::MetalSingularCorrection
     Metal.unsafe_free!(cache.rule_test_points)
     Metal.unsafe_free!(cache.rule_trial_points)
     Metal.unsafe_free!(cache.rule_weights)
+    _release_metal_fused_singular_tables!(cache)
     tables = cache.gather_tables[]
     tables isa MetalSingularGatherTables && _metal_release_singular_gather_tables!(tables)
     cache.gather_tables[] = nothing
@@ -929,9 +930,9 @@ function _metal_add_host_singular_corrections!(
     return image_singular_pairs
 end
 
-# Test (BLAB_TEST_COMBINED_BM): `_metal_singular_pair_gather_kernel!` into one combined operator,
+# `_metal_singular_pair_gather_kernel!` into one combined Burton-Miller operator:
 # target += f * first + g * second (f real, g complex).
-function _test_singular_combined_gather_kernel!(
+function _metal_singular_combined_gather_kernel!(
     target,
     first_values,
     second_values,
