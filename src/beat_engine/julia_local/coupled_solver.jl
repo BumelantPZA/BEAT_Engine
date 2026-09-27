@@ -3364,7 +3364,11 @@ function solve_request_impl(request; event_mode=false)
                                   get(options, "excitation_weights", Any[]) :
                                   raw_weight_sweep[frequency_index]
                     if isempty(raw_weights)
-                        pressures = [
+                        pressures = bem_backend == :metal && BeatEngineCore._test_field_multi_on() ?
+                            BeatEngineCore.evaluate_galerkin_field_metal_multi(
+                                points, bem_mesh, [s.bem_pressure for s in solutions], [s.bem_neumann for s in solutions],
+                                coupled_system.wavenumber, coupled_system.field_cache,
+                            ) : [
                             if bem_backend == :cuda
                                 evaluate_galerkin_field_cuda(
                                     points,

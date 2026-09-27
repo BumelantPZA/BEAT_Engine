@@ -180,3 +180,168 @@ function _evaluate_galerkin_field_metal_fast(
     return_device || Metal.unsafe_free!(d_potentials)
     return result
 end
+
+# Test (BLAB_TEST_FIELD_MULTI=1): every excitation's field in one pass. Distance, Green's value and
+# normal projection are computed once per (point, source) and applied to ND weight sets (drive-major
+# weights4); each drive sums in the same order as `_metal_fast_field_kernel!`.
+@inline _test_mf_update(pre, pim, weights4, s, stride, dr, di, gr, gi, ::Val{0}) = (pre, pim)
+@inline function _test_mf_update(pre, pim, weights4, s, stride, dr, di, gr, gi, ::Val{D}) where {D}
+    pre, pim = _test_mf_update(pre, pim, weights4, s, stride, dr, di, gr, gi, Val(D - 1))
+    @inbounds w = weights4[s + Int32(D - 1) * stride]
+    Base.@fastmath begin
+        re = pre[D] + (dr * w[1].value - di * w[2].value - gr * w[3].value + gi * w[4].value)
+        im = pim[D] + (dr * w[2].value + di * w[1].value - gr * w[4].value - gi * w[3].value)
+    end
+    return Base.setindex(pre, re, D), Base.setindex(pim, im, D)
+end
+
+function _test_multi_field_kernel!(
+    partials, eval_points, points4, normals4, weights4, k::Float32,
+    source_count::Int32, point_count::Int32, chunk_length::Int32, chunk_count::Int32, ::Val{MODE}, ::Val{ND},
+) where {MODE,ND}
+    linear_index = Int32(thread_position_in_grid_1d())
+    linear_index > point_count * chunk_count && return nothing
+    point_index = (linear_index - Int32(1)) % point_count + Int32(1)
+    chunk_index = (linear_index - Int32(1)) ÷ point_count
+    source_start = chunk_index * chunk_length + Int32(1)
+    source_stop = min(source_count, source_start + chunk_length - Int32(1))
+    inv_four_pi = 0.07957747154594767f0
+    @inbounds x1 = eval_points[point_index]
+    @inbounds x2 = eval_points[point_index + point_count]
+    @inbounds x3 = eval_points[point_index + Int32(2) * point_count]
+    potential_re = ntuple(_ -> 0.0f0, Val(ND))
+    potential_im = ntuple(_ -> 0.0f0, Val(ND))
+    s = source_start
+    while s <= source_stop
+        @inbounds sp = points4[s]
+        Base.@fastmath begin
+        r1 = sp[1].value - x1
+        r2 = sp[2].value - x2
+        r3 = sp[3].value - x3
+        radius2 = r1 * r1 + r2 * r2 + r3 * r3
+        if radius2 > 0.0f0
+            @inbounds sn = normals4[s]
+            if MODE == 4
+                radius = _metal_precise_sqrt(radius2)
+                inv_radius = 1.0f0 / radius
+            else
+                inv_radius = _metal_fast_rsqrt(radius2)
+                radius = radius2 * inv_radius
+            end
+            phase = k * radius
+            green_scale = inv_radius * inv_four_pi
+            c, sn_ = _metal_field_cis(phase, Val(MODE))
+            green_re = c * green_scale
+            green_im = sn_ * green_scale
+            normal_projection = (r1 * sn[1].value + r2 * sn[2].value + r3 * sn[3].value) * inv_radius
+            double_re = (-green_re * inv_radius - green_im * k) * normal_projection
+            double_im = (green_re * k - green_im * inv_radius) * normal_projection
+            potential_re, potential_im = _test_mf_update(potential_re, potential_im, weights4, s, source_count,
+                double_re, double_im, green_re, green_im, Val(ND))
+        end
+        end
+        s += Int32(1)
+    end
+    stride = point_count * chunk_count
+    d = 1
+    while d <= ND
+        @inbounds partials[linear_index + Int32(d - 1) * stride] = Complex(potential_re[d], potential_im[d])
+        d += 1
+    end
+    return nothing
+end
+
+function _test_multi_field_reduce_kernel!(potentials, partials, point_count::Int32, chunk_count::Int32, drive_count::Int32)
+    index = Int32(thread_position_in_grid_1d())
+    index > point_count * drive_count && return nothing
+    point_index = (index - Int32(1)) % point_count + Int32(1)
+    drive = (index - Int32(1)) ÷ point_count
+    base = drive * point_count * chunk_count
+    total_re = 0.0f0
+    total_im = 0.0f0
+    chunk_index = Int32(0)
+    while chunk_index < chunk_count
+        @inbounds value = partials[base + point_index + chunk_index * point_count]
+        total_re += real(value)
+        total_im += imag(value)
+        chunk_index += Int32(1)
+    end
+    @inbounds potentials[index] = Complex(total_re, total_im)
+    return nothing
+end
+
+_test_field_multi_on() = get(ENV, "BLAB_TEST_FIELD_MULTI", "0") == "1" && get(ENV, "BLAB_METAL_FIELD_FAST", "0") != "0" &&
+    get(ENV, "BLAB_TEST_FIELD_F64", "0") != "1"
+
+"""
+Test (BLAB_TEST_FIELD_MULTI=1): `[evaluate_galerkin_field_metal(points, mesh, p, q, k, cache) for (p, q)]`
+in one kernel pass (up to 8 drives per pass). Falls back to one call per drive when the switch or the
+fast Float32 field is off.
+"""
+function evaluate_galerkin_field_metal_multi(eval_points, mesh::BoundaryMesh{T}, pressures, neumanns, k::T,
+                                             cache::MetalFieldEvaluationCache{T}) where {T<:AbstractFloat}
+    drive_count = length(pressures)
+    if !(T === Float32 && _test_field_multi_on()) || drive_count <= 1 || isempty(eval_points)
+        return [evaluate_galerkin_field_metal(eval_points, mesh, p, q, k, cache) for (p, q) in zip(pressures, neumanns)]
+    end
+    k = outgoing_wavenumber(k)
+    _require_metal!()
+    results = Vector{Vector{ComplexF32}}(undef, drive_count)
+    first_drive = 1
+    while first_drive <= drive_count
+        last_drive = min(drive_count, first_drive + 7)
+        results[first_drive:last_drive] = _test_multi_field_pass(eval_points, pressures[first_drive:last_drive],
+                                                                 neumanns[first_drive:last_drive], Float32(k), cache)
+        first_drive = last_drive + 1
+    end
+    return results
+end
+
+function _test_multi_field_pass(eval_points, pressures, neumanns, k::Float32, cache::MetalFieldEvaluationCache)
+    nd = length(pressures)
+    point_count = length(eval_points)
+    source_count = cache.source_count
+    tables = _metal_fast_field_tables_for(cache)
+    d_eval_points = MtlArray(_metal_eval_point_arrays(eval_points, Float32))
+    d_weights4 = MtlArray{_MetalFloat4}(undef, source_count * nd)
+    groupsize = 128
+    for d in 1:nd
+        d_pressure = MtlArray(ComplexF32.(pressures[d]))
+        d_neumann = MtlArray(ComplexF32.(neumanns[d]))
+        _metal_launch(
+            _metal_fast_field_sources_kernel!,
+            source_count,
+            view(d_weights4, (d - 1) * source_count + 1:d * source_count), d_pressure, d_neumann,
+            cache.source_weights, cache.source_faces, cache.source_elements, cache.basis_values, Int32(source_count);
+            groupsize=groupsize,
+        )
+        Metal.synchronize()
+        Metal.unsafe_free!(d_pressure)
+        Metal.unsafe_free!(d_neumann)
+    end
+    chunk_count = _metal_field_chunk_count(point_count, source_count)
+    chunk_length = cld(source_count, chunk_count)
+    d_partials = MtlArray{ComplexF32}(undef, point_count * chunk_count * nd)
+    d_potentials = MtlArray{ComplexF32}(undef, point_count * nd)
+    _metal_launch(
+        _test_multi_field_kernel!,
+        point_count * chunk_count,
+        d_partials, d_eval_points, tables.points4, tables.normals4, d_weights4, k,
+        Int32(source_count), Int32(point_count), Int32(chunk_length), Int32(chunk_count),
+        Val(parse(Int, get(ENV, "BLAB_METAL_FIELD_FAST", "1"))), Val(nd);
+        groupsize=groupsize,
+    )
+    _metal_launch(
+        _test_multi_field_reduce_kernel!,
+        point_count * nd,
+        d_potentials, d_partials, Int32(point_count), Int32(chunk_count), Int32(nd);
+        groupsize=groupsize,
+    )
+    Metal.synchronize()
+    host = Array(d_potentials)
+    Metal.unsafe_free!(d_eval_points)
+    Metal.unsafe_free!(d_weights4)
+    Metal.unsafe_free!(d_partials)
+    Metal.unsafe_free!(d_potentials)
+    return [host[(d - 1) * point_count + 1:d * point_count] for d in 1:nd]
+end
