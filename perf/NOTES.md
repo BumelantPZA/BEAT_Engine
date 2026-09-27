@@ -1,5 +1,26 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
+## Round 17 S2 (2026-09-27): R17-1 split done, bundle not extended (user declined the dependency change)
+Gate: M3 X ~60/45 s >= 15 s, so R17-1 went ahead; Y ~4.5 s < 10 s, so no R17-1b micro. R17-1c declined.
+Done (commit 55db2b5): `julia_local/BeatEngineCoupledWorker.jl` = the coupled engine as a module (exports
+`run_worker, solve_request, reclaim_accelerator_memory!, test_cold_log`); `coupled_solver.jl` = 84-line loader
+(solver.jl pattern). The loader loads the bundle only if the bundle's source mentions `BeatEngineCoupledWorker`, so today
+it always includes from source (no second engine copy); `BLAB_BEAT_ENGINE_BUNDLE=0` forces that. Load-time side
+effects: BLAS forwarding and all `ENV` reads were already runtime; runtime caches reset in `__init__`, MUMPS
+handle `LIBRARY[]` reset in `BeatEngineMumps.__init__`. `tests/memory_mesh_tests.jl` now includes the module.
+Revise: `quick.py --revise` 12-freq smoke OK (r16 0.0004 dB as before), and an edit in the module file hot-reloads.
+Not done (needs the bundle Project.toml change): steps 4-5 (bundle workload, `precompile_bundle.sh`), so no
+cold-start gain yet. Remaining work for a later yes: add `BeatEngineCoupledWorker.jl` + MUMPS/Serialization deps to
+the bundle, a CPU coupled workload, `precompile` for Metal host entries, re-resolve `julia_metal`, time the precompile.
+
+App path, round-16 switches via `APP_TIMING_EXTRA` (to first freq / total, s; one run each, same machine state):
+| Project | before (pre-s2) cold | after cold | before warm | after warm |
+|---|---|---|---|---|
+| SAWMOD 50 freqs | 66.2 / 97.7 | 66.5 / 93.7 | 1.94 / 28.0 | 1.79 / 26.3 |
+| proto2_quarter 200 | 50.6 / 62.4 | 51.1 / 62.9 | 0.21 / 11.24 | 0.20 / 11.27 |
+Bit-identity (`perf/cmp_dumps.py`, everything outside `diagnostics`): SAWMOD IDENTICAL (50 freqs, 3550 values),
+proto2q IDENTICAL (200 freqs, 5200 values). Precompile time: not measured (no bundle change).
+
 ## Round 17 S1 (2026-09-27): measurements M1, M2, M3
 Hooks added (commit 55a196b, no effect when unset; smoke-tested on SAWMOD and proto2q, identical results):
 `BLAB_TEST_DELAY_EXT_SOLVE=<s>` (exterior host solve), `BLAB_TEST_COLD_LOG=<file>` (process env: start-up

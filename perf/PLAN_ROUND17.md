@@ -126,6 +126,7 @@ Validation sets used below:
 Accuracy is maxdB against `base`, the stock app environment, under the HANDOFF policy.
 
 ### R17-1 Cold start: load the coupled engine from the precompiled bundle
+- **Status (S2): stopped after the module split; bundle steps 4-6 need the user's yes on Q1.**
 - **Helps:** both projects, on every app launch.
 - **Gain:** today about 59 s (SAWMOD) and 44 s (prototype2) pass before the first frequency. The bundle removes the `include` and host-JIT time (call it X, from M3), minus the pkgimage load (~1-3 s, measured in S2). For example, X = 30 s would bring SAWMOD's cold solve from 84.7 s to ~57 s and prototype2's from 59 s to ~32 s. Metal kernel compilation (Y) stays; see R17-1b.
 - **Accuracy:** exact, same code. Check bit-identity.
@@ -250,7 +251,7 @@ Accuracy is maxdB against `base`, the stock app environment, under the HANDOFF p
 1. **S1: measure** (cheap). *[S1 done 2026-09-27: M3 = X ~60/45 s, Y ~4.5 s, so R17-1 in, R17-1b out; M1 = CPU leads by ~36 ms; M2 = pipeline on saves 8 ms/freq, so R17-2 is in]* Trim HANDOFF (step 0), add 3 small hooks, then M1, M2, M3.
 2. **R17-2** if M2 shows >= 3 ms. *[yes: 8 ms]* A switch-only fix goes straight into the round 17 app patch draft.
 3. **R17-5** (cheap; M1 already covers TY8).
-4. **R17-1** if M3 shows X >= 15 s. *[yes: X ~60 s SAWMOD, ~45 s proto2q; Y ~4.5 s, so no R17-1b]* After it: R17-1b if Y >= 10 s, and R17-1c if you say yes.
+4. **R17-1** if M3 shows X >= 15 s. *[yes: X ~60 s SAWMOD, ~45 s proto2q; Y ~4.5 s, so no R17-1b]* *[S2 2026-09-27: STOPPED after steps 1-3 (module split, bit-identical); bundle extension declined by the user, R17-1c declined; no cold-start gain yet]* After it: R17-1b if Y >= 10 s, and R17-1c if you say yes.
 5. By M1's verdict:
 
 | M1 says | Next | Then |

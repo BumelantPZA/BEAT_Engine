@@ -22,6 +22,16 @@ Explain accuracy to the user in plain terms (dB change and seconds saved), not m
   off at 10-20 kHz at the quietest points of the 60 dB window (Float32 summation). A max-dB limit of
   0.01 there is below what Float32 can deliver; compare against stock, not against zero.
 
+## Status round 17 S2 (2026-09-27, NOTES "Round 17 S2")
+- R17-1 **stopped after steps 1-3**: user declined extending BeatEngineMetalBundle (deps + julia_metal re-resolve).
+  R17-1c declined too. R17-1b not needed (Y ~4.5 s).
+- Done: coupled engine is now module `julia_local/BeatEngineCoupledWorker.jl`; `coupled_solver.jl` is a thin loader
+  that uses the bundle only if the bundle carries that module (today never), else includes from source.
+- Results bit-identical to pre-S2 (SAWMOD, proto2q); cold/warm times unchanged. Revise harness works, module edits
+  hot-reload. Cold-start gain: 0 s until the bundle is extended (then expected ~-40..-55 s per M3).
+- `perf/cmp_dumps.py a.pkl b.pkl`: exact compare of APP_TIMING_DUMP pickles.
+- Next: R17-5, then by M1 verdict (plan §3), or R17-1 steps 4-6 if the user approves the bundle change.
+
 ## Status round 17 S1 (2026-09-27, NOTES "Round 17 S1"; plan perf/PLAN_ROUND17.md)
 - M1 SAWMOD: **CPU chain leads by ~36 ms** (GPU +50 ms costs +5, CPU +50 ms costs +41; MUMPS ~-80 ms buys -74,
   GPU -150 ms buys -12). Next for SAWMOD: R17-3 micro, then R17-6.
