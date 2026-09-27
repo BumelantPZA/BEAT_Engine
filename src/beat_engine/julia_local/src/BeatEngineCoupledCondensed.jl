@@ -1686,6 +1686,9 @@ function _build_mumps_condensation(
                 error("Transducer motion operators must have one row per FEM vertex.")
             transducer_count = size(surface, 2)
             columns = hcat(Matrix(surface), Matrix(force))
+            # Test (BLAB_TEST_DUMP_REDUCE=<file>): the reduction's right-hand sides, next to BLAB_TEST_DUMP_FEM.
+            dump_reduce = get(ENV, "BLAB_TEST_DUMP_REDUCE", "")
+            !isempty(dump_reduce) && !isfile(dump_reduce) && open(io -> serialize(io, columns), dump_reduce, "w")
             test_reduce_started = time_ns()
             reduced = mumps_reduce(solver, columns)
             test_reduce_s = (time_ns() - test_reduce_started) / 1.0e9

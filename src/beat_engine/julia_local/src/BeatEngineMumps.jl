@@ -585,7 +585,8 @@ function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; sym
     return schur
 end
 
-function _solve_phase!(solver::MumpsSchurSolver, rhs::Matrix{ComplexF64}, reduced::Matrix{ComplexF64}, mode::Integer)
+function _solve_phase!(solver::MumpsSchurSolver, rhs::Matrix{ComplexF64}, reduced::Matrix{ComplexF64}, mode::Integer;
+                       sparse_rhs::Bool=false)
     solver.factored || error("MUMPS solve needs a factorization first.")
     size(rhs, 1) == solver.n || error("MUMPS right-hand side must have one row per matrix row.")
     size(reduced) == (length(solver.schur_variables), size(rhs, 2)) ||
@@ -602,13 +603,26 @@ function _solve_phase!(solver::MumpsSchurSolver, rhs::Matrix{ComplexF64}, reduce
     single = s isa CMumpsStruc
     rhs_c = single ? ComplexF32.(rhs) : rhs
     reduced_c = single ? ComplexF32.(reduced) : reduced
-    GC.@preserve solver rhs_c reduced_c begin
+    # Test (BLAB_TEST_MUMPS_SPARSE_RHS): `rhs` goes in as a sparse column matrix (ICNTL(20)=1) so
+    # MUMPS can prune the forward sweep; `rhs` is still the dense output array (ICNTL(21)=0).
+    sparse = sparse_rhs && !single ? SparseMatrixCSC{ComplexF64,Int32}(rhs) : nothing
+    isnothing(sparse) || (set_icntl!(s, 20, 1); s.nz_rhs = Int32(nnz(sparse)))
+    GC.@preserve solver rhs_c reduced_c sparse begin
         s.rhs = pointer(rhs_c)
         s.redrhs = pointer(reduced_c)
+        if !isnothing(sparse)
+            s.irhs_ptr = pointer(sparse.colptr)
+            s.irhs_sparse = pointer(sparse.rowval)
+            s.rhs_sparse = pointer(sparse.nzval)
+        end
         _call!(solver.library, s, 3)
         s.rhs = C_NULL
         s.redrhs = C_NULL
+        s.irhs_ptr = C_NULL
+        s.irhs_sparse = C_NULL
+        s.rhs_sparse = C_NULL
     end
+    isnothing(sparse) || (set_icntl!(s, 20, 0); s.nz_rhs = Int32(0))
     if single
         rhs .= rhs_c
         reduced .= reduced_c
@@ -627,7 +641,7 @@ columns `rhs`, in `schur_variables` order.
 function mumps_reduce(solver::MumpsSchurSolver, rhs::AbstractMatrix)
     work = Matrix{ComplexF64}(rhs)
     reduced = zeros(ComplexF64, length(solver.schur_variables), size(work, 2))
-    _solve_phase!(solver, work, reduced, 1)
+    _solve_phase!(solver, work, reduced, 1; sparse_rhs=get(ENV, "BLAB_TEST_MUMPS_SPARSE_RHS", "0") == "1")
     return reduced
 end
 
