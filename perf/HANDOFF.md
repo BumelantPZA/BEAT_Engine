@@ -199,7 +199,16 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 - Bit-changing work goes behind a `BLAB_TEST_*` switch and is judged by the accuracy policy below.
 - Commit and push to the fork at each step.
 - Ask before installing or upgrading anything in the app checkout.
-- Keep tokens low.
+- Keep tokens low. How (from the round 16 usage review, 2026-09-27: ~56 % of that session's tokens went to
+  re-reading old command output, ~26 % to fixed instructions, ~18 % to writing code and thinking):
+  - Trim output at the source: on a failed job print only the error type and the first `BeatEngine*.jl:<line>`
+    locations (`grep -o "Reason: [^\\]*"`, `grep -o "BeatEngine[A-Za-z]*.jl:[0-9]*" | head -4`), never whole
+    stack traces; no `"detail": true` unless the per-frequency dB is actually needed; `| tail`/`grep` on job output.
+  - Delegate benchmark runs whose raw output isn't needed to a cheap runner agent (`horn-runner`, Haiku) with an
+    exact command and a short table as the answer. Keep edit-compile-fix loops and decisions in the main session
+    (an agent starts cold and re-reads the code, which costs more than it saves there).
+  - Split long work into sessions at phase boundaries (e.g. one per 1-2 targets), with the state in NOTES/HANDOFF,
+    so later turns don't re-read a long history.
 - Goal is speed on other Macs too (stronger CPU or GPU moves the bottleneck).
 
 ## What worked (all in the app)
