@@ -2459,6 +2459,9 @@ function build_condensed_coupled_system(
             ),
         ) : nothing
         isnothing(interior_task) || (stage_condensation = merge(stage_condensation, fetch(interior_task)))
+        # Test (BLAB_TEST_DELAY_FEM=<s>): lengthen the CPU chain by an idle wait (bottleneck test).
+        test_delay = parse(Float64, get(ENV, "BLAB_TEST_DELAY_FEM", "0"))
+        test_delay > 0 && sleep(test_delay)
         fem_stage_work[] = (time_ns() - fem_stage_work_started) / 1.0e9
         (stage_condensation, presolve)
     end
@@ -3088,6 +3091,9 @@ function _test_metal_operators(prepared, bem_mesh, wavenumber, singular_order, f
     end
     row_weights = host_row_weights ? p1_symmetry_orbit_weights(bem_mesh, prepared.symmetry_mode) : nothing
     _test_asm_timing_write(wavenumber)
+    # Test (BLAB_TEST_DELAY_GPU=<s>): lengthen the GPU lane by an idle wait (bottleneck test).
+    test_delay = parse(Float64, get(ENV, "BLAB_TEST_DELAY_GPU", "0"))
+    test_delay > 0 && sleep(test_delay)
     # Wraps shared device storage in place (copies it when the storage mode
     # is private); either way the host tuple owns the device buffers, so
     # `device_operators` must not be released separately.

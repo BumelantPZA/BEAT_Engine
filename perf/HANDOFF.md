@@ -26,8 +26,10 @@ Explain accuracy to the user in plain terms (dB change and seconds saved), not m
 - Operators alone: SAWMOD 250 ms (pair kernel 214 = maths ~120 + in-group reduction ~90), field 84;
   prototype2 quarter 49 ms (pairs 22, gathers 17, singular 12), field 12.6. Kernels are
   occupancy-limited (512 / 384 threads per group).
-- End-to-end: prototype2 is GPU-bound (1:1); SAWMOD on the M1 Pro gains at most ~4 % from faster GPU
-  operators (CPU chain MUMPS -> LU is longer). Five targets T1-T5 in GPU_PLAN.md; the user picks.
+- End-to-end: prototype2 is GPU-bound (1:1). SAWMOD (definitive test, NOTES round 15b): CPU and GPU
+  lanes are tied, CPU longer by ~20 ms/freq (~4 %); either lane +100 ms costs +70-78 ms, either lane
+  alone faster gains <= ~20 ms. Say "tied, CPU ahead by ~20 ms", not "CPU-bound" or "GPU-bound".
+  Five targets T1-T5 in GPU_PLAN.md; the user picks.
 
 ## Status after round 14 (2026-09-27) and next step
 - App path SAWMOD ~24 s warm (stock Metal 131 s); prototype2 quarter 13.9 s (stock 20.5 s). Tags up to

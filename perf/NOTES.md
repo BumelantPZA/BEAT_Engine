@@ -457,3 +457,19 @@ alloc/identity/row weights/rhs reduce ~3.5. Field 1 call, 12.6 ms (7322 x 29592)
 - **End-to-end ceiling:** 50-freq sweep with the pair maths removed: 0.073 -> 0.057 s/freq (1:1).
   prototype2 is GPU-bound; every GPU millisecond counts.
 Plan with five targets: `perf/GPU_PLAN.md`.
+
+### Round 15b (2026-09-27): definitive bottleneck test for SAWMOD (lane delay sensitivity)
+Idle waits (sleep: no CPU/GPU use) added to one lane, 50-freq pipelined sweep, 2 rounds interleaved:
+`BLAB_TEST_DELAY_GPU=<s>` (end of the GPU operator assembly) and `BLAB_TEST_DELAY_FEM=<s>` (end of
+the FEM stage, the start of the CPU chain).
+| Config | s/freq | vs base |
+|---|---|---|
+| base | 0.509 (0.502-0.516) | |
+| GPU lane +100 ms | 0.587 | +78 ms |
+| CPU chain +100 ms | 0.579 | +70 ms (the sleep also frees cores: less contention beside it) |
+| both +100 ms | 0.598 | +89 ms |
+With round 15's speed-up test (GPU operators -150 ms -> only -19 ms/freq): **the two lanes are tied;
+the CPU chain is longer by ~20 ms per frequency (~4 % of the cycle)**. Both tests give the same ~20 ms
+GPU slack (+78 = 100 - 22; -19). They are coupled, not independent: the dense step waits for the GPU
+matrices, and the field waits for the CPU solution. Consequence: shortening either lane alone gains at
+most ~20 ms/freq (~1 s per 50 freqs); larger gains need both lanes shorter.
