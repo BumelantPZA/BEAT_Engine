@@ -291,6 +291,123 @@ end
     return nothing
 end
 
+# Test (BLAB_TEST_TR_EARLY_COMB=1|2): the combined pair values C = -S - βK' and A = -D + βH formed per
+# test point before the outer-product expansion (as the fused exterior kernel does with β = i/k), so
+# 24 accumulators are live instead of 48. H = curl G_total - k^2 (n.n') Σ φ h, so per test point
+# u = -d + γ h with γ = -β k^2 (n.n'), and β curl G_total is added once after the loop.
+# Mode 1 unrolls the test loop, mode 2 keeps it a runtime loop (rule values from device arrays).
+@inline function _test_comb_test_point(acc, context, tb1, tb2, tb3, x, y, z, test_weight, rc, rv::Val{R}) where {R}
+    a_re, a_im, c_re, c_im, g_re, g_im = acc
+    k, inv_four_pi, jac_scale, test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs,
+        points4, trial_index, beta_re, beta_im, gamma_re, gamma_im = context
+    T = typeof(k)
+    z3 = zero(SVector{3,T})
+    test_basis = SVector(tb1, tb2, tb3)
+    trial_context = (x, y, z, test_weight * jac_scale, k, inv_four_pi,
+        test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs, points4, trial_index, Val(0))
+    s_re, s_im, q_re, q_im, d_re, d_im, h_re, h_im = _metal_packed_trial_fold(
+        (zero(k), zero(k), zero(k), zero(k), z3, z3, z3, z3), trial_context, Val(R), rc, rv)
+    c_re += test_basis * (-s_re - (beta_re * q_re - beta_im * q_im))
+    c_im += test_basis * (-s_im - (beta_re * q_im + beta_im * q_re))
+    g_re += s_re
+    g_im += s_im
+    u_re = -d_re + (gamma_re * h_re - gamma_im * h_im)
+    u_im = -d_im + (gamma_re * h_im + gamma_im * h_re)
+    a_re += SVector(
+        tb1 * u_re[1], tb2 * u_re[1], tb3 * u_re[1],
+        tb1 * u_re[2], tb2 * u_re[2], tb3 * u_re[2],
+        tb1 * u_re[3], tb2 * u_re[3], tb3 * u_re[3],
+    )
+    a_im += SVector(
+        tb1 * u_im[1], tb2 * u_im[1], tb3 * u_im[1],
+        tb1 * u_im[2], tb2 * u_im[2], tb3 * u_im[2],
+        tb1 * u_im[3], tb2 * u_im[3], tb3 * u_im[3],
+    )
+    return (a_re, a_im, c_re, c_im, g_re, g_im)
+end
+
+@inline _test_comb_fold(acc, context, test_index, ::Val{0}, rc, rv::Val) = acc
+@inline function _test_comb_fold(acc, context, test_index, ::Val{N}, rc, rv::Val{R}) where {N,R}
+    acc = _test_comb_fold(acc, context, test_index, Val(N - 1), rc, rv)
+    xi = _metal_rule_xi(rc, rv, N)
+    eta = _metal_rule_eta(rc, rv, N)
+    @inbounds p = context[11][(test_index - Int32(1)) * Int32(R) + Int32(N)]
+    return _test_comb_test_point(acc, context, one(xi) - xi - eta, xi, eta,
+        p[1].value, p[2].value, p[3].value, _metal_rule_w(rc, rv, N), rc, rv)
+end
+
+@inline function _test_comb_pair(
+    points4, normals4, areas, curls4, rule_points, rule_weights,
+    test_index::Int32, trial_index::Int32, k, rc, rv::Val{R},
+    trial_sign_x, trial_sign_y, trial_sign_z, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
+    beta_re, beta_im, ::Val{MODE},
+) where {R,MODE}
+    T = typeof(k)
+    inv_four_pi = T(0.07957747154594767)
+    @inbounds tn = normals4[test_index]
+    @inbounds rn = normals4[trial_index]
+    test_nx = tn[1].value
+    test_ny = tn[2].value
+    test_nz = tn[3].value
+    trial_nx = trial_sign_x * rn[1].value
+    trial_ny = trial_sign_y * rn[2].value
+    trial_nz = trial_sign_z * rn[3].value
+    normal_product = test_nx * trial_nx + test_ny * trial_ny + test_nz * trial_nz
+    @inbounds jac_scale = T(4) * areas[test_index] * areas[trial_index]
+    trial_signs = SVector(trial_sign_x, trial_sign_y, trial_sign_z)
+    k2n = k * k * normal_product
+    context = (k, inv_four_pi, jac_scale, test_nx, test_ny, test_nz, trial_nx, trial_ny, trial_nz, trial_signs,
+        points4, trial_index, beta_re, beta_im, -beta_re * k2n, -beta_im * k2n)
+    acc = (zero(SVector{9,T}), zero(SVector{9,T}), zero(SVector{3,T}), zero(SVector{3,T}), zero(k), zero(k))
+    if MODE == 2
+        test_q = Int32(1)
+        while test_q <= Int32(R)
+            @inbounds xi = rule_points[test_q]
+            @inbounds eta = rule_points[test_q + Int32(R)]
+            @inbounds p = points4[(test_index - Int32(1)) * Int32(R) + test_q]
+            @inbounds w = rule_weights[test_q]
+            acc = _test_comb_test_point(acc, context, one(k) - xi - eta, xi, eta,
+                p[1].value, p[2].value, p[3].value, w, rc, rv)
+            test_q += Int32(1)
+        end
+    else
+        acc = _test_comb_fold(acc, context, test_index, rv, rc, rv)
+    end
+    a_re, a_im, c_re, c_im, g_re, g_im = acc
+    @inbounds t1 = curls4[(test_index - Int32(1)) * Int32(3) + Int32(1)]
+    @inbounds t2 = curls4[(test_index - Int32(1)) * Int32(3) + Int32(2)]
+    @inbounds t3 = curls4[(test_index - Int32(1)) * Int32(3) + Int32(3)]
+    @inbounds q1 = curls4[(trial_index - Int32(1)) * Int32(3) + Int32(1)]
+    @inbounds q2 = curls4[(trial_index - Int32(1)) * Int32(3) + Int32(2)]
+    @inbounds q3 = curls4[(trial_index - Int32(1)) * Int32(3) + Int32(3)]
+    t11, t12, t13 = t1[1].value, t1[2].value, t1[3].value
+    t21, t22, t23 = t2[1].value, t2[2].value, t2[3].value
+    t31, t32, t33 = t3[1].value, t3[2].value, t3[3].value
+    r11 = trial_curl_sign_x * q1[1].value
+    r12 = trial_curl_sign_y * q1[2].value
+    r13 = trial_curl_sign_z * q1[3].value
+    r21 = trial_curl_sign_x * q2[1].value
+    r22 = trial_curl_sign_y * q2[2].value
+    r23 = trial_curl_sign_z * q2[3].value
+    r31 = trial_curl_sign_x * q3[1].value
+    r32 = trial_curl_sign_y * q3[2].value
+    r33 = trial_curl_sign_z * q3[3].value
+    curl_products = SVector(
+        t11 * r11 + t12 * r12 + t13 * r13,
+        t21 * r11 + t22 * r12 + t23 * r13,
+        t31 * r11 + t32 * r12 + t33 * r13,
+        t11 * r21 + t12 * r22 + t13 * r23,
+        t21 * r21 + t22 * r22 + t23 * r23,
+        t31 * r21 + t32 * r22 + t33 * r23,
+        t11 * r31 + t12 * r32 + t13 * r33,
+        t21 * r31 + t22 * r32 + t23 * r33,
+        t31 * r31 + t32 * r32 + t33 * r33,
+    )
+    a_re += curl_products * (beta_re * g_re - beta_im * g_im)
+    a_im += curl_products * (beta_re * g_im + beta_im * g_re)
+    return c_re, c_im, a_re, a_im
+end
+
 function _metal_tilereduce_pair_kernel!(
     blocks4,
     points4,
@@ -330,7 +447,10 @@ function _metal_tilereduce_pair_kernel!(
     beta_re,
     beta_im,
     probev::Val{PROBE}=Val(0),
-) where {RC,R,TY,SKIP,SIMDBAR,COMB,PROBE}
+    earlyv::Val{EARLY}=Val(0),
+    rule_points=nothing,
+    rule_weights=nothing,
+) where {RC,R,TY,SKIP,SIMDBAR,COMB,PROBE,EARLY}
     tg = MtlThreadGroupArray(Float32, (16, TY, 12))
     tpos = thread_position_in_threadgroup()
     gpos = threadgroup_position_in_grid()
@@ -341,6 +461,38 @@ function _metal_tilereduce_pair_kernel!(
     test_position = (tile - Int32(1)) * Int32(16) + tx
     trial_local = trial_first + ty
     T = Float32
+    if COMB && EARLY > 0
+        c_re = zero(SVector{3,T})
+        c_im = zero(SVector{3,T})
+        a_re = zero(SVector{9,T})
+        a_im = zero(SVector{9,T})
+        if test_position <= element_count && trial_local <= chunk_count
+            @inbounds test_index = Int32(elements[test_position])
+            @inbounds trial_index = Int32(elements[chunk_start + trial_local - Int32(1)])
+            if !_metal_pair_is_skipped(faces, face_count, test_index, trial_index,
+                                       pair_offsets, singular_trial_indices, skip_mode)
+                c_re, c_im, a_re, a_im = _test_comb_pair(
+                    points4, normals4, areas, curls4, rule_points, rule_weights, test_index, trial_index, k, rc, rv,
+                    trial_sign_x, trial_sign_y, trial_sign_z, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
+                    beta_re, beta_im, Val(EARLY))
+            end
+        end
+        @inbounds slot_first = Int32(tile_slot_offsets[tile])
+        @inbounds slot_count = Int32(tile_slot_offsets[tile + Int32(1)]) - slot_first
+        _metal_tilereduce_put!(tg, tx, ty, c_re, c_im,
+            SVector(a_re[1], a_re[2], a_re[3]), SVector(a_im[1], a_im[2], a_im[3]))
+        _metal_tilereduce_barrier(barv)
+        _metal_tilereduce_reduce!(blocks4, tg, slot_entry_offsets, slot_entries, slot_first, slot_count,
+            tx, ty, trial_local, chunk_count, slot_total, Int32(0), skipv, accumulate, Val(PROBE))
+        _metal_tilereduce_barrier(barv)
+        _metal_tilereduce_put!(tg, tx, ty,
+            SVector(a_re[4], a_re[5], a_re[6]), SVector(a_im[4], a_im[5], a_im[6]),
+            SVector(a_re[7], a_re[8], a_re[9]), SVector(a_im[7], a_im[8], a_im[9]))
+        _metal_tilereduce_barrier(barv)
+        _metal_tilereduce_reduce!(blocks4, tg, slot_entry_offsets, slot_entries, slot_first, slot_count,
+            tx, ty, trial_local, chunk_count, slot_total, group_stride, skipv, accumulate, Val(PROBE))
+        return nothing
+    end
     slp_re = zero(SVector{3,T})
     slp_im = zero(SVector{3,T})
     adj_re = zero(SVector{3,T})
@@ -743,6 +895,9 @@ function _launch_metal_tilereduce_transforms!(operators, cache::MetalRegularAsse
             beta_re,
             beta_im,
             Val(parse(Int, get(ENV, "BLAB_TEST_TR_PROBE", "0"))),
+            Val(parse(Int, get(ENV, "BLAB_TEST_TR_EARLY_COMB", "0"))),
+            cache.rule_points,
+            cache.rule_weights,
             )
             chunk == 1 && transform_index == 1 && _test_pipeinfo("tilereduce_pair", _metal_tilereduce_pair_kernel!, pair_args...)
             Metal.@metal threads=(_METAL_TILEREDUCE_TX, ty) groups=(tables.tile_count, cld(chunk_count, ty)) _metal_tilereduce_pair_kernel!(pair_args...)

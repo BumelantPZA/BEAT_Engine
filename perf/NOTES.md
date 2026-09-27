@@ -493,3 +493,20 @@ most ~20 ms/freq (~1 s per 50 freqs); larger gains need both lanes shorter.
   6-point rule makes that kernel 85 ms (vs 22). Diff in perf/attic/t1_fused_via_tilereduce.diff.
 Stage split after T1 (proto2q, synced timers): pairs 18.9 ms (4 transforms), lhs gather 2.9, rhs 1.5,
 singular 8.8 (blocks 8.9 of it), image singular 4.2.
+
+**T2 (leaner tile-reduce pair kernel, SAWMOD), no gain; code left behind switches, off.**
+GPU micro (`BLAB_TEST_GPU_MICRO`, SAWMOD alone on the GPU, ms per assembly, pair kernel / wall):
+| Variant | pairs | wall | maxThreads |
+|---|---|---|---|
+| base (COMB) | 216-225 | 257-263 | 512 |
+| `TR_EARLY_COMB=1` (per-test-point combine, unrolled test loop) | 323 | 361 | 448 |
+| `TR_EARLY_COMB=2` (runtime test loop) | Metal compiler fails at pipeline link ("Compilation to native code failed") | | |
+| `METAL_TILEREDUCE_TY=8` | 207-215 | 244-255 | |
+- Early combination costs occupancy here (448) although it helps the fused exterior kernel (T1): this
+  kernel also holds 12 KB threadgroup memory and the barrier/reduction code. Step 2 (image loop in
+  registers) needs step 1, so it was not attempted (round 9 already showed it is slower without it).
+- TY=8: bit-identical, -9 ms GPU alone, but the 50-freq pipelined sweep is 0.547 vs 0.532 (noise band;
+  the CPU lane leads by ~20 ms, round 15b). Worth re-testing on a GPU-weaker Mac; not switched on.
+- Harness note: a failed request kills quick.py, and its `.job.json` stays in queue/ and is re-run at the
+  next start: delete leftover `queue/*.job.json` before restarting. The GPU micro hook runs once per
+  (file, k): use a new file name after a failure.
