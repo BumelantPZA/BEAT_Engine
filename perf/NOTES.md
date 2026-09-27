@@ -510,3 +510,21 @@ GPU micro (`BLAB_TEST_GPU_MICRO`, SAWMOD alone on the GPU, ms per assembly, pair
 - Harness note: a failed request kills quick.py, and its `.job.json` stays in queue/ and is re-run at the
   next start: delete leftover `queue/*.job.json` before restarting. The GPU micro hook runs once per
   (file, k): use a new file name after a failure.
+
+**T3 (field).** Part 1 done, part 2 rejected.
+- Part 1 `BLAB_TEST_FIELD_MULTI=1` (`evaluate_galerkin_field_metal_multi`, `_test_multi_field_kernel!`):
+  all excitations of a frequency in one pass (Green's value per (point, source) once, ND weight sets,
+  each drive summed in the stock order). SAWMOD 50 freqs, 2 rounds: **0.530 -> 0.504 s/freq**, field
+  section 0.09 -> 0.04, maxdB 0.0005. Vented_Sub and prototype2 (one excitation): falls back, bit-identical.
+  Hook: coupled_solver.jl `exterior_pressure` output (no excitation weights).
+- Part 2 `BLAB_TEST_FIELD_FAR_RULE=c/kappa` (group of R sources -> one weight-centroid source when
+  |x - centroid| > c h and k h < kappa): prototype2 quarter, 50 freqs, vs stock:
+  | Setting | s/freq | maxdB |
+  |---|---|---|
+  | stock / FIELD_MULTI | 0.074 / 0.075 | 0 |
+  | c=10, kh<0.3 | 0.072 | 20.2 |
+  | c=5 or 20, kh<1 | 0.069 / 0.071 | 36.7 |
+  | c=10, any kh | 0.066 | 42.9 |
+  Rejected: the pressure varies linearly over an element, so a centroid source is only first-order
+  accurate, and the quiet points of the 60 dB window amplify it. Even the best case saves only 8 ms.
+  A correct version needs per-drive first moments (dipole correction) or a lower-order rule, not tried.
