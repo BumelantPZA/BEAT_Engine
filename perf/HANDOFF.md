@@ -31,6 +31,9 @@ Explain accuracy to the user in plain terms (dB change and seconds saved), not m
   only ~4.5 s (Y). So S2 = R17-1 (bundle), R17-1b dropped. Warm one-time cost ~1.5 s/request.
 - New hooks: `BLAB_TEST_DELAY_EXT_SOLVE`, `BLAB_TEST_COLD_LOG` (process env), overlap_plan line in PHASE_LOG,
   `mkjob.py --request=`.
+- **S1 closed (tag metal-test-round17s1). Next: S2 (R17-1).** Ask PLAN Q1 first (extend `BeatEngineMetalBundle`
+  + precompile after each edit; app pre-start R17-1c). Cold runs: M3 commands in NOTES, `perf/cold_sum.py <log>`.
+  quick.py is stopped; the user stops it themselves (pkill is blocked for Claude by a permission check).
 
 ## Status after round 16 (2026-09-27): GPU_PLAN T1-T5 worked through (NOTES "Round 16")
 - Kept (test-only switches, off by default, app patch `perf/app_patches/round16_engine_distribution.diff`
