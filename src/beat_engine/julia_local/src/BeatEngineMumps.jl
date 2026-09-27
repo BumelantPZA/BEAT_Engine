@@ -212,6 +212,8 @@ end
 
 const LIBRARY = Ref{Union{Nothing,MumpsLibrary}}(nothing)
 const LIBRARY_LOCK = ReentrantLock()
+# The handle holds dlopen pointers: never let one from a precompile workload into a new process.
+__init__() = (LIBRARY[] = nothing; nothing)
 #: Test hook: pretend the library is missing, to exercise the UMFPACK fallback.
 const FORCE_UNAVAILABLE = Ref(false)
 #: Live solvers, released at process exit if their owner did not release them.
