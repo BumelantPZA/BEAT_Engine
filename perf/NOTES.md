@@ -1,5 +1,41 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
+## Round 17 S1 (2026-09-27): measurements M1, M2 (M3 pending)
+Hooks added (commit 55a196b, no effect when unset; smoke-tested on SAWMOD and proto2q, identical results):
+`BLAB_TEST_DELAY_EXT_SOLVE=<s>` (exterior host solve), `BLAB_TEST_COLD_LOG=<file>` (process env: start-up
+stamps with epoch + cumulative compile time, request phases, first-launch wall per Metal kernel name via
+`@_test_cold_launch`), an `overlap_plan ...` line in `BLAB_TEST_PHASE_LOG`, `mkjob.py --request=<file>`.
+HANDOFF history moved to `HANDOFF_ARCHIVE.md`.
+
+**M1, SAWMOD lanes** (50 freqs, 3 rounds interleaved, harness; deltas vs `r16` within each round, ms/freq):
+| Config | r1 | r2 | r3 | median | reading |
+|---|---|---|---|---|---|
+| r16 (FIELD_MULTI) s/freq | 0.495 | 0.502 | 0.467 | | |
+| gpu50 (GPU lane +50 ms) | +3 | +10 | +5 | **+5** | GPU slack ~45 ms |
+| fem50 (CPU chain +50 ms) | +41 | +39 | +42 | **+41** | CPU slack ~9 ms |
+| mumpsfast (CPU chain ~-80 ms, wrong results) | -74 | -76 | -66 | **-74** | nearly all of it shows |
+| gpufast (GPU lane ~-150 ms, wrong results) | -8 | -20 | -12 | **-12** | |
+| ty8 (`BLAB_METAL_TILEREDUCE_TY=8`, identical results) | +1 | -33 | -8 | -8 | noisy; re-test in R17-5 |
+**Verdict: the CPU chain leads** (fem50 - gpu50 = 36 ms >= 15, mumpsfast gains 74 >= 15). A CPU-chain cut of
+~80 ms buys ~74 ms; a GPU cut buys ~12 ms. Changed since R15b (tied): FIELD_MULTI took the GPU lane down.
+
+**M2, prototype2 quarter pipeline** (50 freqs, 3 rounds, all rounds equal to 1 ms):
+| Config | s/freq |
+|---|---|
+| base (stock app env) | 0.070 |
+| r16 (3 exterior switches), auto plan | 0.055 |
+| pipe0 (`BLAB_METAL_PIPELINE=0`) | 0.055 |
+| **pipe1 (`BLAB_METAL_PIPELINE=1`)** | **0.047** (-8 ms, -15 %, same maxrel 1.4e-6 / 0.0021 dB as r16) |
+| depth2 (`=1`, `PIPELINE_DEPTH=2`) | 0.047 |
+| solve10 (host solve +10 ms) | 0.069 (+14 ms: the solve is fully serial) |
+The auto plan is **off**: `overlap_plan enabled=false reason=model assembly_model_s=0.067 solve_model_s=0.0019
+saving_model_s=-0.0011`. The model's solve estimate (1.9 ms) is far below the real serial host time (~8 ms
+recovered by pipelining). R17-2 is a switch-only fix: `BLAB_METAL_PIPELINE=1` for the test solver (or fix the
+model's solve estimate in `BeatEngineSweepOverlap.jl`). Still to check: proto2 full mesh and 200 freqs (V-P).
+
+**M3, cold start: not run.** Stopping `quick.py` (a precondition) was blocked by a permission check in this
+session; waiting for the user.
+
 ## Round 11 (2026-09-26): in-app BLAS bug, MUMPS pivoting, early build with optimized prefetch
 In-app path (`perf/app_timing.py`, the app's headless solve on the SAWMOD project, 50 freqs, warm):
 **37.7 s → 33.9 s (BLAS fix) → 29.4 s (prefetch opt) → 27.1 s (FEM lane) → 25.1 s (all, 10 threads)**.

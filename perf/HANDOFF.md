@@ -22,6 +22,15 @@ Explain accuracy to the user in plain terms (dB change and seconds saved), not m
   off at 10-20 kHz at the quietest points of the 60 dB window (Float32 summation). A max-dB limit of
   0.01 there is below what Float32 can deliver; compare against stock, not against zero.
 
+## Status round 17 S1 (2026-09-27, NOTES "Round 17 S1"; plan perf/PLAN_ROUND17.md)
+- M1 SAWMOD: **CPU chain leads by ~36 ms** (GPU +50 ms costs +5, CPU +50 ms costs +41; MUMPS ~-80 ms buys -74,
+  GPU -150 ms buys -12). Next for SAWMOD: R17-3 micro, then R17-6.
+- M2 prototype2 quarter: `BLAB_METAL_PIPELINE=1` 0.055 -> 0.047 s/freq (identical results); the overlap model
+  turns it off (solve model 1.9 ms vs ~8 ms real). R17-2 = switch/model fix; verify on proto2 full + 200 freqs.
+- M3 cold start not run yet (needs quick.py stopped; blocked in S1). Run it first in the next session.
+- New hooks: `BLAB_TEST_DELAY_EXT_SOLVE`, `BLAB_TEST_COLD_LOG` (process env), overlap_plan line in PHASE_LOG,
+  `mkjob.py --request=`.
+
 ## Status after round 16 (2026-09-27): GPU_PLAN T1-T5 worked through (NOTES "Round 16")
 - Kept (test-only switches, off by default, app patch `perf/app_patches/round16_engine_distribution.diff`
   not yet applied): `BLAB_TEST_FUSED_IMAGE_ACC=1` + `BLAB_TEST_FUSED_PACKED=2` (T1, exterior),

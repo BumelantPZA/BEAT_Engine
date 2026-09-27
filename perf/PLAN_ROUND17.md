@@ -247,15 +247,15 @@ Accuracy is maxdB against `base`, the stock app environment, under the HANDOFF p
 ---
 
 ## 3. Suggested order
-1. **S1: measure** (cheap). Trim HANDOFF (step 0), add 3 small hooks, then M1, M2, M3.
-2. **R17-2** if M2 shows >= 3 ms. A switch-only fix goes straight into the round 17 app patch draft.
+1. **S1: measure** (cheap). *[S1 done 2026-09-27 except M3: M1 = CPU leads by ~36 ms; M2 = pipeline on saves 8 ms/freq, so R17-2 is in]* Trim HANDOFF (step 0), add 3 small hooks, then M1, M2, M3.
+2. **R17-2** if M2 shows >= 3 ms. *[yes: 8 ms]* A switch-only fix goes straight into the round 17 app patch draft.
 3. **R17-5** (cheap; M1 already covers TY8).
 4. **R17-1** if M3 shows X >= 15 s. After it: R17-1b if Y >= 10 s, and R17-1c if you say yes.
 5. By M1's verdict:
 
 | M1 says | Next | Then |
 |---|---|---|
-| CPU leads (>= 15 ms) | R17-3 micro, then R17-6 | R17-4 for prototype2 only |
+| **CPU leads (>= 15 ms)** ← M1 result | R17-3 micro, then R17-6 | R17-4 for prototype2 only |
 | GPU leads | R17-4 (both kernels), R17-8 if approved | R17-7 |
 | Tied | R17-4 (prototype2), R17-8 if approved | R17-3 / R17-6 as other-Mac insurance |
 
