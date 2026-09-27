@@ -1,6 +1,6 @@
 --- a/src/blab/solvers/engine_distribution.py
 +++ b/src/blab/solvers/engine_distribution.py
-@@ -104,6 +104,17 @@
+@@ -104,6 +104,21 @@
          "BLAB_TEST_FUSED_IMAGE_ACC": "1",
          "BLAB_TEST_FUSED_PACKED": "2",
          "BLAB_TEST_FIELD_MULTI": "1",
@@ -14,5 +14,9 @@
 +        "BLAB_TEST_SING_SPLIT": "0.4",
 +        "BLAB_TEST_SING_PACKED": "2",
 +        "BLAB_TEST_POOL_ZERO2": "1",
++        # Round 17 S4: the transducer reduction passes its 6 columns to MUMPS as a sparse right-hand
++        # side (ICNTL(20)=1), so the forward sweep is pruned: 14.3 -> 4.5 ms alone. SAWMOD 50 freqs
++        # 0.565 -> 0.551 s/freq, 0.0003 dB; vented_sub / compression_driver 0.0000 dB.
++        "BLAB_TEST_MUMPS_SPARSE_RHS": "1",
      }
  }
