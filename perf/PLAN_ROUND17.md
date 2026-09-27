@@ -247,10 +247,10 @@ Accuracy is maxdB against `base`, the stock app environment, under the HANDOFF p
 ---
 
 ## 3. Suggested order
-1. **S1: measure** (cheap). *[S1 done 2026-09-27 except M3: M1 = CPU leads by ~36 ms; M2 = pipeline on saves 8 ms/freq, so R17-2 is in]* Trim HANDOFF (step 0), add 3 small hooks, then M1, M2, M3.
+1. **S1: measure** (cheap). *[S1 done 2026-09-27: M3 = X ~60/45 s, Y ~4.5 s, so R17-1 in, R17-1b out; M1 = CPU leads by ~36 ms; M2 = pipeline on saves 8 ms/freq, so R17-2 is in]* Trim HANDOFF (step 0), add 3 small hooks, then M1, M2, M3.
 2. **R17-2** if M2 shows >= 3 ms. *[yes: 8 ms]* A switch-only fix goes straight into the round 17 app patch draft.
 3. **R17-5** (cheap; M1 already covers TY8).
-4. **R17-1** if M3 shows X >= 15 s. After it: R17-1b if Y >= 10 s, and R17-1c if you say yes.
+4. **R17-1** if M3 shows X >= 15 s. *[yes: X ~60 s SAWMOD, ~45 s proto2q; Y ~4.5 s, so no R17-1b]* After it: R17-1b if Y >= 10 s, and R17-1c if you say yes.
 5. By M1's verdict:
 
 | M1 says | Next | Then |

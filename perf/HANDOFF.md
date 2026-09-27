@@ -27,7 +27,8 @@ Explain accuracy to the user in plain terms (dB change and seconds saved), not m
   GPU -150 ms buys -12). Next for SAWMOD: R17-3 micro, then R17-6.
 - M2 prototype2 quarter: `BLAB_METAL_PIPELINE=1` 0.055 -> 0.047 s/freq (identical results); the overlap model
   turns it off (solve model 1.9 ms vs ~8 ms real). R17-2 = switch/model fix; verify on proto2 full + 200 freqs.
-- M3 cold start not run yet (needs quick.py stopped; blocked in S1). Run it first in the next session.
+- M3 cold start: ~60 s (SAWMOD) / ~45 s (proto2q) of the wait is host JIT + includes (X), Metal kernel compile
+  only ~4.5 s (Y). So S2 = R17-1 (bundle), R17-1b dropped. Warm one-time cost ~1.5 s/request.
 - New hooks: `BLAB_TEST_DELAY_EXT_SOLVE`, `BLAB_TEST_COLD_LOG` (process env), overlap_plan line in PHASE_LOG,
   `mkjob.py --request=`.
 

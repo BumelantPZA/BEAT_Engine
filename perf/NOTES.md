@@ -1,6 +1,6 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
-## Round 17 S1 (2026-09-27): measurements M1, M2 (M3 pending)
+## Round 17 S1 (2026-09-27): measurements M1, M2, M3
 Hooks added (commit 55a196b, no effect when unset; smoke-tested on SAWMOD and proto2q, identical results):
 `BLAB_TEST_DELAY_EXT_SOLVE=<s>` (exterior host solve), `BLAB_TEST_COLD_LOG=<file>` (process env: start-up
 stamps with epoch + cumulative compile time, request phases, first-launch wall per Metal kernel name via
@@ -33,8 +33,26 @@ saving_model_s=-0.0011`. The model's solve estimate (1.9 ms) is far below the re
 recovered by pipelining). R17-2 is a switch-only fix: `BLAB_METAL_PIPELINE=1` for the test solver (or fix the
 model's solve estimate in `BeatEngineSweepOverlap.jl`). Still to check: proto2 full mesh and 200 freqs (V-P).
 
-**M3, cold start: not run.** Stopping `quick.py` (a precondition) was blocked by a permission check in this
-session; waiting for the user.
+**M3, cold start** (app path, `BLAB_TEST_COLD_LOG` as process env, run 1 cold / run 2 warm; summary with
+`perf/cold_sum.py <log>`). Seconds from the worker script's first line (Julia runtime start before it ~1 s);
+"compile" = `Base.cumulative_compile_time_ns` (summed over threads, so it can exceed wall):
+| Phase | SAWMOD wall (compile) | proto2q wall (compile) |
+|---|---|---|
+| `using` JSON/LinearAlgebra/... | 0.4 (0.2) | 0.4 (0.2) |
+| engine `include`s | 4.1 (1.3) | 4.4 (1.4) |
+| to worker ready (backend check loads Metal) | 3.2 (1.9) | 3.4 (2.1) |
+| request read -> env (request parse + system setup JIT) | 21.2 (21.2) | 25.8 (25.4, to first freq) |
+| env -> first frequency (setup) | 7.5 (6.4) | (in the row above) |
+| first frequency | 35.0 (52.9) | 18.5 (17.5) |
+| of which Metal kernel first launches (Y) | 4.3 (8 kernels; tilereduce pair 1.6) | 4.7 (11; packed pair 1.7) |
+| then steady | 0.51 s/freq | 0.060 s/freq |
+| app_timing: to first freq / total | 70.6 / 98.0 s (warm 1.8 / 27.9) | 53.3 / 65.5 s (warm 0.26 / 11.6) |
+Package-load floor (`using Metal, JSON, StaticArrays, SparseArrays`): 1.98 s.
+**X (includes + host JIT that a precompiled bundle can cache) ~ 60 s SAWMOD, ~45 s proto2q; Y ~ 4.5 s.** So
+R17-1 is in (X >> 15 s); R17-1b is out (Y < 10 s). Nearly all of the cold start is Julia JIT of engine code,
+spread over request setup and the first frequency, not package loading or Metal shader compilation.
+Q5 (warm one-time cost, SAWMOD run 2): request -> env 0.04, setup 0.65, first frequency 1.15 (vs 0.52 steady),
+emit 0.21 s: ~1.5 s one-time per request.
 
 ## Round 11 (2026-09-26): in-app BLAS bug, MUMPS pivoting, early build with optimized prefetch
 In-app path (`perf/app_timing.py`, the app's headless solve on the SAWMOD project, 50 freqs, warm):
