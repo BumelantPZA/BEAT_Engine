@@ -57,6 +57,11 @@ end
 
 # MODE 1: fast sin/cos on the raw phase. MODE 2: precise sin/cos. MODE 3: fast sin/cos after
 # Cody-Waite reduction of the phase to [-pi, pi] (the fast intrinsics are accurate only there).
+# MODE 4: MODE 3 with the distance from a precise sqrt. The phase k*r reaches ~1e3 rad at 20 kHz and
+# 3 m, where the fast rsqrt's relative error becomes ~1e-3 rad per term (SAWMOD: 0.035 dB at 17-20 kHz
+# against the stock field, over the 0.01 dB target).
+@inline _metal_field_cis(phase, ::Val{4}) = _metal_field_cis(phase, Val(3))
+@inline _metal_precise_sqrt(x::Float32) = sqrt(x)   # called from a @fastmath block: not rewritten
 @inline _metal_field_cis(phase, ::Val{1}) = (_metal_fast_cos(phase), _metal_fast_sin(phase))
 @inline _metal_field_cis(phase, ::Val{2}) = (cos(phase), sin(phase))
 @inline function _metal_field_cis(phase, ::Val{3})
@@ -92,8 +97,13 @@ function _metal_fast_field_kernel!(
         if radius2 > 0.0f0
             @inbounds sn = normals4[s]
             @inbounds w = weights4[s]
-            inv_radius = _metal_fast_rsqrt(radius2)
-            radius = radius2 * inv_radius
+            if MODE == 4
+                radius = _metal_precise_sqrt(radius2)
+                inv_radius = 1.0f0 / radius
+            else
+                inv_radius = _metal_fast_rsqrt(radius2)
+                radius = radius2 * inv_radius
+            end
             phase = k * radius
             green_scale = inv_radius * inv_four_pi
             c, sn_ = _metal_field_cis(phase, Val(MODE))

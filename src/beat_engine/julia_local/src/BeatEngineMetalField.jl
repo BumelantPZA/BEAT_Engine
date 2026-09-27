@@ -272,6 +272,11 @@ function evaluate_galerkin_field_metal(
     point_count = length(eval_points)
     point_count == 0 && return return_device ? MtlArray(Complex{T}[]) : Complex{T}[]
     _require_metal!()
+    # Test (BLAB_TEST_FIELD_F64=1): a Float64 CPU reference of the same sum over the same Float32 surface
+    # data (slow; for judging the Float32 field kernels' accuracy only).
+    get(ENV, "BLAB_TEST_FIELD_F64", "0") == "1" &&
+        return _test_field_f64(eval_points, pressure, q_neumann, Float64(k), cache, return_device)
+    _require_metal!()
     T === Float32 && get(ENV, "BLAB_METAL_FIELD_FAST", "0") != "0" &&
         return _evaluate_galerkin_field_metal_fast(eval_points, pressure, q_neumann, k, cache; return_device=return_device)
     d_eval_points = MtlArray(_metal_eval_point_arrays(eval_points, T))
@@ -353,4 +358,31 @@ function evaluate_galerkin_field_metal(
     d_partials === nothing || Metal.unsafe_free!(d_partials)
     return_device || Metal.unsafe_free!(d_potentials)
     return result
+end
+
+
+function _test_field_f64(eval_points, pressure, q_neumann, k::Float64, cache, return_device::Bool)
+    n = cache.source_count
+    points = Float64.(Array(cache.source_points)); normals = Float64.(Array(cache.source_normals))
+    faces = reshape(Array(cache.source_faces), n, :); basis = Float64.(reshape(Array(cache.basis_values), n, :))
+    weights = Float64.(Array(cache.source_weights)); elements = Array(cache.source_elements)
+    p = ComplexF64.(Array(pressure)); q = ComplexF64.(Array(q_neumann))
+    ps = [(basis[s, 1] * p[faces[s, 1]] + basis[s, 2] * p[faces[s, 2]] + basis[s, 3] * p[faces[s, 3]]) * weights[s] for s in 1:n]
+    qs = [q[elements[s]] * weights[s] for s in 1:n]
+    out = Vector{ComplexF64}(undef, length(eval_points))
+    Threads.@threads for i in eachindex(eval_points)
+        x1, x2, x3 = Float64(eval_points[i][1]), Float64(eval_points[i][2]), Float64(eval_points[i][3])
+        acc = zero(ComplexF64)
+        @inbounds for s in 1:n
+            r1 = points[s, 1] - x1; r2 = points[s, 2] - x2; r3 = points[s, 3] - x3
+            radius = sqrt(r1 * r1 + r2 * r2 + r3 * r3)
+            radius == 0 && continue
+            green = cis(k * radius) / (4pi * radius)
+            projection = (r1 * normals[s, 1] + r2 * normals[s, 2] + r3 * normals[s, 3]) / radius
+            acc += green * (complex(0.0, k) - 1 / radius) * projection * ps[s] - green * qs[s]
+        end
+        out[i] = acc
+    end
+    result = ComplexF32.(out)
+    return return_device ? MtlArray(result) : result
 end

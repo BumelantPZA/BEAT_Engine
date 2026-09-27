@@ -1,5 +1,5 @@
 diff --git a/src/blab/solvers/engine_distribution.py b/src/blab/solvers/engine_distribution.py
-index 40299fc..bb2e824 100644
+index 40299fc..9048fad 100644
 --- a/src/blab/solvers/engine_distribution.py
 +++ b/src/blab/solvers/engine_distribution.py
 @@ -1,5 +1,7 @@
@@ -10,7 +10,7 @@ index 40299fc..bb2e824 100644
  try:
      import beat_engine
  except ImportError as exc:
-@@ -12,4 +14,98 @@ from beat_engine import backend_catalog as backend_catalog
+@@ -12,4 +14,100 @@ from beat_engine import backend_catalog as backend_catalog
  from beat_engine import backend_info as engine_backend_info
  from beat_engine import engine_paths as engine_paths
  
@@ -32,7 +32,9 @@ index 40299fc..bb2e824 100644
 +        "BLAB_TEST_COUPLED_PREFETCH": "1",   # round 11: on again, for EARLY_BUILD (see below)
 +        "BLAB_METAL_REGULAR_KERNEL_MODE": "pair_tilereduce",
 +        "BLAB_TEST_BLAS": "accelerate",
-+        "BLAB_METAL_FIELD_FAST": "3",
++        # 2026-09-27: mode 4 = mode 3 with a precise sqrt for the distance (the phase k*r); same speed,
++        # the closest Float32 field to a Float64 reference (SAWMOD 20 kHz 0.029 vs 0.045 dB, stock 0.030).
++        "BLAB_METAL_FIELD_FAST": "4",
 +        "BLAB_TEST_DENSE_STATS": "1",
 +        # 2026-09-26 round 5: threaded Burton-Miller matrix build, bit-identical (bem_matrix 0.10 -> 0.04).
 +        "BLAB_TEST_BM_THREADED": "1",

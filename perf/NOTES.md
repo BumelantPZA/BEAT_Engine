@@ -404,3 +404,19 @@ Micros on the SAWMOD FEM dump (`perf/mumps_param_micro.jl`, `mumps_loop_micro.jl
   above 10 kHz (low-frequency cancellation in the Schur complement). Rejected; left off by default.
 Conclusion: MUMPS is at its floor in double precision; the pipeline is now balanced between the CPU
 chain (~0.45) and the GPU lane (~0.33 + interlocks), so the next gain needs the GPU BEM kernel too.
+
+### Round 14 (2026-09-27): accuracy policy, dB metric, field kernel mode 4
+- The user adopted the accuracy policy now at the top of HANDOFF.md (0.01 dB = invisible; ~0.001 dB
+  per change OK; >= 0.1 dB rejected; in between ask). quick.py reports `maxdB` (within 60 dB of each
+  excitation's peak) and per-frequency dB with `"detail": true`.
+- Re-judged, SAWMOD 50 freqs vs the current test backend: MUMPS_SINGLE 1.11 dB (interface velocity at
+  46.6 Hz), 0.433 vs 0.469 s/freq -> rejected. ELIM_F32 0.10 dB (exterior pressure 781 Hz), 0.464 vs
+  0.469 -> rejected. Both: 0.416, 1.10 dB.
+- Test backend vs stock settings: 0.035 dB at 17-20 kHz, all from BLAB_METAL_FIELD_FAST=3 (without it
+  0.0014 dB but 0.654 s/freq). Modes 1/2: 0.054/0.035 dB (so not sin/cos).
+- BLAB_TEST_FIELD_F64=1 (Float64 CPU field from the same surface data) as the true reference:
+  SAWMOD worst dB: stock field 0.030, mode 3 0.045, mode 4 0.029. prototype2 quarter: stock 0.024,
+  mode 3 0.022, mode 4 0.018, all 0.071 s/freq (stock field 0.099).
+- MODE 4 (`BLAB_METAL_FIELD_FAST=4`): mode 3 with a precise sqrt for the distance (the phase k*r
+  reaches ~1e3 rad at 20 kHz, 3 m). Same speed, now the app test setting. Precise sin/cos on top
+  (tried): no gain, field 0.08 -> 0.15 s. Kahan accumulation: not measured (removed).

@@ -38,7 +38,27 @@ SECTIONS = ("bem_operator_s", "fem_condensation_s", "bem_matrix_s", "block_assem
 
 def decode(packed):
     raw, shape = packed
-    return np.frombuffer(base64.b64decode(raw), dtype=np.complex128)
+    values = np.frombuffer(base64.b64decode(raw), dtype=np.complex128)
+    return values.reshape(shape) if int(np.prod(shape)) == values.size else values
+
+
+# Accuracy target (user, 2026-09-27): level difference <= 0.01 dB at every point within 60 dB of the
+# peak, the peak taken per excitation (first axis) of each output at each frequency.
+DB_LIMIT = 0.01
+DB_WINDOW = 60.0
+
+
+def db_error(reference, output):
+    ref = np.abs(reference.reshape(reference.shape[0], -1) if reference.ndim == 2 else reference.reshape(1, -1))
+    out = np.abs(output.reshape(ref.shape))
+    worst = 0.0
+    for a, b in zip(ref, out):
+        peak = a.max()
+        if peak <= 0:
+            continue
+        mask = a >= peak * 10 ** (-DB_WINDOW / 20)
+        worst = max(worst, float(np.max(np.abs(20 * np.log10(np.maximum(b[mask], 1e-300) / a[mask])))))
+    return worst
 
 
 def run_config(worker, env, freqs, scratch):
@@ -74,7 +94,7 @@ def run_job(worker, job, out):
     keys = sorted(SEEN_KEYS)
     walls = {name: [] for name in configs}
     secs = {name: [] for name in configs}
-    reference, worst = None, {}
+    reference, worst, worst_db = None, {}, {}
     lines = []
     for name, env in configs.items():  # uncounted: compiles each config's code path
         run_config(worker, {k: env.get(k) for k in keys}, [200.0, 5000.0], QUEUE / "request.json")
@@ -99,14 +119,20 @@ def run_job(worker, job, out):
             err = max(np.linalg.norm(outputs[k] - reference[k]) / max(np.linalg.norm(reference[k]), 1e-30)
                       for k in reference)
             worst[name] = max(worst.get(name, 0.0), err)
+            worst_db[name] = max(worst_db.get(name, 0.0), max(db_error(reference[k], outputs[k]) for k in reference))
             if job.get("detail") and outputs is not reference:   # the worst outputs, as name@freq
                 per = sorted(((np.linalg.norm(outputs[k] - reference[k]) / max(np.linalg.norm(reference[k]), 1e-30), k)
                               for k in reference), reverse=True)
                 lines.append(f"  {name} worst: " + "  ".join(f"{k} {e:.1e}" for e, k in per[:8]))
-                by_freq = {}
+                by_freq, db_freq = {}, {}
                 for e, k in per:
-                    by_freq[k.split("@")[1]] = max(by_freq.get(k.split("@")[1], 0.0), e)
-                lines.append(f"  {name} by freq: " + "  ".join(f"{f}:{e:.0e}" for f, e in sorted(by_freq.items(), key=lambda t: float(t[0]))))
+                    f = k.split("@")[1]
+                    by_freq[f] = max(by_freq.get(f, 0.0), e)
+                    db_freq[f] = max(db_freq.get(f, 0.0), db_error(reference[k], outputs[k]))
+                lines.append(f"  {name} maxrel by freq: " + "  ".join(f"{f}:{e:.0e}" for f, e in sorted(by_freq.items(), key=lambda t: float(t[0]))))
+                lines.append(f"  {name} dB by freq: " + "  ".join(f"{f}:{e:.4f}" for f, e in sorted(db_freq.items(), key=lambda t: float(t[0]))))
+                db_keys = sorted(((db_error(reference[k], outputs[k]), k) for k in reference), reverse=True)[:6]
+                lines.append(f"  {name} worst dB: " + "  ".join(f"{k} {e:.4f}" for e, k in db_keys))
             lines.append(f"round {round_index + 1} {name:14s} {per_freq:.3f} s/freq")
             out.write_text("\n".join(lines) + "\n")
     base = statistics.median(walls[next(iter(configs))])
@@ -117,7 +143,8 @@ def run_job(worker, job, out):
         sec = "  ".join(f"{k.removesuffix('_s').replace('interface_', 'if_').replace('coupled_', 'c_')} {v:.2f}"
                         for k, v in med.items())
         lines.append(f"{name:14s} {statistics.median(w):.3f} [{min(w):.3f}-{max(w):.3f}]  "
-                     f"{base / statistics.median(w):.2f}x  maxrel {worst[name]:.1e}\n    {sec}")
+                     f"{base / statistics.median(w):.2f}x  maxrel {worst[name]:.1e}  maxdB {worst_db[name]:.4f}"
+                     f"{'' if worst_db[name] <= DB_LIMIT else ' OVER'}\n    {sec}")
     out.write_text("\n".join(lines) + "\n")
 
 

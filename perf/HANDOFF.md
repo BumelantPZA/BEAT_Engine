@@ -4,6 +4,24 @@ To continue in a new session, open `~/Desktop/Claude/Boundarylab/beat-engine-tes
 "Read perf/HANDOFF.md and continue with the next idea." Full history is in `perf/NOTES.md`
 (newest round on top).
 
+## Accuracy policy (agreed with the user 2026-09-27; replaces the old "maxrel <= 1e-5", which was
+## never the user's rule, only a default Claude set on 2026-09-26)
+Explain accuracy to the user in plain terms (dB change and seconds saved), not maxrel.
+- Scale: 0.001 dB arithmetic noise; **0.01 dB = invisible, upstream's "same answer" line**; 0.1 dB
+  about a plot's line width; 1 dB visibly wrong. Mesh coarseness alone moves results 0.02-0.5 dB.
+- Rule: changes that keep results identical or move them by ~0.001 dB may be switched on; anything
+  that moves results by >= 0.1 dB is rejected whatever it saves; in between, ask the user with the
+  seconds saved and the dB cost.
+- Upstream's own gate (docs/Metal Backend.md, scripts/compare_coupled_precision.jl): vs a CPU Float64
+  run, "5e-4 relative / 0.01 dB", dB = |20 log10(|new|/|ref|)| at points within 80 dB of the peak.
+- Measuring: `quick.py` prints `maxdB` (max level difference within 60 dB of each excitation's peak,
+  vs the job's first config, `OVER` if > 0.01) and, with `"detail": true`, dB and maxrel per
+  frequency plus the worst outputs. The first config is the reference: `{}` = stock settings;
+  `BLAB_TEST_FIELD_F64=1` = the same solve with a Float64 CPU field (true reference for the field).
+- Know the floor: against a Float64 field, every Float32 field kernel, stock included, is 0.02-0.03 dB
+  off at 10-20 kHz at the quietest points of the 60 dB window (Float32 summation). A max-dB limit of
+  0.01 there is below what Float32 can deliver; compare against stock, not against zero.
+
 ## Where things stand (after round 11, 2026-09-26)
 - Goal: shorten the whole SAWMOD coupled FEM-BEM solve (50 freqs) in Boundary Lab's
   "BEAT Engine (Apple Metal test)" solver. In-app, 50 freqs: 141 s (stock) → 58 s (round 3) → 51.2 s
@@ -148,8 +166,7 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 - Short test cycles (quick.py), never two benchmarks at once, don't kill the user's app
   processes.
 - Diagnose instead of restarting. After ~2 failed fixes of the same problem, report and ask.
-- Bit-changing work goes behind a `BLAB_TEST_*` switch; accuracy must be maxrel ≤ ~1e-5 vs
-  the app config.
+- Bit-changing work goes behind a `BLAB_TEST_*` switch and is judged by the accuracy policy below.
 - Commit and push to the fork at each step.
 - Ask before installing or upgrading anything in the app checkout.
 - Keep tokens low.
@@ -221,5 +238,5 @@ cd perf && PYTHONPATH=$PWD/../src nohup ../../boundary-lab/.venv/bin/python $PWD
 5. Anything that cuts memory traffic beside MUMPS (stale GMRES reads ~0.35 GB per iteration).
 6. Other Macs: the pipeline adapts (threads = core count); MUMPS single-thread speed sets the floor.
 
-Not viable under 1e-5 (Fable's analysis): interior ROM / Craig-Bampton, rational interpolation
+Not viable at upstream's accuracy (Fable's analysis): interior ROM / Craig-Bampton, rational interpolation
 of S(k) over frequency, F32 MUMPS, F32 elimination.
