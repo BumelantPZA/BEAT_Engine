@@ -43,7 +43,9 @@ export assemble_condensed_regular_operators,
     prepare_condensed_coupled_cache,
     release_condensed_coupled_cache!,
     build_condensed_coupled_system,
+    condensed_metal_operators,
     release_condensed_coupled_system!,
+    clear_condensed_host_pool!,
     solve_condensed_coupled_excitations,
     solve_condensed_coupled_system,
     solve_condensed_coupled_systems
@@ -173,6 +175,7 @@ _dense_refinement_enabled(bem_backend::Symbol=:cpu) = _coupled_switch("BLAB_COUP
 _dense_double_assembly(bem_backend::Symbol=:cpu) =
     _dense_float64_enabled(bem_backend) || _dense_refinement_enabled(bem_backend)
 
+include(joinpath(@__DIR__, "BeatEngineCoupledHostPool.jl"))
 include(joinpath(@__DIR__, "BeatEngineCoupledDenseLU.jl"))
 
 """
@@ -207,6 +210,55 @@ widened copy of `fem_mesh`.
   they depend on (vertex coordinates, tetrahedra, per-vertex bulk-loss factors, wall matrices), so
   a mesh or loss change made in place is picked up.
 """
+# Position of each stored entry of `part` in `whole`'s nonzeros, or `nothing` if `part` has an entry
+# outside `whole`'s pattern (or the stiffness and mass patterns differ, checked by the caller).
+function _pattern_positions(part::SparseMatrixCSC, whole::SparseMatrixCSC)
+    size(part) == size(whole) || return nothing
+    map = Vector{Int}(undef, nnz(part))
+    rows = rowvals(whole)
+    for column in axes(part, 2)
+        range = nzrange(whole, column)
+        for entry in nzrange(part, column)
+            local_index = searchsortedfirst(view(rows, range), rowvals(part)[entry])
+            (local_index <= length(range) && rows[range[local_index]] == rowvals(part)[entry]) || return nothing
+            map[entry] = range[local_index]
+        end
+    end
+    return map
+end
+
+# The dynamic stiffness written straight into the stiffness pattern, entry by entry in the same order
+# of operations as the sparse expressions in `_fem_system_float64` (each of which allocated and merged
+# a 330k-entry matrix on SAWMOD), so the result is bit-identical.
+function _fem_system_in_pattern(matrices, maps, prepared, omega, frequency_hz, sound_speed, density)
+    stiffness, mass = matrices.stiffness, matrices.mass
+    squared_wavenumber = (omega / Float64(sound_speed))^2
+    values = Vector{ComplexF64}(undef, nnz(stiffness))
+    @inbounds for j in eachindex(values)
+        values[j] = Complex{Float64}(nonzeros(stiffness)[j]) - squared_wavenumber * nonzeros(mass)[j]
+    end
+    bulk_scale = Complex{Float64}(0, propagation_sign() * squared_wavenumber)
+    bulk_values = nonzeros(matrices.bulk_loss_mass)
+    @inbounds for (entry, j) in enumerate(maps.bulk)
+        values[j] -= bulk_scale * bulk_values[entry]
+    end
+    for (operator, matrix, map) in zip(prepared.wall_impedance_operators, matrices.walls, maps.walls)
+        admittance = miki_rigid_backed_surface_admittance(
+            Float64(frequency_hz),
+            Float64(sound_speed),
+            Float64(density),
+            Float64(operator.thickness_m),
+            Float64(operator.flow_resistivity_pa_s_per_m2),
+        )
+        scale = neumann_scale(Float64(density), omega) * admittance
+        wall_values = nonzeros(matrix)
+        @inbounds for (entry, j) in enumerate(map)
+            values[j] -= scale * wall_values[entry]
+        end
+    end
+    return SparseMatrixCSC(size(stiffness)..., stiffness.colptr, stiffness.rowval, values)
+end
+
 function _fem_system_float64(store, fem_mesh::VolumeMesh, prepared, frequency_hz, sound_speed, density)
     walls = [operator.matrix for operator in prepared.wall_impedance_operators]
     cached = !isnothing(store) && haskey(store, :matrices) &&
@@ -244,6 +296,15 @@ function _fem_system_float64(store, fem_mesh::VolumeMesh, prepared, frequency_hz
         end
     end
     omega = 2pi * Float64(frequency_hz)
+    maps = isnothing(store) || !cached ? nothing : get(store, :pattern_maps, nothing)
+    if isnothing(maps)
+        maps = (bulk=_pattern_positions(matrices.bulk_loss_mass, matrices.stiffness),
+                walls=[_pattern_positions(matrix, matrices.stiffness) for matrix in matrices.walls])
+        isnothing(store) || (store[:pattern_maps] = maps)
+    end
+    if !isnothing(maps.bulk) && all(!isnothing, maps.walls)
+        return _fem_system_in_pattern(matrices, maps, prepared, omega, frequency_hz, sound_speed, density)
+    end
     system = assemble_fem_dynamic_stiffness(
         matrices.stiffness,
         matrices.mass,
@@ -557,23 +618,47 @@ end
 `M_kk⁻¹ rhs` for a complex right-hand side. The Cholesky path solves the real and imaginary parts
 as one real panel.
 """
-function _mass_block_solve(block, rhs::AbstractMatrix)
-    if block.kind == :cholmod
-        rows, columns = size(rhs)
-        panel = Matrix{Float64}(undef, rows, 2 * columns)
-        @inbounds for column in 1:columns, row in 1:rows
-            value = rhs[row, column]
-            panel[row, column] = real(value)
-            panel[row, columns + column] = imag(value)
+# Panel columns `chunk` (real parts in 1:columns, imaginary parts after) into the complex result.
+function _write_mass_chunk!(result::Matrix{ComplexF64}, solved::Matrix{Float64}, chunk, columns::Int)
+    @inbounds for (local_column, column) in enumerate(chunk)
+        if column <= columns
+            for row in axes(result, 1)
+                result[row, column] = complex(solved[row, local_column], imag(result[row, column]))
+            end
+        else
+            target = column - columns
+            for row in axes(result, 1)
+                result[row, target] = complex(real(result[row, target]), solved[row, local_column])
+            end
         end
-        solved = block.factor \ panel
-        result = Matrix{ComplexF64}(undef, rows, columns)
-        @inbounds for column in 1:columns, row in 1:rows
-            result[row, column] = complex(solved[row, column], solved[row, columns + column])
-        end
-        return result
     end
-    return block.factor \ ComplexF64.(rhs)
+    return result
+end
+
+# Parallel tasks for the Cholesky mass solve. CHOLMOD's workspace is task-local and the solve only
+# reads the factor; the columns are independent, so the result is bit-identical. More than 4 tasks
+# measured no faster on SAWMOD.
+const MASS_SOLVE_TASKS = 4
+
+function _mass_block_solve(block, rhs::AbstractMatrix)
+    block.kind == :cholmod || return block.factor \ ComplexF64.(rhs)
+    rows, columns = size(rhs)
+    panel = _pool_take(Float64, rows, 2 * columns)
+    @inbounds for column in 1:columns, row in 1:rows
+        value = rhs[row, column]
+        panel[row, column] = real(value)
+        panel[row, columns + column] = imag(value)
+    end
+    tasks = min(MASS_SOLVE_TASKS, Threads.nthreads())
+    chunks = tasks > 1 && size(panel, 2) >= 2 * tasks ?
+             collect(Iterators.partition(1:size(panel, 2), cld(size(panel, 2), tasks))) : [1:size(panel, 2)]
+    parts = map(chunk -> Threads.@spawn(block.factor \ panel[:, chunk]), chunks)
+    result = _pool_take(ComplexF64, rows, columns)
+    for (chunk, part) in zip(chunks, parts)
+        _write_mass_chunk!(result, fetch(part), chunk, columns)
+    end
+    _pool_give!(panel)
+    return result
 end
 
 """
@@ -649,8 +734,20 @@ function _flux_mass_presolve(operator, schur::AbstractMatrix, motion_columns::Ab
         end
     end
     schur_blocks = map(operator.blocks) do block
-        local_schur = _split_timed!(() -> ComplexF64.(schur[block.rows, block.rows]), split, :schur_convert)
-        _split_timed!(() -> _mass_block_solve(block, local_schur), split, :mass_solve)
+        local_schur = _split_timed!(split, :schur_convert) do
+            # `ComplexF64.(schur[block.rows, block.rows])`, indexed in place into a pooled array.
+            converted = _pool_take(ComplexF64, length(block.rows), length(block.rows))
+            block_rows = block.rows
+            Threads.@threads for column in eachindex(block_rows)
+                @inbounds for row in eachindex(block_rows)
+                    converted[row, column] = ComplexF64(schur[block_rows[row], block_rows[column]])
+                end
+            end
+            converted
+        end
+        solved = _split_timed!(() -> _mass_block_solve(block, local_schur), split, :mass_solve)
+        _pool_give!(local_schur)
+        solved
     end
     motion_solution = _split_timed!(() -> _interface_mass_apply(operator, motion_columns), split, :mass_solve)
     return (schur_blocks=schur_blocks, motion_solution=motion_solution, split=split)
@@ -763,6 +860,7 @@ function _build_condensation(
     schur_float64::Bool=false,
     fem_solver::Symbol=:umfpack,
     mumps_store=nothing,
+    defer_interior_fields::Bool=false,
 ) where {T<:AbstractFloat}
     schur_block_columns > 0 || error("Schur block column count must be positive.")
     fem_solver in (:umfpack, :mumps) || error("Unsupported FEM condensation solver: $fem_solver.")
@@ -796,6 +894,7 @@ function _build_condensation(
                     motion_force=motion_force,
                     mumps_store=mumps_store,
                     schur_float64=schur_float64,
+                    defer_interior_fields=defer_interior_fields,
                 )
             catch exception
                 exception isa InterruptException && rethrow()
@@ -935,6 +1034,7 @@ function _build_mumps_condensation(
     motion_force=nothing,
     mumps_store=nothing,
     schur_float64::Bool=false,
+    defer_interior_fields::Bool=false,
 ) where {S<:AbstractFloat,T<:AbstractFloat}
     threads = mumps_threads()
     owned = isnothing(mumps_store)
@@ -951,11 +1051,19 @@ function _build_mumps_condensation(
 
         factorization_started = time_ns()
         # Assembly sums the (i, j) and (j, i) contributions separately, so allow round-off.
-        schur_double = mumps_factorize!(solver, fem_system; symmetry_tolerance=64 * eps(S))
+        schur_double = mumps_factorize!(solver, fem_system; symmetry_tolerance=64 * eps(S),
+                                        schur_storage=_pool_take(ComplexF64, length(retained), length(retained)))
         factorization_s = (time_ns() - factorization_started) / 1.0e9
 
         schur_started = time_ns()
-        schur = schur_float64 ? schur_double : Complex{T}.(schur_double)
+        schur = if schur_float64
+            schur_double
+        else
+            # The Float64 copy goes back to the pool once converted.
+            converted = _pool_converted(Complex{T}, schur_double)
+            _pool_give!(schur_double)
+            converted
+        end
         transducer_condensed = !isnothing(motion_surface)
         transducer_started = time_ns()
         motion_fields = if transducer_condensed
@@ -966,16 +1074,29 @@ function _build_mumps_condensation(
             transducer_count = size(surface, 2)
             columns = hcat(Matrix(surface), Matrix(force))
             reduced = mumps_reduce(solver, columns)
-            interior_solution = mumps_interior_solve(solver, columns)
-            motion_solution = interior_solution[interior_vertices, 1:transducer_count]
-            force_interior = force[interior_vertices, :]
+            # The interior solve and what depends on it. Expanding that reduction with x_Γ = 0 is
+            # A_II⁻¹ b_I, the interior solve, but reuses the reduction's forward sweep; it must be
+            # the next MUMPS call on `solver` (see `mumps_expand`).
+            interior_fields = () -> begin
+                interior_solution = mumps_expand(solver, zeros(ComplexF64, length(solver.schur_variables), size(columns, 2)))
+                motion_solution = interior_solution[interior_vertices, 1:transducer_count]
+                force_interior = force[interior_vertices, :]
+                (
+                    motion_solution=motion_solution,
+                    force_solution=interior_solution[interior_vertices, (transducer_count+1):end],
+                    motion_force_correction=Matrix(transpose(force_interior) * motion_solution),
+                )
+            end
+            # `defer_interior_fields`: the caller runs `interior_fields` itself (the FEM stage of
+            # `build_condensed_coupled_system` runs it beside its interface-mass presolve) and
+            # merges the result in.
             (
                 motion_interior=surface[interior_vertices, :],
-                motion_solution=motion_solution,
-                force_solution=interior_solution[interior_vertices, (transducer_count+1):end],
+                (defer_interior_fields ? (motion_solution=nothing, force_solution=nothing, motion_force_correction=nothing) :
+                 interior_fields())...,
                 motion_gamma=reduced[:, 1:transducer_count],
                 force_gamma=reduced[:, (transducer_count+1):end],
-                motion_force_correction=Matrix(transpose(force_interior) * motion_solution),
+                deferred_interior_fields=defer_interior_fields ? interior_fields : nothing,
             )
         else
             (
@@ -1056,6 +1177,11 @@ function _forward_schur(
     R = Complex{result_type}
     interior_rhs = ComplexF64.(fem_rhs[condensation.interior_vertices, :])
     if hasproperty(condensation, :backend) && condensation.backend == :mumps_seq
+        # Voltage-only excitations leave the FEM right-hand side zero, and so its reduction; skip
+        # the MUMPS call (the back substitution never expands it).
+        if all(iszero, fem_rhs)
+            return zeros(R, condensation.retained_count, size(fem_rhs, 2)), interior_rhs
+        end
         reduced = mumps_reduce(condensation.mumps_solver, fem_rhs)
         return R.(reduced), interior_rhs
     end
@@ -1408,8 +1534,12 @@ function prepare_condensed_coupled_cache(
         mumps_store=Dict{Symbol,Any}(),
         # Double-precision FEM matrices for BLAB_COUPLED_FEM_FLOAT64.
         fem_float64_store=Dict{Symbol,Any}(),
+        # The sweep's reused Float32 dense factor (`RefinedDenseLU`).
+        dense_factor_reuse=DenseFactorReuse(),
     )
 end
+
+_dense_factor_reuse(cache) = hasproperty(cache, :dense_factor_reuse) ? cache.dense_factor_reuse : nothing
 
 function release_condensed_coupled_cache!(cache)
     # Extra bundles (orders other than the base) own their own device caches
@@ -1474,6 +1604,11 @@ always produces the `:fem_interface_condensed` formulation and never the monolit
 
 `cache` is a `prepare_condensed_coupled_cache` result. `regular_quadrature_order` selects which of its
 bundles to assemble with, defaulting to the cache's base order.
+
+Hooks for a pipelined sweep (`BeatEngineCoupledPipeline`): `prefetched_operators` is a task
+returning `condensed_metal_operators` for this frequency, used instead of assembling here;
+`on_operators_ready(flux_columns)` is called once the BEM operators exist, so the next frequency's
+can be assembled; `dense_gate` is an event the dense part waits for.
 """
 function build_condensed_coupled_system(
     fem_mesh::VolumeMesh{T},
@@ -1496,6 +1631,9 @@ function build_condensed_coupled_system(
     prescribed_bem_normal_velocity=nothing,
     schur_block_columns::Int=32,
     allow_transducer_condensation::Bool=true,
+    prefetched_operators=nothing,
+    on_operators_ready=nothing,
+    dense_gate=nothing,
 ) where {T<:AbstractFloat}
     # `relative_residual` needs the monolithic coupled matrix, which this formulation never
     # forms. `fem_interior_residual` on each solution is the condensed-appropriate check.
@@ -1573,7 +1711,10 @@ function build_condensed_coupled_system(
 
     omega = T(2pi) * frequency_hz
     wavenumber = omega / sound_speed
-    fem_system = assemble_fem_dynamic_stiffness(
+    # The Float64 system below replaces this one when enabled; don't assemble it (and its wall
+    # terms) only to drop it.
+    skip_fem_single = T !== Float64 && _fem_float64_enabled(bem_backend)
+    fem_system = skip_fem_single ? nothing : assemble_fem_dynamic_stiffness(
         prepared.stiffness,
         prepared.mass,
         wavenumber;
@@ -1589,7 +1730,7 @@ function build_condensed_coupled_system(
         )
         for operator in prepared.wall_impedance_operators
     ]
-    for (operator, admittance) in zip(prepared.wall_impedance_operators, wall_admittances)
+    skip_fem_single || for (operator, admittance) in zip(prepared.wall_impedance_operators, wall_admittances)
         fem_system -= neumann_scale(density, omega) * admittance .* operator.matrix
     end
     interface_operators = prepared.interface_operators
@@ -1689,7 +1830,12 @@ function build_condensed_coupled_system(
             interface_operators,
             gamma_fem_vertices;
             condensation_options...,
+            defer_interior_fields=true,
         )
+        # The transducer columns' interior solve runs beside the mass presolve, which reads only
+        # `motion_gamma` and makes no MUMPS call (see `_build_mumps_condensation`).
+        interior_fields = get(stage_condensation, :deferred_interior_fields, nothing)
+        interior_task = isnothing(interior_fields) ? nothing : Threads.@spawn(interior_fields())
         presolve = mass_in_fem_stage ? _flux_mass_presolve(
             mass_operator,
             stage_condensation.schur,
@@ -1698,64 +1844,65 @@ function build_condensed_coupled_system(
                 resolved_transducer_operators, gamma_fem_vertices,
             ),
         ) : nothing
+        isnothing(interior_task) || (stage_condensation = merge(stage_condensation, fetch(interior_task)))
         (stage_condensation, presolve)
     end
     condensation_started = time_ns()
     condensation_task = stage_overlap ? Threads.@spawn(fem_stage()) : nothing
 
     bem_operator_started = time_ns()
-    # This solver's own fork of the CPU regular assembly, so it can be optimised without
-    # touching the shared path every other backend runs through. Behaviourally identical to
-    # `assemble_regular_galerkin_operators(...; backend=:cpu)`, pinned by an equivalence test.
-    operators = if prepared.bem_backend == :metal
-        # Metal assembles the four operators on the GPU; the condensed algebra
-        # below is CPU-only, so bring them down and free the device copies.
-        device_operators = assemble_regular_galerkin_operators(
-            bem_mesh,
-            prepared.p1,
-            prepared.dp0,
-            wavenumber,
-            prepared.rule;
-            skip_singular=false,
-            singular_order=singular_order,
-            backend=:metal,
-            device_cache=prepared.device_cache,
-            singular_cache=prepared.singular_cache,
-            device_singular_cache=prepared.device_singular_cache,
-            symmetry_mode=prepared.symmetry_mode,
+    assembled = if !isnothing(prefetched_operators)
+        # Assembled on the GPU for this frequency while the previous frequency's host stages ran
+        # (`condensed_metal_operators`); `bem_operator_s` is the wait.
+        fetched = fetch(prefetched_operators)
+        fetched.k == wavenumber || error("prefetched operators for k=$(fetched.k), need k=$(wavenumber)")
+        fetched
+    elseif prepared.bem_backend == :metal
+        _condensed_metal_assembly(
+            prepared, bem_mesh, wavenumber, singular_order,
+            _flux_columns(interface_operators, bem_motion_flux, bem_prescribed_neumann),
         )
-        # Wraps shared device storage in place (copies it when the storage mode
-        # is private); either way the host tuple owns the device buffers, so
-        # `device_operators` must not be released separately.
-        metal_host_operators(device_operators)
     else
-        assemble_condensed_regular_operators(
-            bem_mesh,
-            prepared.p1,
-            prepared.dp0,
-            wavenumber,
-            prepared.rule;
-            skip_singular=false,
-            singular_order=singular_order,
-            singular_cache=prepared.singular_cache,
-            cpu_cache=prepared.cpu_assembly_cache,
-            symmetry_mode=prepared.symmetry_mode,
+        # This solver's own fork of the CPU regular assembly, so it can be optimised without
+        # touching the shared path every other backend runs through. Behaviourally identical to
+        # `assemble_regular_galerkin_operators(...; backend=:cpu)`, pinned by an equivalence test.
+        (
+            operators=assemble_condensed_regular_operators(
+                bem_mesh,
+                prepared.p1,
+                prepared.dp0,
+                wavenumber,
+                prepared.rule;
+                skip_singular=false,
+                singular_order=singular_order,
+                singular_cache=prepared.singular_cache,
+                cpu_cache=prepared.cpu_assembly_cache,
+                symmetry_mode=prepared.symmetry_mode,
+            ),
+            row_weights=nothing,
+            combined=false,
+            flux_columns=nothing,
         )
     end
+    operators = assembled.operators
     bem_operator_s = (time_ns() - bem_operator_started) / 1.0e9
+    isnothing(on_operators_ready) || on_operators_ready(assembled.flux_columns)
 
     bem_matrix_started = time_ns()
-    bem_lhs, bem_rhs_operator = burton_miller_neumann_matrices(
-        operators,
-        prepared.identity_p1_p1,
-        prepared.identity_p1_dp0,
-        wavenumber,
+    bem_lhs, bem_rhs_operator = _burton_miller_matrices_threaded(
+        operators, prepared.identity_p1_p1, prepared.identity_p1_dp0, wavenumber;
+        row_weights=assembled.row_weights, flux_columns=assembled.flux_columns, combined=assembled.combined,
     )
     # `operators` is dead from here on and the matrices above are freshly
     # allocated host arrays, so free the Metal buffers now rather than leaking
     # one operator set per condensed frequency.
     prepared.bem_backend == :metal && release_operator_storage!(operators)
-    bem_interface_block = -(bem_rhs_operator * Complex{T}.(interface_operators.bem_flux))
+    # `-(bem_rhs_operator * flux)`, into a pooled array and negated in place (a `mul!` with
+    # alpha = -1 rounds differently).
+    flux_operator = Complex{T}.(interface_operators.bem_flux)
+    bem_interface_block = mul!(_pool_take(eltype(bem_rhs_operator), size(bem_rhs_operator, 1), size(flux_operator, 2)),
+                               bem_rhs_operator, flux_operator)
+    bem_interface_block .= .-bem_interface_block
     bem_motion_block = transducer_count == 0 ? nothing : -(bem_rhs_operator * bem_motion_flux)
     bem_prescribed_rhs = prescribed_bem_count == 0 ?
                          zeros(Complex{T}, length(bem_mesh.vertices), 0) :
@@ -1777,6 +1924,9 @@ function build_condensed_coupled_system(
         end
     end
     fem_condensation_s = (time_ns() - condensation_started) / 1.0e9
+    # A pipelined sweep (BeatEngineCoupledPipeline) may run this build beside the previous frequency's
+    # solve; the dense part below, which reuses that frequency's stale factor, waits for it.
+    isnothing(dense_gate) || wait(dense_gate)
 
     block_assembly_started = time_ns()
     fem_count = length(fem_mesh.vertices)
@@ -1824,7 +1974,7 @@ function build_condensed_coupled_system(
     ]
     force_factor = T[transducer.bl_n_per_a for transducer in transducers]
 
-    coupled = zeros(Complex{dense_type}, system_count, system_count)
+    coupled = _pool_zeros(Complex{dense_type}, system_count, system_count)
     interface_elimination_s = 0.0
     elimination = nothing
     # The Schur complement takes the slot the full FEM block occupies in the monolithic
@@ -1881,6 +2031,12 @@ function build_condensed_coupled_system(
             elimination_split[Symbol("fem_stage_", key)] = value
         end
     end
+    dense_correction = nothing
+    # Under refinement with a Float32 BEM block, the flux elimination's `B_q W` products stay out of
+    # the dense matrix (`RefinedDenseLU`'s `correction`): the Float64 residuals apply them exactly and
+    # only the Float32 LU input gets them, from cgemms.
+    implicit_flux_products = eltype(bem_interface_block) === ComplexF32 &&
+                             dense_type === Float64 && T !== Float64 && _dense_refinement_enabled(bem_backend)
     if interface_elimination != :none
         elimination_started = time_ns()
         # The same blocks the unmodified layout writes (at the dense scalar type), promoted for the elimination.
@@ -1925,11 +2081,29 @@ function build_condensed_coupled_system(
             else
                 fem_stage_presolve
             end
-            interface_block = _split_timed!(() -> ComplexF64.(bem_interface_block), elimination_split, :block_convert)
-            _flux_block_products!(
-                coupled, bem_range, bem_columns, mass_operator, presolve.schur_blocks, interface_block,
-                elimination_split,
-            )
+            interface_block = _split_timed!(() -> _pool_converted(ComplexF64, bem_interface_block), elimination_split, :block_convert)
+            if implicit_flux_products
+                dense_correction = (
+                    rows=bem_range,
+                    block32=bem_interface_block,
+                    parts=[
+                        (
+                            columns=bem_columns[block.rows],
+                            coupling=block.contiguous ? view(interface_block, :, first(block.dofs):last(block.dofs)) :
+                                     interface_block[:, block.dofs],
+                            coupling32=block.contiguous ?
+                                       view(bem_interface_block, :, first(block.dofs):last(block.dofs)) :
+                                       bem_interface_block[:, block.dofs],
+                            schur=schur_block,
+                        ) for (block, schur_block) in zip(mass_operator.blocks, presolve.schur_blocks)
+                    ],
+                )
+            else
+                _flux_block_products!(
+                    coupled, bem_range, bem_columns, mass_operator, presolve.schur_blocks, interface_block,
+                    elimination_split,
+                )
+            end
             if transducer_count > 0
                 motion_coupling = _split_timed!(
                     () -> interface_block * presolve.motion_solution, elimination_split, :product,
@@ -1958,7 +2132,7 @@ function build_condensed_coupled_system(
                 (mass_factorization \ schur_double, mass_factorization \ gamma_mech)
             end
             schur_double = nothing
-            interface_block = _split_timed!(() -> ComplexF64.(bem_interface_block), elimination_split, :block_convert)
+            interface_block = _split_timed!(() -> _pool_converted(ComplexF64, bem_interface_block), elimination_split, :block_convert)
             schur_coupling, motion_coupling = _split_timed!(elimination_split, :product) do
                 (interface_block * schur_solution, interface_block * motion_solution)
             end
@@ -1991,9 +2165,13 @@ function build_condensed_coupled_system(
 
     coupled_factorization_started = time_ns()
     factorization = dense_type === Float64 && T !== Float64 && _dense_refinement_enabled(bem_backend) ?
-                    RefinedDenseLU(coupled) : lu!(coupled)
+                    RefinedDenseLU(coupled; correction=dense_correction, reuse=_dense_factor_reuse(condensed_cache)) :
+                    lu!(coupled)
     coupled_factorization_s = (time_ns() - coupled_factorization_started) / 1.0e9
 
+    # Nothing below references the BEM matrices; `release_condensed_coupled_system!` returns the rest.
+    _pool_give!(bem_lhs, bem_rhs_operator)
+    isnothing(dense_correction) && _pool_give!(bem_interface_block)
     return (
         fem_mesh=fem_mesh,
         bem_mesh=bem_mesh,
@@ -2070,7 +2248,159 @@ function build_condensed_coupled_system(
     )
 end
 
+# `burton_miller_neumann_matrices` with each output column on its own thread, into pooled arrays.
+# The per-entry expressions are the broadcasts' own, in the same order, so the result is
+# bit-identical; the broadcasts run on one thread and took ~0.15 s per frequency on the critical
+# path. `row_weights` applies the symmetry row weights the assembly left out, `combined` reads the
+# combined operators (`MetalAssemblyOptions`), and columns outside `flux_columns` are zero.
+function _burton_miller_matrices_threaded(
+    operators, identity_p1_p1, identity_p1_dp0, k::T; row_weights=nothing, flux_columns=nothing, combined=false,
+) where {T<:AbstractFloat}
+    coupling = burton_miller_coupling(k)
+    half = Complex{T}(0.5)
+    D, H = operators.double_layer, operators.hypersingular
+    S, Kp = operators.single_layer, operators.adjoint_double_layer
+    lhs = _pool_take(Complex{T}, size(D)...)
+    rhs = _pool_take(Complex{T}, size(S)...)
+    if !isnothing(row_weights)
+        # The assembly left the symmetry row weights to this pass (`operator .*= w`, row i scaled by
+        # w[i]); the same products are formed here, then combined exactly as below.
+        w = Complex{T}.(row_weights)
+        if combined
+            # Combined assembly: D holds A = -D + βH and S holds C = -S - βK'.
+            Threads.@threads for j in axes(lhs, 2)
+                @inbounds for i in axes(lhs, 1)
+                    lhs[i, j] = half * identity_p1_p1[i, j] + D[i, j] * w[i]
+                end
+            end
+            Threads.@threads for j in axes(rhs, 2)
+                if !isnothing(flux_columns) && !flux_columns[j]
+                    @inbounds rhs[:, j] .= zero(Complex{T})
+                    continue
+                end
+                @inbounds for i in axes(rhs, 1)
+                    rhs[i, j] = S[i, j] * w[i] - coupling * (half * identity_p1_dp0[i, j])
+                end
+            end
+            return lhs, rhs
+        end
+        Threads.@threads for j in axes(lhs, 2)
+            @inbounds for i in axes(lhs, 1)
+                lhs[i, j] = half * identity_p1_p1[i, j] - D[i, j] * w[i] + coupling * (H[i, j] * w[i])
+            end
+        end
+        Threads.@threads for j in axes(rhs, 2)
+            if !isnothing(flux_columns) && !flux_columns[j]
+                @inbounds rhs[:, j] .= zero(Complex{T})
+                continue
+            end
+            @inbounds for i in axes(rhs, 1)
+                rhs[i, j] = -(S[i, j] * w[i]) - coupling * (Kp[i, j] * w[i] + half * identity_p1_dp0[i, j])
+            end
+        end
+        return lhs, rhs
+    end
+    Threads.@threads for j in axes(lhs, 2)
+        @inbounds for i in axes(lhs, 1)
+            lhs[i, j] = half * identity_p1_p1[i, j] - D[i, j] + coupling * H[i, j]
+        end
+    end
+    Threads.@threads for j in axes(rhs, 2)
+        @inbounds for i in axes(rhs, 1)
+            rhs[i, j] = -S[i, j] - coupling * (Kp[i, j] + half * identity_p1_dp0[i, j])
+        end
+    end
+    return lhs, rhs
+end
+
+"""
+    _flux_columns(interface_operators, bem_motion_flux, bem_prescribed_neumann) -> BitVector
+
+The DP0 columns (faces) that carry flux in some right-hand-side block. S and K' are only ever
+multiplied by those flux matrices, so the Metal assembly skips the other columns and the host
+combine writes zeros there.
+"""
+function _flux_columns(interface_operators, bem_motion_flux, bem_prescribed_neumann)
+    used = vec(any(!iszero, interface_operators.bem_flux; dims=2))
+    size(bem_motion_flux, 2) == 0 || (used .|= vec(any(!iszero, bem_motion_flux; dims=2)))
+    size(bem_prescribed_neumann, 2) == 0 || (used .|= vec(any(!iszero, bem_prescribed_neumann; dims=2)))
+    return used
+end
+
+# The four Metal BEM operators for the condensed builder, as host arrays, with what the host
+# Burton-Miller combine needs to know about them. The builder assembles with the tile-reduce kernels
+# unless BLAB_METAL_REGULAR_KERNEL_MODE says otherwise: under symmetry the host combine then applies
+# the row weights (instead of a separate GPU pass) and the GPU writes the combined operators
+# A = -D + βH and C = -S - βK' (CUDA's combined assembly), and faces without flux are skipped.
+function _condensed_metal_assembly(prepared, bem_mesh, wavenumber, singular_order, flux_columns)
+    kernel_mode = BeatEngineCore._normalized_metal_regular_kernel_mode(nothing; default="pair_tilereduce")
+    supported = BeatEngineCore.metal_combined_assembly_supported(kernel_mode)
+    host_row_weights = supported && BeatEngineCore.normalized_symmetry_mode(prepared.symmetry_mode) != :off
+    options = BeatEngineCore.MetalAssemblyOptions(
+        regular_kernel_mode=kernel_mode,
+        bm_coupling=host_row_weights ? Complex{Float32}(burton_miller_coupling(wavenumber)) : nothing,
+        flux_mask=supported && !isnothing(flux_columns) ? BeatEngineCore.MtlArray(Int32.(flux_columns)) : nothing,
+        apply_row_weights=!host_row_weights,
+    )
+    device_operators = assemble_regular_galerkin_operators(
+        bem_mesh,
+        prepared.p1,
+        prepared.dp0,
+        wavenumber,
+        prepared.rule;
+        skip_singular=false,
+        singular_order=singular_order,
+        backend=:metal,
+        device_cache=prepared.device_cache,
+        singular_cache=prepared.singular_cache,
+        device_singular_cache=prepared.device_singular_cache,
+        symmetry_mode=prepared.symmetry_mode,
+        metal_options=options,
+    )
+    # Wraps shared device storage in place (copies it when the storage mode is private); either
+    # way the host tuple owns the device buffers, so `device_operators` must not be released
+    # separately.
+    return (
+        operators=metal_host_operators(device_operators),
+        row_weights=host_row_weights ? p1_symmetry_orbit_weights(bem_mesh, prepared.symmetry_mode) : nothing,
+        combined=host_row_weights,
+        flux_columns=supported ? flux_columns : nothing,
+    )
+end
+
+"""
+    condensed_metal_operators(cache, bem_mesh, frequency_hz, sound_speed; quadrature_order, singular_order, flux_columns)
+
+The Metal BEM operators exactly as `build_condensed_coupled_system` assembles them for this
+frequency, so a sweep can assemble frequency i+1 on the GPU while frequency i's host stages run and
+pass the result as `prefetched_operators`. `flux_columns` is what the previous build reported
+through `on_operators_ready`; the flux pattern does not change with frequency.
+"""
+function condensed_metal_operators(
+    cache, bem_mesh::BoundaryMesh{T}, frequency_hz::T, sound_speed::T;
+    quadrature_order::Int, singular_order::Int, flux_columns=nothing,
+) where {T<:AbstractFloat}
+    prepared = merge(cache.base, cache.quadrature_bundles[quadrature_order])
+    wavenumber = T(2pi) * frequency_hz / sound_speed
+    return (k=wavenumber, _condensed_metal_assembly(prepared, bem_mesh, wavenumber, singular_order, flux_columns)...)
+end
+
 function release_condensed_coupled_system!(system)
+    # The system's large host arrays go back to the pool for the next frequency. The current stale
+    # factor stays with the cache's `DenseFactorReuse`, which a later frequency may still reuse.
+    if hasproperty(system, :factorization) && system.factorization isa RefinedDenseLU
+        refined = system.factorization
+        _pool_give!(refined.matrix)
+        factor = refined.factor
+        reuse = refined.reuse
+        !isnothing(factor) && (isnothing(reuse) || factor !== reuse.factor) && _pool_give!(factor.factors)
+        isnothing(refined.correction) || _pool_give!(refined.correction.block32)
+        data = system.interface_elimination_data
+        !isnothing(data) && hasproperty(data, :interface_block) && _pool_give!(data.interface_block)
+        !isnothing(data) && hasproperty(data, :schur_blocks) && _pool_give!(data.schur_blocks...)
+        condensation = system.condensation
+        !isnothing(condensation) && hasproperty(condensation, :schur) && _pool_give!(condensation.schur)
+    end
     _release_condensation!(system.condensation)
     system.owns_cache && release_condensed_coupled_cache!(system.cache)
     return nothing
@@ -2223,6 +2553,10 @@ function solve_condensed_coupled_excitations(system, excitations; reconstruct_in
     if elimination_mode == :flux
         # BEM rows gain B_q M_Γ⁻¹ g from substituting q = M_Γ⁻¹ (S P p_B + E y - g).
         flux_rhs_solution = _split_timed!(solve_split, :flux_rhs_mass) do
+            # A zero reduced right-hand side needs no mass solve.
+            all(iszero, reduced_rhs) ?
+            zeros(ComplexF64, hasproperty(elimination, :mass_operator) ? elimination.mass_operator.count :
+                              size(reduced_rhs, 1), size(reduced_rhs, 2)) :
             hasproperty(elimination, :mass_operator) ?
                 _interface_mass_apply(elimination.mass_operator, reduced_rhs) :
                 elimination.mass_factorization \ ComplexF64.(reduced_rhs)
