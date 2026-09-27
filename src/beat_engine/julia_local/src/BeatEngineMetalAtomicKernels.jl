@@ -353,7 +353,7 @@ function _launch_metal_atomic_pair_kernels!(
     groups_x = cld(element_count, tile_x)
     groups_y = cld(element_count, tile_y)
     scatter = Val(get(ENV, "BLAB_METAL_ATOMIC_SCATTER", "1") != "0")
-    Metal.@metal threads=(tile_x, tile_y) groups=(groups_x, groups_y) _metal_regular_pair_atomic_kernel!(
+    @_test_cold_launch Metal.@metal threads=(tile_x, tile_y) groups=(groups_x, groups_y) _metal_regular_pair_atomic_kernel!(
         reinterpret(Float32, operators.single_layer),
         reinterpret(Float32, operators.adjoint_double_layer),
         reinterpret(Float32, operators.double_layer),
@@ -694,6 +694,7 @@ function _launch_metal_singular_block_scatter_kernels!(
         sx, sy, sz, csx, csy, csz,
     )
     if gather_tables === nothing
+        isnothing(_TEST_COMBINED_BM[]) || error("BLAB_TEST_COMBINED_BM needs BLAB_METAL_SINGULAR_WRITEBACK=gather.")
         _metal_launch(
             _metal_singular_block_scatter_kernel!,
             pair_count,
@@ -705,6 +706,24 @@ function _launch_metal_singular_block_scatter_kernels!(
             singular_cache.test_indices, singular_cache.trial_indices,
             regular_cache.p1_dofs, regular_cache.element_dp0_dofs,
             pair_count, part_count, regular_cache.p1_dof_count, regular_cache.face_count,
+        )
+    elseif !isnothing(_TEST_COMBINED_BM[])
+        beta = ComplexF32(_TEST_COMBINED_BM[])
+        row_map = gather_tables.p1_dp0
+        _metal_launch(
+            _test_singular_combined_gather_kernel!,
+            row_map.entry_count,
+            operators.single_layer, slp_values, adjoint_values, -1.0f0, -real(beta), -imag(beta),
+            row_map.entry_indices, row_map.contrib_offsets, row_map.contrib_values,
+            row_map.entry_count, pair_count, part_count,
+        )
+        block_map = gather_tables.p1_p1
+        _metal_launch(
+            _test_singular_combined_gather_kernel!,
+            block_map.entry_count,
+            operators.double_layer, dlp_values, hypersingular_values, -1.0f0, real(beta), imag(beta),
+            block_map.entry_indices, block_map.contrib_offsets, block_map.contrib_values,
+            block_map.entry_count, pair_count, part_count,
         )
     else
         # One thread per touched cell instead of one per pair: no atomics, and

@@ -30,7 +30,7 @@ which makes that margin nearly free.
 """
 module BeatEngineCoupledCondensed
 
-using LinearAlgebra, SparseArrays, StaticArrays, Statistics
+using LinearAlgebra, Serialization, SparseArrays, StaticArrays, Statistics
 using ..BeatEngineCore
 using ..BeatEngineCoupled
 
@@ -43,6 +43,7 @@ export assemble_condensed_regular_operators,
     prepare_condensed_coupled_cache,
     release_condensed_coupled_cache!,
     build_condensed_coupled_system,
+    condensed_metal_operators,
     release_condensed_coupled_system!,
     solve_condensed_coupled_excitations,
     solve_condensed_coupled_system,
@@ -208,17 +209,366 @@ mutable struct RefinedDenseLU
     iterations::Int
     fallback_reason::Union{Nothing,String}
     backward_error::Float64
+    stale::Bool   # test (BLAB_TEST_STALE_LU): `factor` belongs to an earlier frequency
+    correction::Any   # test (BLAB_TEST_ELIM_IMPLICIT): `B_q W` columns kept out of `matrix`, or nothing
 end
 
-function RefinedDenseLU(matrix::Matrix{ComplexF64})
+# Test (BLAB_TEST_HOST_POOL=1): large per-frequency host arrays come from, and go back to, a pool
+# keyed by element type and size, so the next frequency writes pages it already owns. Filling a
+# fresh 155 MB array costs ~57 ms of page faults, a reused one 1.5 ms; SAWMOD allocated ~1.1 GB per
+# frequency (~76k faults, ~0.3 s system time). An array goes back only once nothing references it;
+# the driver empties the pool per request.
+const _TEST_HOST_POOL = Dict{Any,Vector{Any}}()
+const _TEST_HOST_POOL_LOCK = ReentrantLock()
+_test_host_pool_on() = get(ENV, "BLAB_TEST_HOST_POOL", "0") == "1"
+function _test_take(::Type{T}, dims::Vararg{Int,N}) where {T,N}
+    _test_host_pool_on() || return Array{T,N}(undef, dims)
+    found = lock(_TEST_HOST_POOL_LOCK) do
+        list = get(_TEST_HOST_POOL, (T, dims), nothing)
+        isnothing(list) || isempty(list) ? nothing : pop!(list)
+    end
+    return isnothing(found) ? Array{T,N}(undef, dims) : found::Array{T,N}
+end
+function _test_give!(arrays...)
+    _test_host_pool_on() || return nothing
+    lock(_TEST_HOST_POOL_LOCK) do
+        for array in arrays
+            array isa Array || continue
+            list = get!(Vector{Any}, _TEST_HOST_POOL, (eltype(array), size(array)))
+            any(x -> x === array, list) || push!(list, array)
+        end
+    end
+    return nothing
+end
+_test_host_pool_clear!() = lock(() -> empty!(_TEST_HOST_POOL), _TEST_HOST_POOL_LOCK)
+# zeros(T, dims) from the pool, zeroed by column on all threads.
+function _test_take_zeros(::Type{T}, m::Int, n::Int) where {T}
+    _test_host_pool_on() || return zeros(T, m, n)
+    array = _test_take(T, m, n)
+    Threads.@threads for column in 1:n
+        @inbounds for row in 1:m
+            array[row, column] = zero(T)
+        end
+    end
+    return array
+end
+# `convert.(T, source)` into a pooled array, by column on all threads.
+function _test_take_converted(::Type{T}, source::Matrix) where {T}
+    _test_host_pool_on() || return T.(source)
+    array = _test_take(T, size(source)...)
+    Threads.@threads for column in axes(source, 2)
+        @inbounds for row in axes(source, 1)
+            array[row, column] = T(source[row, column])
+        end
+    end
+    return array
+end
+
+# Test (BLAB_TEST_ELIM_IMPLICIT=1): the flux elimination's `B_q W` columns stay out of the Float64
+# dense matrix. `correction.parts` holds them per block as factors (Float64 `coupling` and `schur`,
+# plus the Float32 `coupling32` the BEM produced); every Float64 product (refinement residuals, stale
+# GMRES) applies them exactly, and only the Float32 LU input gets them explicitly, from one cgemm per
+# block (~4x zgemm). The Float32 accumulation error (2.7e-4 when it was in the Float64 matrix) then
+# only slows the refinement, which still has to reach the Float64 backward error.
+function _test_dense_mul!(y, factorization::RefinedDenseLU, x, alpha, beta)
+    mul!(y, factorization.matrix, x, alpha, beta)
+    correction = factorization.correction
+    isnothing(correction) && return y
+    for part in correction.parts
+        gathered = x[part.columns, :]
+        projected = similar(gathered, size(part.schur, 1), size(gathered, 2))
+        _test_chunked_mul!(projected, part.schur, gathered, one(eltype(y)), zero(eltype(y)))
+        _test_chunked_mul!(view(y, correction.rows, :), part.coupling, projected, alpha, one(eltype(y)))
+    end
+    return y
+end
+
+# `mul!` with the rows split over tasks, one BLAS call each: Accelerate barely threads a gemm with
+# 1-3 columns (perf/implicit_micro.jl: B*t 5.4 -> 2.0 ms, W*g 2.9 -> 0.9 ms).
+function _test_chunked_mul!(y, A, x, alpha, beta)
+    parts = collect(Iterators.partition(axes(A, 1), cld(size(A, 1), Threads.nthreads())))
+    Threads.@threads for rows in parts
+        mul!(view(y, rows, :), view(A, rows, :), x, alpha, beta)
+    end
+    return y
+end
+
+function _test_scatter_parts!(matrix, correction, precision)
+    for part in correction.parts
+        if precision === Float32
+            # BLAB_TEST_HOST_POOL: the same `*` (this `mul!`) into pooled arrays.
+            schur32 = _test_take_converted(ComplexF32, part.schur)
+            product = mul!(_test_take(ComplexF32, size(part.coupling32, 1), size(schur32, 2)), part.coupling32, schur32)
+            _test_give!(schur32)
+        else
+            product = part.coupling * part.schur
+        end
+        for (local_column, column) in enumerate(part.columns)
+            @views matrix[correction.rows, column] .+= product[:, local_column]
+        end
+        precision === Float32 && _test_give!(product)
+    end
+    return matrix
+end
+
+# The Float32 LU input: `matrix` narrowed, plus the correction from single-precision products.
+function _test_narrowed(refined)
+    matrix = refined.matrix
+    narrowed = _test_take(ComplexF32, size(matrix)...)
+    Threads.@threads for column in axes(matrix, 2)
+        @inbounds for row in axes(matrix, 1)
+            narrowed[row, column] = ComplexF32(matrix[row, column])
+        end
+    end
+    isnothing(refined.correction) || _test_scatter_parts!(narrowed, refined.correction, Float32)
+    return narrowed
+end
+
+# Row sums of |matrix| and its largest |entry|, threaded by row blocks (as `_dense_abs_stats`).
+function _test_abs_row_sums(matrix::Matrix{<:Complex})
+    m, n = size(matrix)
+    sums = zeros(Float64, m)
+    blocks = collect(Iterators.partition(1:m, 256))
+    maxima = zeros(Float64, length(blocks))
+    Threads.@threads for b in eachindex(blocks)
+        largest = 0.0
+        @inbounds for j in 1:n, i in blocks[b]
+            a = abs(matrix[i, j])
+            sums[i] += a
+            largest = max(largest, a)
+        end
+        maxima[b] = largest
+    end
+    return sums, maximum(maxima; init=0.0)
+end
+
+# `|B_q| (|W| 1)` summed over the correction's blocks: per row of `correction.rows`, an upper bound on
+# the row sums of |B_q W|, so the matrix norm without the product is bounded from above.
+function _test_correction_row_bound(correction)
+    total = nothing
+    for part in correction.parts
+        weights = vec(sum(abs, part.schur; dims=2))
+        coupling = part.coupling
+        bound = zeros(Float64, size(coupling, 1))
+        blocks = collect(Iterators.partition(axes(coupling, 1), 256))
+        Threads.@threads for b in eachindex(blocks)
+            @inbounds for j in axes(coupling, 2), i in blocks[b]
+                bound[i] += abs(coupling[i, j]) * weights[j]
+            end
+        end
+        total = isnothing(total) ? bound : total .+ bound
+    end
+    return total
+end
+
+function _test_bounded_norm(matrix, correction)
+    sums, max_entry = _test_abs_row_sums(matrix)
+    bound = _test_correction_row_bound(correction)
+    view(sums, correction.rows) .+= bound
+    norm_bound = maximum(sums; init=0.0)
+    return norm_bound, max(max_entry, maximum(bound; init=0.0))
+end
+
+# Adds the correction to `matrix` in Float64 (before a Float64 fallback or a dump).
+function _test_materialize!(refined)
+    isnothing(refined.correction) && return refined
+    _test_scatter_parts!(refined.matrix, refined.correction, Float64)
+    refined.correction = nothing
+    return refined
+end
+
+# Test (BLAB_TEST_STALE_LU=<cap>): the last fresh ComplexF32 factor of this request, reused as a
+# GMRES preconditioner for later frequencies while the previous stale solve needed at most
+# BLAB_TEST_STALE_REUSE (default 8) iterations. A stale solve that has not reached the Float64
+# backward error after `cap` iterations factors afresh and disables reuse for the rest of the
+# request (the sweep ascends; iterations grow with frequency). The driver resets it per request.
+mutable struct _TestStaleState
+    factor::Union{Nothing,LinearAlgebra.LU{ComplexF32,Matrix{ComplexF32},Vector{LinearAlgebra.BlasInt}}}
+    last_iterations::Int
+    disabled::Bool
+end
+const _TEST_STALE = _TestStaleState(nothing, 0, false)
+_test_stale_cap() = something(tryparse(Int, get(ENV, "BLAB_TEST_STALE_LU", "0")), 0)
+# BLAB_TEST_STALE_LOG=<file>: one line per stale/fresh decision.
+function _test_stale_log(message)
+    path = get(ENV, "BLAB_TEST_STALE_LOG", "")
+    isempty(path) || open(io -> println(io, message), path, "a")
+    return nothing
+end
+function _test_stale_reset!()
+    _TEST_STALE.factor = nothing
+    _TEST_STALE.last_iterations = 0
+    _TEST_STALE.disabled = false
+    _test_host_pool_clear!()   # BLAB_TEST_HOST_POOL: same per-request lifetime
+    BeatEngineMumps._TEST_SCHUR_TAKE[] = _test_take   # a plain allocation while the pool is off
+    return nothing
+end
+
+# Test (BLAB_TEST_DENSE_STATS, default on): `opnorm(matrix, Inf)` and `maximum(abs, matrix)` in one
+# threaded pass. `opnorm` walks the column-major matrix row by row (~95 ms at n = 3116); here each
+# task owns a block of rows and sweeps it column by column, so every row sum adds the same terms
+# in the same order (j = 1..n) as `opnorm` and both values are bit-identical.
+function _dense_abs_stats(matrix::Matrix{<:Complex})
+    m, n = size(matrix)
+    block = 256
+    blocks = cld(m, block)
+    norms = zeros(Float64, blocks)
+    maxima = zeros(Float64, blocks)
+    Threads.@threads for b in 1:blocks
+        rows = ((b - 1) * block + 1):min(b * block, m)
+        sums = zeros(Float64, length(rows))
+        largest = 0.0
+        @inbounds for j in 1:n
+            for (local_row, i) in enumerate(rows)
+                a = abs(matrix[i, j])
+                sums[local_row] += a
+                largest = max(largest, a)
+            end
+        end
+        norms[b] = isempty(sums) ? 0.0 : maximum(sums)
+        maxima[b] = largest
+    end
+    return maximum(norms; init=0.0), maximum(maxima; init=0.0)
+end
+
+# Test instrumentation: split of the last `RefinedDenseLU` construction (s), copied into the
+# build's elimination split as `lu_<key>`.
+const _TEST_LU_SPLIT = Dict{Symbol,Float64}()
+
+function _test_swap_rows!(A, ipiv, k, ke, columns)
+    Threads.@threads for j in columns
+        @inbounds for i in k:ke
+            r = ipiv[i]
+            r == i && continue
+            A[i, j], A[r, j] = A[r, j], A[i, j]
+        end
+    end
+end
+
+# Test (BLAB_TEST_BLOCKED_LU=<nb>): right-looking blocked LU with partial pivoting whose trailing
+# updates are single large `gemm!` calls. Accelerate's cgetrf reaches ~0.3-0.4 TFLOP/s at n = 3116,
+# its cgemm ~2; this runs at ~0.6 (perf/lu_micro.jl). Pivots can differ from getrf's on near ties,
+# so the factor is not bit-identical; the refinement still has to reach the Float64 backward error.
+function _test_blocked_lu!(A::Matrix{T}, nb::Int) where {T}
+    n = LinearAlgebra.checksquare(A)
+    ipiv = Vector{LinearAlgebra.BlasInt}(undef, n)
+    info = 0
+    for k in 1:nb:n
+        ke = min(k + nb - 1, n)
+        _, panel_pivots, panel_info = LAPACK.getrf!(view(A, k:n, k:ke); check=false)
+        info == 0 && panel_info > 0 && (info = k - 1 + panel_info)
+        ipiv[k:ke] .= panel_pivots .+ (k - 1)
+        _test_swap_rows!(A, ipiv, k, ke, 1:(k-1))
+        ke < n || continue
+        _test_swap_rows!(A, ipiv, k, ke, (ke+1):n)
+        BLAS.trsm!('L', 'L', 'N', 'U', one(T), view(A, k:ke, k:ke), view(A, k:ke, (ke+1):n))
+        BLAS.gemm!('N', 'N', -one(T), view(A, (ke+1):n, k:ke), view(A, k:ke, (ke+1):n), one(T),
+                   view(A, (ke+1):n, (ke+1):n))
+    end
+    return LinearAlgebra.LU(A, ipiv, LinearAlgebra.BlasInt(info))
+end
+
+# Test (BLAB_TEST_FAST_TRS=<nb>): the ComplexF32 LU solve as row swaps plus blocked triangular
+# solves whose off-diagonal updates are `gemm!` calls. Accelerate's getrs barely threads: 15 ms
+# for 3 right-hand sides at n = 3116, this 4 ms. Rounding differs from getrs (F32 level); the
+# refinement still has to reach the Float64 backward error.
+function _test_lu_solve(factor::LinearAlgebra.LU{T}, rhs::AbstractVecOrMat) where {T}
+    nb = something(tryparse(Int, get(ENV, "BLAB_TEST_FAST_TRS", "0")), 0)
+    nb > 0 || return factor \ T.(rhs)
+    B = Matrix{T}(reshape(rhs, size(rhs, 1), :))
+    A = factor.factors
+    n = size(A, 1)
+    @inbounds for i in 1:n
+        r = factor.ipiv[i]
+        r == i && continue
+        for c in axes(B, 2)
+            B[i, c], B[r, c] = B[r, c], B[i, c]
+        end
+    end
+    for k in 1:nb:n
+        ke = min(k + nb - 1, n)
+        BLAS.trsm!('L', 'L', 'N', 'U', one(T), view(A, k:ke, k:ke), view(B, k:ke, :))
+        ke < n && BLAS.gemm!('N', 'N', -one(T), view(A, (ke+1):n, k:ke), view(B, k:ke, :), one(T),
+                             view(B, (ke+1):n, :))
+    end
+    for ke in n:-nb:1
+        k = max(ke - nb + 1, 1)
+        BLAS.trsm!('L', 'U', 'N', 'N', one(T), view(A, k:ke, k:ke), view(B, k:ke, :))
+        k > 1 && BLAS.gemm!('N', 'N', -one(T), view(A, 1:(k-1), k:ke), view(B, k:ke, :), one(T),
+                            view(B, 1:(k-1), :))
+    end
+    return rhs isa AbstractVector ? vec(B) : B
+end
+
+function RefinedDenseLU(matrix::Matrix{ComplexF64}; correction=nothing)
+    empty!(_TEST_LU_SPLIT)
+    t = time_ns()
     all(isfinite, matrix) || throw(ArgumentError("dense coupled matrix has non-finite entries"))
-    refined = RefinedDenseLU(matrix, opnorm(matrix, Inf), nothing, nothing, 0, nothing, NaN)
-    if maximum(abs, matrix; init=0.0) > floatmax(Float32)
+    _TEST_LU_SPLIT[:isfinite] = (time_ns() - t) / 1.0e9; t = time_ns()
+    refined = RefinedDenseLU(matrix, 0.0, nothing, nothing, 0, nothing, NaN, false, correction)
+    stale = _TEST_STALE
+    reuse_stale = _test_stale_cap() > 0 && !stale.disabled && !isnothing(stale.factor) &&
+                  size(stale.factor.factors) == size(matrix) &&
+                  stale.last_iterations <= something(tryparse(Int, get(ENV, "BLAB_TEST_STALE_REUSE", "8")), 8)
+    if !isnothing(correction) && reuse_stale
+        # No Float32 product for a stale factor: the norm is bounded from above (a looser test by
+        # the bound's overshoot, logged against the true norm on fresh factors).
+        matrix_norm, max_entry = _test_bounded_norm(matrix, correction)
+        refined.matrix_norm = matrix_norm
+        _TEST_LU_SPLIT[:stats] = (time_ns() - t) / 1.0e9
+        if max_entry <= floatmax(Float32)
+            refined.factor = stale.factor
+            refined.stale = true
+            _TEST_LU_SPLIT[:stale] = 1.0
+            return refined
+        end
+    end
+    # With a correction the norm comes from the Float32 LU input (the full matrix to ~1e-7).
+    narrowed = isnothing(correction) ? nothing : _test_narrowed(refined)
+    isnothing(narrowed) || (_TEST_LU_SPLIT[:convert] = (time_ns() - t) / 1.0e9; t = time_ns())
+    stats_matrix = something(narrowed, matrix)
+    matrix_norm, max_entry = get(ENV, "BLAB_TEST_DENSE_STATS", "1") == "1" ?
+                             _dense_abs_stats(stats_matrix) :
+                             (opnorm(stats_matrix, Inf), maximum(abs, stats_matrix; init=0.0))
+    refined.matrix_norm = Float64(matrix_norm)
+    _TEST_LU_SPLIT[:stats] = (time_ns() - t) / 1.0e9; t = time_ns()
+    if !isnothing(correction) && !isempty(get(ENV, "BLAB_TEST_STALE_LOG", ""))
+        _test_stale_log("NORM true $(matrix_norm) bound $(first(_test_bounded_norm(matrix, correction)))")
+        t = time_ns()
+    end
+    if max_entry > floatmax(Float32)
         _dense_fall_back!(refined, "an entry is outside the Float32 range")
+    elseif reuse_stale
+        refined.factor = stale.factor
+        refined.stale = true
+        _TEST_LU_SPLIT[:stale] = 1.0
     else
-        candidate = lu!(ComplexF32.(matrix); check=false)
+        _test_fresh_factor!(refined, narrowed)
+    end
+    return refined
+end
+
+function _test_fresh_factor!(refined::RefinedDenseLU, narrowed=nothing)
+    t = time_ns()
+    begin
+        if isnothing(narrowed)
+            narrowed = _test_narrowed(refined)
+            _TEST_LU_SPLIT[:convert] = (time_ns() - t) / 1.0e9; t = time_ns()
+        end
+        blocked_nb = something(tryparse(Int, get(ENV, "BLAB_TEST_BLOCKED_LU", "0")), 0)
+        candidate = blocked_nb > 0 ? _test_blocked_lu!(narrowed, blocked_nb) : lu!(narrowed; check=false)
+        _TEST_LU_SPLIT[:getrf] = (time_ns() - t) / 1.0e9; t = time_ns()
+        _test_stale_log("STALE fresh")
         if issuccess(candidate) && all(isfinite, candidate.factors)
             refined.factor = candidate
+            refined.stale = false
+            if _test_stale_cap() > 0
+                previous = _TEST_STALE.factor
+                # BLAB_TEST_HOST_POOL: the replaced stale factor is referenced by no system any more.
+                isnothing(previous) || previous === candidate || _test_give!(previous.factors)
+                _TEST_STALE.factor = candidate
+                _TEST_STALE.last_iterations = 0
+            end
         else
             _dense_fall_back!(refined, "the Float32 factorization is singular or not finite")
         end
@@ -226,10 +576,70 @@ function RefinedDenseLU(matrix::Matrix{ComplexF64})
     return refined
 end
 
+# Test (BLAB_TEST_STALE_LU): right-preconditioned GMRES (modified Gram-Schmidt, no restart) with
+# the stale ComplexF32 factor, all right-hand sides in lockstep so the matvec and the
+# preconditioner solve are batched. Stops when every column meets `RefinedDenseLU`'s Float64
+# backward-error test on the true residual. Returns (solution, iterations, ratio) or nothing.
+function _test_stale_gmres(factorization::RefinedDenseLU, target::Matrix{ComplexF64}, cap::Int)
+    M = factorization.factor
+    n, k = size(target)
+    threshold = factorization.matrix_norm * eps(Float64) * sqrt(n)
+    x0 = ComplexF64.(_test_lu_solve(M, ComplexF32.(target)))
+    residual = copy(target)
+    _test_dense_mul!(residual, factorization, x0, -one(ComplexF64), one(ComplexF64))
+    ratio = _dense_backward_error_ratio(factorization, residual, x0)
+    ratio <= 1 && return (x0, 0, ratio)
+    beta = [norm(view(residual, :, c)) for c in 1:k]
+    V = zeros(ComplexF64, n, cap + 1, k)
+    Z = zeros(ComplexF64, n, cap, k)
+    H = zeros(ComplexF64, cap + 1, cap, k)
+    for c in 1:k
+        beta[c] > 0 && (V[:, 1, c] .= view(residual, :, c) ./ beta[c])
+    end
+    basis = Matrix{ComplexF64}(undef, n, k)
+    w = similar(target)
+    trial = copy(x0)
+    for j in 1:cap
+        for c in 1:k
+            basis[:, c] .= view(V, :, j, c)
+        end
+        preconditioned = ComplexF64.(_test_lu_solve(M, ComplexF32.(basis)))
+        _test_dense_mul!(w, factorization, preconditioned, one(ComplexF64), zero(ComplexF64))
+        estimate_ok = true
+        for c in 1:k
+            Z[:, j, c] .= view(preconditioned, :, c)
+            beta[c] > 0 || continue
+            wc = view(w, :, c)
+            for i in 1:j
+                h = dot(view(V, :, i, c), wc)
+                H[i, j, c] = h
+                wc .-= h .* view(V, :, i, c)
+            end
+            h = norm(wc)
+            H[j+1, j, c] = h
+            h > 0 && (V[:, j+1, c] .= wc ./ h)
+            rhs = zeros(ComplexF64, j + 1)
+            rhs[1] = beta[c]
+            Hj = H[1:(j+1), 1:j, c]
+            y = Hj \ rhs
+            trial[:, c] .= view(x0, :, c) .+ view(Z, :, 1:j, c) * y
+            norm(rhs - Hj * y) <= threshold * norm(view(trial, :, c), Inf) || (estimate_ok = false)
+        end
+        estimate_ok || continue
+        copyto!(residual, target)
+        _test_dense_mul!(residual, factorization, trial, -one(ComplexF64), one(ComplexF64))
+        ratio = _dense_backward_error_ratio(factorization, residual, trial)
+        isfinite(ratio) || return nothing
+        ratio <= 1 && return (trial, j, ratio)
+    end
+    return nothing
+end
+
 function _dense_fall_back!(factorization::RefinedDenseLU, reason::AbstractString)
     factorization.fallback_reason = "Float32 LU with refinement fell back to a Float64 LU: " * reason
     @warn factorization.fallback_reason
     factorization.factor = nothing
+    _test_materialize!(factorization)
     factorization.fallback = lu(factorization.matrix)
     return factorization
 end
@@ -249,16 +659,47 @@ end
 
 function _dense_residual!(residual, factorization::RefinedDenseLU, target, solution)
     copyto!(residual, target)
-    mul!(residual, factorization.matrix, solution, -one(ComplexF64), one(ComplexF64))
+    _test_dense_mul!(residual, factorization, solution, -one(ComplexF64), one(ComplexF64))
     return residual
 end
 
+const _TEST_DUMP_COUNTER = Ref(0)
+
 function Base.:\(factorization::RefinedDenseLU, rhs::AbstractVecOrMat)
     all(isfinite, rhs) || throw(ArgumentError("dense coupled right-hand side has non-finite entries"))
+    # Test (BLAB_TEST_DUMP_DENSE=<dir>): write each dense system for offline preconditioner studies.
+    dump_dir = get(ENV, "BLAB_TEST_DUMP_DENSE", "")
+    if !isempty(dump_dir)
+        _test_materialize!(factorization)
+        _TEST_DUMP_COUNTER[] += 1
+        open(joinpath(dump_dir, "dense_$(_TEST_DUMP_COUNTER[]).bin"), "w") do io
+            write(io, Int64(size(factorization.matrix, 1)), Int64(size(rhs, 2)))
+            write(io, factorization.matrix)
+            write(io, ComplexF64.(rhs))
+        end
+    end
     target = ComplexF64.(rhs)
     residual = similar(target)
+    if isnothing(factorization.fallback) && factorization.stale
+        result = _test_stale_gmres(factorization, Matrix(reshape(target, size(target, 1), :)), _test_stale_cap())
+        if !isnothing(result)
+            solution, iterations, ratio = result
+            _TEST_STALE.last_iterations = iterations
+            # BLAB_TEST_STALE_STOP=<m>: a stale solve needing more than m iterations ends reuse for
+            # the request, before a later one runs into the cap.
+            iterations > something(tryparse(Int, get(ENV, "BLAB_TEST_STALE_STOP", "")), typemax(Int)) &&
+                (_TEST_STALE.disabled = true)
+            _test_stale_log("STALE ok $iterations")
+            factorization.iterations = max(factorization.iterations, iterations)
+            factorization.backward_error = ratio
+            return rhs isa AbstractVector ? vec(solution) : solution
+        end
+        _TEST_STALE.disabled = true
+        _test_stale_log("STALE fail")
+        _test_fresh_factor!(factorization)
+    end
     if isnothing(factorization.fallback)
-        solution = ComplexF64.(factorization.factor \ ComplexF32.(target))
+        solution = ComplexF64.(_test_lu_solve(factorization.factor, ComplexF32.(target)))
         previous = Inf
         reason = nothing
         for iteration in 0:DENSE_REFINEMENT_MAX_ITERATIONS
@@ -277,7 +718,7 @@ function Base.:\(factorization::RefinedDenseLU, rhs::AbstractVecOrMat)
                 break
             end
             previous = ratio
-            solution .+= ComplexF64.(factorization.factor \ ComplexF32.(residual))
+            solution .+= ComplexF64.(_test_lu_solve(factorization.factor, ComplexF32.(residual)))
             factorization.iterations = max(factorization.iterations, iteration + 1)
         end
         isnothing(reason) &&
@@ -349,6 +790,52 @@ widened copy of `fem_mesh`.
   they depend on (vertex coordinates, tetrahedra, per-vertex bulk-loss factors, wall matrices), so
   a mesh or loss change made in place is picked up.
 """
+# Position of each stored entry of `part` in `whole`'s nonzeros, or `nothing` if `part` has an entry
+# outside `whole`'s pattern (or the stiffness and mass patterns differ, checked by the caller).
+function _test_pattern_map(part::SparseMatrixCSC, whole::SparseMatrixCSC)
+    size(part) == size(whole) || return nothing
+    map = Vector{Int}(undef, nnz(part))
+    rows = rowvals(whole)
+    for column in axes(part, 2)
+        range = nzrange(whole, column)
+        for entry in nzrange(part, column)
+            local_index = searchsortedfirst(view(rows, range), rowvals(part)[entry])
+            (local_index <= length(range) && rows[range[local_index]] == rowvals(part)[entry]) || return nothing
+            map[entry] = range[local_index]
+        end
+    end
+    return map
+end
+
+function _test_fem_system_inplace(matrices, maps, prepared, omega, frequency_hz, sound_speed, density)
+    stiffness, mass = matrices.stiffness, matrices.mass
+    squared_wavenumber = (omega / Float64(sound_speed))^2
+    values = Vector{ComplexF64}(undef, nnz(stiffness))
+    @inbounds for j in eachindex(values)
+        values[j] = Complex{Float64}(nonzeros(stiffness)[j]) - squared_wavenumber * nonzeros(mass)[j]
+    end
+    bulk_scale = Complex{Float64}(0, propagation_sign() * squared_wavenumber)
+    bulk_values = nonzeros(matrices.bulk_loss_mass)
+    @inbounds for (entry, j) in enumerate(maps.bulk)
+        values[j] -= bulk_scale * bulk_values[entry]
+    end
+    for (operator, matrix, map) in zip(prepared.wall_impedance_operators, matrices.walls, maps.walls)
+        admittance = miki_rigid_backed_surface_admittance(
+            Float64(frequency_hz),
+            Float64(sound_speed),
+            Float64(density),
+            Float64(operator.thickness_m),
+            Float64(operator.flow_resistivity_pa_s_per_m2),
+        )
+        scale = neumann_scale(Float64(density), omega) * admittance
+        wall_values = nonzeros(matrix)
+        @inbounds for (entry, j) in enumerate(map)
+            values[j] -= scale * wall_values[entry]
+        end
+    end
+    return SparseMatrixCSC(size(stiffness)..., stiffness.colptr, stiffness.rowval, values)
+end
+
 function _fem_system_float64(store, fem_mesh::VolumeMesh, prepared, frequency_hz, sound_speed, density)
     walls = [operator.matrix for operator in prepared.wall_impedance_operators]
     cached = !isnothing(store) && haskey(store, :matrices) &&
@@ -386,6 +873,20 @@ function _fem_system_float64(store, fem_mesh::VolumeMesh, prepared, frequency_hz
         end
     end
     omega = 2pi * Float64(frequency_hz)
+    # Test (BLAB_TEST_FEM_INPLACE=1): the values written straight into the stiffness pattern, entry by
+    # entry in the same order of operations as the sparse expressions below (each of which allocated
+    # and merged a 330k-entry matrix).
+    if get(ENV, "BLAB_TEST_FEM_INPLACE", "0") == "1"
+        maps = isnothing(store) ? nothing : get(store, :test_maps, nothing)
+        if isnothing(maps)
+            maps = (bulk=_test_pattern_map(matrices.bulk_loss_mass, matrices.stiffness),
+                    walls=[_test_pattern_map(matrix, matrices.stiffness) for matrix in matrices.walls])
+            isnothing(store) || (store[:test_maps] = maps)
+        end
+        if !isnothing(maps.bulk) && all(!isnothing, maps.walls)
+            return _test_fem_system_inplace(matrices, maps, prepared, omega, frequency_hz, sound_speed, density)
+        end
+    end
     system = assemble_fem_dynamic_stiffness(
         matrices.stiffness,
         matrices.mass,
@@ -699,17 +1200,58 @@ end
 `M_kk⁻¹ rhs` for a complex right-hand side. The Cholesky path solves the real and imaginary parts
 as one real panel.
 """
+# Panel columns `chunk` (real parts in 1:columns, imaginary parts after) into the complex result.
+function _test_write_mass_chunk!(result::Matrix{ComplexF64}, solved::Matrix{Float64}, chunk, columns::Int)
+    @inbounds for (local_column, column) in enumerate(chunk)
+        if column <= columns
+            for row in axes(result, 1)
+                result[row, column] = complex(solved[row, local_column], imag(result[row, column]))
+            end
+        else
+            target = column - columns
+            for row in axes(result, 1)
+                result[row, target] = complex(real(result[row, target]), solved[row, local_column])
+            end
+        end
+    end
+    return result
+end
+
 function _mass_block_solve(block, rhs::AbstractMatrix)
     if block.kind == :cholmod
         rows, columns = size(rhs)
-        panel = Matrix{Float64}(undef, rows, 2 * columns)
+        panel = _test_take(Float64, rows, 2 * columns)
         @inbounds for column in 1:columns, row in 1:rows
             value = rhs[row, column]
             panel[row, column] = real(value)
             panel[row, columns + column] = imag(value)
         end
-        solved = block.factor \ panel
-        result = Matrix{ComplexF64}(undef, rows, columns)
+        # Test (BLAB_TEST_MASS_THREADS=<n>): the columns in n chunks on parallel tasks. CHOLMOD's
+        # workspace is task-local and the solve only reads the factor; columns are independent,
+        # so the result is bit-identical.
+        tasks = something(tryparse(Int, get(ENV, "BLAB_TEST_MASS_THREADS", "1")), 1)
+        solved = if tasks > 1 && size(panel, 2) >= 2 * tasks
+            chunks = collect(Iterators.partition(1:size(panel, 2), cld(size(panel, 2), tasks)))
+            parts = map(chunk -> Threads.@spawn(block.factor \ panel[:, chunk]), chunks)
+            if _test_host_pool_on()
+                # BLAB_TEST_HOST_POOL: the chunks go straight into the pooled result (same values).
+                result = _test_take(ComplexF64, rows, columns)
+                for (chunk, part) in zip(chunks, parts)
+                    _test_write_mass_chunk!(result, fetch(part), chunk, columns)
+                end
+                _test_give!(panel)
+                return result
+            end
+            out = similar(panel)
+            for (chunk, part) in zip(chunks, parts)
+                out[:, chunk] = fetch(part)
+            end
+            out
+        else
+            block.factor \ panel
+        end
+        _test_give!(panel)
+        result = _test_take(ComplexF64, rows, columns)
         @inbounds for column in 1:columns, row in 1:rows
             result[row, column] = complex(solved[row, column], solved[row, columns + column])
         end
@@ -791,8 +1333,21 @@ function _flux_mass_presolve(operator, schur::AbstractMatrix, motion_columns::Ab
         end
     end
     schur_blocks = map(operator.blocks) do block
-        local_schur = _split_timed!(() -> ComplexF64.(schur[block.rows, block.rows]), split, :schur_convert)
-        _split_timed!(() -> _mass_block_solve(block, local_schur), split, :mass_solve)
+        local_schur = _split_timed!(split, :schur_convert) do
+            _test_host_pool_on() || return ComplexF64.(schur[block.rows, block.rows])
+            # BLAB_TEST_HOST_POOL: the same conversion, indexed in place into a pooled array.
+            converted = _test_take(ComplexF64, length(block.rows), length(block.rows))
+            block_rows = block.rows
+            Threads.@threads for column in eachindex(block_rows)
+                @inbounds for row in eachindex(block_rows)
+                    converted[row, column] = ComplexF64(schur[block_rows[row], block_rows[column]])
+                end
+            end
+            converted
+        end
+        solved = _split_timed!(() -> _mass_block_solve(block, local_schur), split, :mass_solve)
+        _test_give!(local_schur)
+        solved
     end
     motion_solution = _split_timed!(() -> _interface_mass_apply(operator, motion_columns), split, :mass_solve)
     return (schur_blocks=schur_blocks, motion_solution=motion_solution, split=split)
@@ -810,7 +1365,7 @@ function _flux_block_products!(coupled, rows, columns_of_gamma, operator, schur_
         coupling_columns = block.contiguous ?
                            view(interface_block, :, first(block.dofs):last(block.dofs)) :
                            interface_block[:, block.dofs]
-        block_coupling = _split_timed!(() -> coupling_columns * schur_block, split, :product)
+        block_coupling = _split_timed!(() -> _test_product(coupling_columns, schur_block), split, :product)
         _split_timed!(split, :scatter) do
             for (local_column, column) in enumerate(block.rows)
                 @views coupled[rows, columns_of_gamma[column]] .+= block_coupling[:, local_column]
@@ -818,6 +1373,18 @@ function _flux_block_products!(coupled, rows, columns_of_gamma, operator, schur_
         end
     end
     return coupled
+end
+
+# Test (BLAB_TEST_ELIM_SPLIT=1): a ComplexF32 BEM block times a ComplexF64 W as two cgemms,
+# B*W_hi + B*W_lo with W_hi = F32(W), W_lo = F32(W - W_hi). The inputs are then exact to ~1e-14;
+# only the Float32 accumulation error remains. Not bit-identical.
+_test_product(a, b) = a * b
+function _test_product(a::AbstractMatrix{ComplexF32}, b::AbstractMatrix{ComplexF64})
+    high = ComplexF32.(b)
+    low = ComplexF32.(b .- high)
+    result = ComplexF64.(a * high)
+    result .+= ComplexF64.(a * low)
+    return result
 end
 
 """
@@ -1091,13 +1658,25 @@ function _build_mumps_condensation(
         analysis_reused = mumps_analyse!(solver, fem_system, retained)
         analysis_s = (time_ns() - analysis_started) / 1.0e9
 
+        # Test (BLAB_TEST_DUMP_FEM=<file>): the FEM system and its Schur set, for offline MUMPS studies.
+        dump_fem = get(ENV, "BLAB_TEST_DUMP_FEM", "")
+        if !isempty(dump_fem) && !isfile(dump_fem)
+            open(io -> serialize(io, (fem_system=fem_system, retained=retained, interior=interior_vertices)), dump_fem, "w")
+        end
         factorization_started = time_ns()
         # Assembly sums the (i, j) and (j, i) contributions separately, so allow round-off.
         schur_double = mumps_factorize!(solver, fem_system; symmetry_tolerance=64 * eps(S))
         factorization_s = (time_ns() - factorization_started) / 1.0e9
 
         schur_started = time_ns()
-        schur = schur_float64 ? schur_double : Complex{T}.(schur_double)
+        schur = if schur_float64
+            schur_double
+        else
+            # BLAB_TEST_HOST_POOL: the Float64 copy goes back once converted (both pooled).
+            converted = _test_take_converted(Complex{T}, schur_double)
+            _test_give!(schur_double)
+            converted
+        end
         transducer_condensed = !isnothing(motion_surface)
         transducer_started = time_ns()
         motion_fields = if transducer_condensed
@@ -1107,17 +1686,42 @@ function _build_mumps_condensation(
                 error("Transducer motion operators must have one row per FEM vertex.")
             transducer_count = size(surface, 2)
             columns = hcat(Matrix(surface), Matrix(force))
+            # Test (BLAB_TEST_DUMP_REDUCE=<file>): the reduction's right-hand sides, next to BLAB_TEST_DUMP_FEM.
+            dump_reduce = get(ENV, "BLAB_TEST_DUMP_REDUCE", "")
+            !isempty(dump_reduce) && !isfile(dump_reduce) && open(io -> serialize(io, columns), dump_reduce, "w")
+            test_reduce_started = time_ns()
             reduced = mumps_reduce(solver, columns)
-            interior_solution = mumps_interior_solve(solver, columns)
-            motion_solution = interior_solution[interior_vertices, 1:transducer_count]
-            force_interior = force[interior_vertices, :]
+            test_reduce_s = (time_ns() - test_reduce_started) / 1.0e9
+            # The interior solve and what depends on it.
+            interior_fields = () -> begin
+                test_expand_started = time_ns()
+                # Test (BLAB_TEST_MUMPS_EXPAND=1): the expansion of that reduction with x_Γ = 0 is
+                # A_II⁻¹ b_I, the interior solve, but reuses the reduction's forward sweep.
+                interior_solution = get(ENV, "BLAB_TEST_MUMPS_EXPAND", "0") == "1" ?
+                                    mumps_expand(solver, zeros(ComplexF64, length(solver.schur_variables), size(columns, 2))) :
+                                    mumps_interior_solve(solver, columns)
+                test_expand_s = (time_ns() - test_expand_started) / 1.0e9
+                test_stats = get(ENV, "BLAB_TEST_MUMPS_STATS", "")
+                isempty(test_stats) || open(io -> println(io, "reduce_s=$test_reduce_s expand_s=$test_expand_s"), test_stats, "a")
+                motion_solution = interior_solution[interior_vertices, 1:transducer_count]
+                force_interior = force[interior_vertices, :]
+                (
+                    motion_solution=motion_solution,
+                    force_solution=interior_solution[interior_vertices, (transducer_count+1):end],
+                    motion_force_correction=Matrix(transpose(force_interior) * motion_solution),
+                )
+            end
+            # Test (BLAB_TEST_EXPAND_OVERLAP=1, with MUMPS_EXPAND): the FEM stage runs `interior_fields`
+            # beside its interface-mass presolve, which reads only `motion_gamma` and calls no MUMPS,
+            # and merges the result in.
+            deferred = get(ENV, "BLAB_TEST_EXPAND_OVERLAP", "0") == "1" && get(ENV, "BLAB_TEST_MUMPS_EXPAND", "0") == "1"
             (
                 motion_interior=surface[interior_vertices, :],
-                motion_solution=motion_solution,
-                force_solution=interior_solution[interior_vertices, (transducer_count+1):end],
+                (deferred ? (motion_solution=nothing, force_solution=nothing, motion_force_correction=nothing) :
+                 interior_fields())...,
                 motion_gamma=reduced[:, 1:transducer_count],
                 force_gamma=reduced[:, (transducer_count+1):end],
-                motion_force_correction=Matrix(transpose(force_interior) * motion_solution),
+                test_interior_fields=deferred ? interior_fields : nothing,
             )
         else
             (
@@ -1198,6 +1802,11 @@ function _forward_schur(
     R = Complex{result_type}
     interior_rhs = ComplexF64.(fem_rhs[condensation.interior_vertices, :])
     if hasproperty(condensation, :backend) && condensation.backend == :mumps_seq
+        # Test (BLAB_TEST_ZERO_RHS_SKIP=1): voltage-only excitations leave the FEM right-hand side
+        # zero, and so its reduction; skip the MUMPS call (the back substitution never expands it).
+        if get(ENV, "BLAB_TEST_ZERO_RHS_SKIP", "0") == "1" && all(iszero, fem_rhs)
+            return zeros(R, condensation.retained_count, size(fem_rhs, 2)), interior_rhs
+        end
         reduced = mumps_reduce(condensation.mumps_solver, fem_rhs)
         return R.(reduced), interior_rhs
     end
@@ -1638,6 +2247,10 @@ function build_condensed_coupled_system(
     prescribed_bem_normal_velocity=nothing,
     schur_block_columns::Int=32,
     allow_transducer_condensation::Bool=true,
+    prefetched_operators=nothing,
+    on_operators_ready=nothing,
+    on_fem_done=nothing,
+    dense_gate=nothing,
 ) where {T<:AbstractFloat}
     # `relative_residual` needs the monolithic coupled matrix, which this formulation never
     # forms. `fem_interior_residual` on each solution is the condensed-appropriate check.
@@ -1715,7 +2328,11 @@ function build_condensed_coupled_system(
 
     omega = T(2pi) * frequency_hz
     wavenumber = omega / sound_speed
-    fem_system = assemble_fem_dynamic_stiffness(
+    # Test (BLAB_TEST_FEM_F32_SKIP=1): the Float64 system below replaces this one on Metal; don't
+    # assemble it (and its wall terms) only to drop it. Bit-identical.
+    skip_fem_single = T !== Float64 && _fem_float64_enabled(bem_backend) &&
+                      get(ENV, "BLAB_TEST_FEM_F32_SKIP", "0") == "1"
+    fem_system = skip_fem_single ? nothing : assemble_fem_dynamic_stiffness(
         prepared.stiffness,
         prepared.mass,
         wavenumber;
@@ -1731,7 +2348,7 @@ function build_condensed_coupled_system(
         )
         for operator in prepared.wall_impedance_operators
     ]
-    for (operator, admittance) in zip(prepared.wall_impedance_operators, wall_admittances)
+    skip_fem_single || for (operator, admittance) in zip(prepared.wall_impedance_operators, wall_admittances)
         fem_system -= neumann_scale(density, omega) * admittance .* operator.matrix
     end
     interface_operators = prepared.interface_operators
@@ -1825,13 +2442,17 @@ function build_condensed_coupled_system(
         elimination_split[:mass_prep] = interface_mass_factorization_s
         mass_in_fem_stage = _interface_mass_overlap_enabled(bem_backend)
     end
+    fem_stage_work = Ref(0.0)   # test diagnostic: the stage's own work, without the overlap wait
     fem_stage = () -> begin
+        fem_stage_work_started = time_ns()
         stage_condensation = _build_condensation(
             fem_system,
             interface_operators,
             gamma_fem_vertices;
             condensation_options...,
         )
+        interior_fields = get(stage_condensation, :test_interior_fields, nothing)
+        interior_task = isnothing(interior_fields) ? nothing : Threads.@spawn(interior_fields())
         presolve = mass_in_fem_stage ? _flux_mass_presolve(
             mass_operator,
             stage_condensation.schur,
@@ -1840,36 +2461,49 @@ function build_condensed_coupled_system(
                 resolved_transducer_operators, gamma_fem_vertices,
             ),
         ) : nothing
+        isnothing(interior_task) || (stage_condensation = merge(stage_condensation, fetch(interior_task)))
+        # Test (BLAB_TEST_DELAY_FEM=<s>): lengthen the CPU chain by an idle wait (bottleneck test).
+        test_delay = parse(Float64, get(ENV, "BLAB_TEST_DELAY_FEM", "0"))
+        test_delay > 0 && sleep(test_delay)
+        fem_stage_work[] = (time_ns() - fem_stage_work_started) / 1.0e9
         (stage_condensation, presolve)
     end
     condensation_started = time_ns()
     condensation_task = stage_overlap ? Threads.@spawn(fem_stage()) : nothing
 
     bem_operator_started = time_ns()
+    row_weights = nothing   # test (BLAB_TEST_HOST_ROW_WEIGHTS): symmetry weights still to apply on the host
+    combined_bm = false     # test (BLAB_TEST_COMBINED_BM): operators hold A and C
+    # Test (BLAB_TEST_FLUX_SKIP=1, Metal, own assembly only): DP0 columns whose face carries flux in
+    # some right-hand-side block. S/K' are only ever multiplied by those flux matrices, so the GPU
+    # skips the other columns and the host combine writes zeros there.
+    flux_skip = get(ENV, "BLAB_TEST_FLUX_SKIP", "0") == "1" && prepared.bem_backend == :metal
+    flux_columns = if flux_skip
+        used = vec(any(!iszero, interface_operators.bem_flux; dims=2))
+        transducer_count == 0 || (used .|= vec(any(!iszero, bem_motion_flux; dims=2)))
+        prescribed_bem_count == 0 || (used .|= vec(any(!iszero, bem_prescribed_neumann; dims=2)))
+        used
+    else
+        nothing
+    end
     # This solver's own fork of the CPU regular assembly, so it can be optimised without
     # touching the shared path every other backend runs through. Behaviourally identical to
     # `assemble_regular_galerkin_operators(...; backend=:cpu)`, pinned by an equivalence test.
-    operators = if prepared.bem_backend == :metal
-        # Metal assembles the four operators on the GPU; the condensed algebra
-        # below is CPU-only, so bring them down and free the device copies.
-        device_operators = assemble_regular_galerkin_operators(
-            bem_mesh,
-            prepared.p1,
-            prepared.dp0,
-            wavenumber,
-            prepared.rule;
-            skip_singular=false,
-            singular_order=singular_order,
-            backend=:metal,
-            device_cache=prepared.device_cache,
-            singular_cache=prepared.singular_cache,
-            device_singular_cache=prepared.device_singular_cache,
-            symmetry_mode=prepared.symmetry_mode,
-        )
-        # Wraps shared device storage in place (copies it when the storage mode
-        # is private); either way the host tuple owns the device buffers, so
-        # `device_operators` must not be released separately.
-        metal_host_operators(device_operators)
+    operators = if !isnothing(prefetched_operators)
+        # Test prefetch (BLAB_TEST_COUPLED_PREFETCH): assembled on the GPU for this frequency
+        # while the previous frequency's host stages ran; `bem_operator_s` is the wait.
+        fetched = fetch(prefetched_operators)
+        fetched.k == wavenumber || error("prefetched operators for k=$(fetched.k), need k=$(wavenumber)")
+        # Test (BLAB_TEST_PREFETCH_OPT=1): the prefetch ran the same switches as the build below.
+        row_weights = get(fetched, :row_weights, nothing)
+        combined_bm = get(fetched, :combined, false)
+        flux_columns = get(fetched, :flux_columns, nothing)
+        fetched.operators
+    elseif prepared.bem_backend == :metal
+        assembled = _test_metal_operators(prepared, bem_mesh, wavenumber, singular_order, flux_columns)
+        row_weights = assembled.row_weights
+        combined_bm = assembled.combined
+        assembled.operators
     else
         assemble_condensed_regular_operators(
             bem_mesh,
@@ -1885,19 +2519,102 @@ function build_condensed_coupled_system(
         )
     end
     bem_operator_s = (time_ns() - bem_operator_started) / 1.0e9
+    isnothing(on_operators_ready) || on_operators_ready(flux_columns)
 
     bem_matrix_started = time_ns()
-    bem_lhs, bem_rhs_operator = burton_miller_neumann_matrices(
-        operators,
-        prepared.identity_p1_p1,
-        prepared.identity_p1_dp0,
-        wavenumber,
-    )
+    bem_lhs, bem_rhs_operator = if !isnothing(row_weights)
+        _test_burton_miller_matrices_threaded(
+            operators, prepared.identity_p1_p1, prepared.identity_p1_dp0, wavenumber; row_weights=row_weights,
+            flux_columns=flux_columns, combined=combined_bm,
+        )
+    else
+        (get(ENV, "BLAB_TEST_BM_THREADED", "0") == "1" ?
+         _test_burton_miller_matrices_threaded : burton_miller_neumann_matrices)(
+            operators,
+            prepared.identity_p1_p1,
+            prepared.identity_p1_dp0,
+            wavenumber,
+        )
+    end
+    elimination_split[:diag_bm_matrices] = (time_ns() - bem_matrix_started) / 1.0e9
+    if combined_bm && !isempty(get(ENV, "BLAB_TEST_COMBINED_CHECK", ""))
+        # Debug: the same operators assembled the stock way, combined on the host, compared.
+        BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = true
+        reference_ops = try
+            metal_host_operators(assemble_regular_galerkin_operators(
+                bem_mesh, prepared.p1, prepared.dp0, wavenumber, prepared.rule;
+                skip_singular=false, singular_order=singular_order, backend=:metal,
+                device_cache=prepared.device_cache, singular_cache=prepared.singular_cache,
+                device_singular_cache=prepared.device_singular_cache, symmetry_mode=prepared.symmetry_mode,
+            ))
+        finally
+            BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = false
+        end
+        ref_lhs, ref_rhs = _test_burton_miller_matrices_threaded(
+            reference_ops, prepared.identity_p1_p1, prepared.identity_p1_dp0, wavenumber; row_weights=row_weights,
+        )
+        coupling = burton_miller_coupling(wavenumber)
+        A_ref = -reference_ops.double_layer .+ coupling .* reference_ops.hypersingular
+        C_ref = -reference_ops.single_layer .- coupling .* reference_ops.adjoint_double_layer
+        rel(x, y) = maximum(abs, x .- y) / maximum(abs, y)
+        cols = isnothing(flux_columns) ? Colon() : findall(flux_columns)
+        worst = argmax(abs.(bem_lhs .- ref_lhs))
+        open(ENV["BLAB_TEST_COMBINED_CHECK"], "a") do io
+            println(io, "k=$(wavenumber) lhs=$(rel(bem_lhs, ref_lhs)) rhs=$(rel(bem_rhs_operator[:, cols], ref_rhs[:, cols])) ",
+                    "A=$(rel(operators.double_layer, A_ref)) C=$(rel(operators.single_layer[:, cols], C_ref[:, cols])) ",
+                    "worst_lhs=$(Tuple(worst)) got=$(bem_lhs[worst]) want=$(ref_lhs[worst]) ",
+                    "A_got=$(operators.double_layer[worst]) A_ref=$(A_ref[worst]) D=$(reference_ops.double_layer[worst]) H=$(reference_ops.hypersingular[worst]) w=$(row_weights[worst[1]])")
+        end
+        release_operator_storage!(reference_ops)
+        # Regular part only (no singular corrections), both ways.
+        regular_only(beta) = begin
+            BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = true
+            BeatEngineCore._TEST_COMBINED_BM[] = beta
+            try
+                metal_host_operators(assemble_regular_galerkin_operators(
+                    bem_mesh, prepared.p1, prepared.dp0, wavenumber, prepared.rule;
+                    skip_singular=true, singular_order=singular_order, backend=:metal,
+                    device_cache=prepared.device_cache, singular_cache=prepared.singular_cache,
+                    device_singular_cache=prepared.device_singular_cache, symmetry_mode=prepared.symmetry_mode,
+                ))
+            finally
+                BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = false
+                BeatEngineCore._TEST_COMBINED_BM[] = nothing
+            end
+        end
+        stock = regular_only(nothing)
+        A_reg_ref = -stock.double_layer .+ coupling .* stock.hypersingular
+        C_reg_ref = -stock.single_layer .- coupling .* stock.adjoint_double_layer
+        A_reg_ref = copy(A_reg_ref); C_reg_ref = copy(C_reg_ref)
+        release_operator_storage!(stock)
+        comb = regular_only(Complex{Float32}(coupling))
+        open(ENV["BLAB_TEST_COMBINED_CHECK"], "a") do io
+            println(io, "  regular only: A=$(rel(comb.double_layer, A_reg_ref)) C=$(rel(comb.single_layer, C_reg_ref))")
+        end
+        release_operator_storage!(comb)
+    end
     # `operators` is dead from here on and the matrices above are freshly
     # allocated host arrays, so free the Metal buffers now rather than leaking
     # one operator set per condensed frequency.
     prepared.bem_backend == :metal && release_operator_storage!(operators)
-    bem_interface_block = -(bem_rhs_operator * Complex{T}.(interface_operators.bem_flux))
+    if !isempty(get(ENV, "BLAB_TEST_FLUX_COUNT", ""))
+        used = vec(any(!iszero, interface_operators.bem_flux; dims=2))
+        transducer_count == 0 || (used .|= vec(any(!iszero, bem_motion_flux; dims=2)))
+        prescribed_bem_count == 0 || (used .|= vec(any(!iszero, bem_prescribed_neumann; dims=2)))
+        open(io -> println(io, "faces=$(length(used)) flux_faces=$(count(used)) p1=$(size(bem_rhs_operator, 1)) ",
+                           "interface=$(size(interface_operators.bem_flux, 2)) transducers=$transducer_count prescribed=$prescribed_bem_count ",
+                           "images=$(length(bem_mesh.faces))"), ENV["BLAB_TEST_FLUX_COUNT"], "a")
+    end
+    bem_interface_block = if _test_host_pool_on() && bem_rhs_operator isa Matrix{Complex{T}}
+        # BLAB_TEST_HOST_POOL: the same product (`*` is this `mul!`) into a pooled array, then negated
+        # in place. (alpha = -1 in `mul!` rounds differently.)
+        flux_operator = Complex{T}.(interface_operators.bem_flux)
+        product = mul!(_test_take(Complex{T}, size(bem_rhs_operator, 1), size(flux_operator, 2)), bem_rhs_operator,
+                       flux_operator)
+        product .= .-product
+    else
+        -(bem_rhs_operator * Complex{T}.(interface_operators.bem_flux))
+    end
     bem_motion_block = transducer_count == 0 ? nothing : -(bem_rhs_operator * bem_motion_flux)
     bem_prescribed_rhs = prescribed_bem_count == 0 ?
                          zeros(Complex{T}, length(bem_mesh.vertices), 0) :
@@ -1919,6 +2636,15 @@ function build_condensed_coupled_system(
         end
     end
     fem_condensation_s = (time_ns() - condensation_started) / 1.0e9
+    # Test (BLAB_TEST_FEM_LANE): this frequency's MUMPS work is over, so the next build may start its
+    # FEM stage; the dense part below waits for the previous frequency's solve.
+    isnothing(on_fem_done) || on_fem_done()
+    if !isnothing(dense_gate)
+        test_gate_started = time_ns()
+        wait(dense_gate)
+        elimination_split[:diag_dense_gate_wait] = (time_ns() - test_gate_started) / 1.0e9
+    end
+    elimination_split[:diag_fem_stage_work] = fem_stage_work[]
 
     block_assembly_started = time_ns()
     fem_count = length(fem_mesh.vertices)
@@ -1966,7 +2692,7 @@ function build_condensed_coupled_system(
     ]
     force_factor = T[transducer.bl_n_per_a for transducer in transducers]
 
-    coupled = zeros(Complex{dense_type}, system_count, system_count)
+    coupled = _test_take_zeros(Complex{dense_type}, system_count, system_count)
     interface_elimination_s = 0.0
     elimination = nothing
     # The Schur complement takes the slot the full FEM block occupies in the monolithic
@@ -2023,6 +2749,9 @@ function build_condensed_coupled_system(
             elimination_split[Symbol("fem_stage_", key)] = value
         end
     end
+    dense_correction = nothing
+    test_implicit = get(ENV, "BLAB_TEST_ELIM_IMPLICIT", "0") == "1" && eltype(bem_interface_block) === ComplexF32 &&
+                    dense_type === Float64 && T !== Float64 && _dense_refinement_enabled(bem_backend)
     if interface_elimination != :none
         elimination_started = time_ns()
         # The same blocks the unmodified layout writes (at the dense scalar type), promoted for the elimination.
@@ -2067,11 +2796,42 @@ function build_condensed_coupled_system(
             else
                 fem_stage_presolve
             end
-            interface_block = _split_timed!(() -> ComplexF64.(bem_interface_block), elimination_split, :block_convert)
-            _flux_block_products!(
-                coupled, bem_range, bem_columns, mass_operator, presolve.schur_blocks, interface_block,
-                elimination_split,
-            )
+            interface_block = _split_timed!(() -> _test_take_converted(ComplexF64, bem_interface_block), elimination_split, :block_convert)
+            if get(ENV, "BLAB_TEST_ELIM_F32", "0") == "1" && eltype(bem_interface_block) === ComplexF32
+                # Test: the block products in single precision (cgemm, ~4x zgemm). The BEM block is
+                # single precision already; only the per-block W = M⁻¹S is rounded down. Not bit-identical.
+                _flux_block_products!(
+                    coupled, bem_range, bem_columns, mass_operator, [ComplexF32.(block) for block in presolve.schur_blocks],
+                    bem_interface_block, elimination_split,
+                )
+            elseif test_implicit
+                # Test (BLAB_TEST_ELIM_IMPLICIT=1): no product here; see `_test_dense_mul!`.
+                dense_correction = (
+                    rows=bem_range,
+                    block32=bem_interface_block,
+                    parts=[
+                        (
+                            columns=bem_columns[block.rows],
+                            coupling=block.contiguous ? view(interface_block, :, first(block.dofs):last(block.dofs)) :
+                                     interface_block[:, block.dofs],
+                            coupling32=block.contiguous ?
+                                       view(bem_interface_block, :, first(block.dofs):last(block.dofs)) :
+                                       bem_interface_block[:, block.dofs],
+                            schur=schur_block,
+                        ) for (block, schur_block) in zip(mass_operator.blocks, presolve.schur_blocks)
+                    ],
+                )
+            elseif get(ENV, "BLAB_TEST_ELIM_SPLIT", "0") == "1" && eltype(bem_interface_block) === ComplexF32
+                _flux_block_products!(
+                    coupled, bem_range, bem_columns, mass_operator, presolve.schur_blocks, bem_interface_block,
+                    elimination_split,
+                )
+            else
+                _flux_block_products!(
+                    coupled, bem_range, bem_columns, mass_operator, presolve.schur_blocks, interface_block,
+                    elimination_split,
+                )
+            end
             if transducer_count > 0
                 motion_coupling = _split_timed!(
                     () -> interface_block * presolve.motion_solution, elimination_split, :product,
@@ -2100,7 +2860,7 @@ function build_condensed_coupled_system(
                 (mass_factorization \ schur_double, mass_factorization \ gamma_mech)
             end
             schur_double = nothing
-            interface_block = _split_timed!(() -> ComplexF64.(bem_interface_block), elimination_split, :block_convert)
+            interface_block = _split_timed!(() -> _test_take_converted(ComplexF64, bem_interface_block), elimination_split, :block_convert)
             schur_coupling, motion_coupling = _split_timed!(elimination_split, :product) do
                 (interface_block * schur_solution, interface_block * motion_solution)
             end
@@ -2133,9 +2893,16 @@ function build_condensed_coupled_system(
 
     coupled_factorization_started = time_ns()
     factorization = dense_type === Float64 && T !== Float64 && _dense_refinement_enabled(bem_backend) ?
-                    RefinedDenseLU(coupled) : lu!(coupled)
+                    RefinedDenseLU(coupled; correction=dense_correction) : lu!(coupled)
     coupled_factorization_s = (time_ns() - coupled_factorization_started) / 1.0e9
+    factorization isa RefinedDenseLU &&
+        for (key, value) in _TEST_LU_SPLIT
+            elimination_split[Symbol("lu_", key)] = value
+        end
 
+    # BLAB_TEST_HOST_POOL: nothing below references the BEM matrices; the release returns the rest.
+    _test_give!(bem_lhs, bem_rhs_operator)
+    isnothing(dense_correction) && _test_give!(bem_interface_block)
     return (
         fem_mesh=fem_mesh,
         bem_mesh=bem_mesh,
@@ -2212,7 +2979,190 @@ function build_condensed_coupled_system(
     )
 end
 
+# Test (BLAB_TEST_BM_THREADED=1): `burton_miller_neumann_matrices` with each output column on its own
+# thread. The per-entry expressions are the broadcasts' own, in the same order, so the result is
+# bit-identical; the broadcasts run on one thread and took ~0.15 s/freq on the critical path.
+function _test_burton_miller_matrices_threaded(
+    operators, identity_p1_p1, identity_p1_dp0, k::T; row_weights=nothing, flux_columns=nothing, combined=false,
+) where {T<:AbstractFloat}
+    coupling = burton_miller_coupling(k)
+    half = Complex{T}(0.5)
+    D, H = operators.double_layer, operators.hypersingular
+    S, Kp = operators.single_layer, operators.adjoint_double_layer
+    lhs = _test_take(Complex{T}, size(D)...)
+    rhs = _test_take(Complex{T}, size(S)...)
+    if !isnothing(row_weights)
+        # BLAB_TEST_HOST_ROW_WEIGHTS: the GPU skipped `operator .*= w` (row i scaled by w[i]); the
+        # same products are formed here, then combined exactly as below.
+        w = Complex{T}.(row_weights)
+        if combined
+            # BLAB_TEST_COMBINED_BM: D holds A = -D + βH and S holds C = -S - βK'.
+            Threads.@threads for j in axes(lhs, 2)
+                @inbounds for i in axes(lhs, 1)
+                    lhs[i, j] = half * identity_p1_p1[i, j] + D[i, j] * w[i]
+                end
+            end
+            Threads.@threads for j in axes(rhs, 2)
+                if !isnothing(flux_columns) && !flux_columns[j]
+                    @inbounds rhs[:, j] .= zero(Complex{T})
+                    continue
+                end
+                @inbounds for i in axes(rhs, 1)
+                    rhs[i, j] = S[i, j] * w[i] - coupling * (half * identity_p1_dp0[i, j])
+                end
+            end
+            return lhs, rhs
+        end
+        Threads.@threads for j in axes(lhs, 2)
+            @inbounds for i in axes(lhs, 1)
+                lhs[i, j] = half * identity_p1_p1[i, j] - D[i, j] * w[i] + coupling * (H[i, j] * w[i])
+            end
+        end
+        Threads.@threads for j in axes(rhs, 2)
+            if !isnothing(flux_columns) && !flux_columns[j]
+                @inbounds rhs[:, j] .= zero(Complex{T})
+                continue
+            end
+            @inbounds for i in axes(rhs, 1)
+                rhs[i, j] = -(S[i, j] * w[i]) - coupling * (Kp[i, j] * w[i] + half * identity_p1_dp0[i, j])
+            end
+        end
+        return lhs, rhs
+    end
+    Threads.@threads for j in axes(lhs, 2)
+        @inbounds for i in axes(lhs, 1)
+            lhs[i, j] = half * identity_p1_p1[i, j] - D[i, j] + coupling * H[i, j]
+        end
+    end
+    Threads.@threads for j in axes(rhs, 2)
+        @inbounds for i in axes(rhs, 1)
+            rhs[i, j] = -S[i, j] - coupling * (Kp[i, j] + half * identity_p1_dp0[i, j])
+        end
+    end
+    return lhs, rhs
+end
+
+"""
+    condensed_metal_operators(cache, bem_mesh, frequency_hz, sound_speed; quadrature_order, singular_order)
+
+Test prefetch: the four Metal BEM operators exactly as `build_condensed_coupled_system` assembles
+them for this frequency, so a sweep can assemble frequency i+1 while frequency i's host stages run.
+"""
+# Metal assembly of the four operators under the round 8/9 test switches (host row weights, combined
+# Burton-Miller, flux skip), which reach the kernels through BeatEngineCore globals: callers must
+# never run two of these at once. Returns the host operators, the row weights still to apply and
+# whether the operators are combined.
+function _test_metal_operators(prepared, bem_mesh, wavenumber, singular_order, flux_columns; timing=_test_asm_timing())
+    # Test (BLAB_TEST_GPU_MICRO): repeated assemblies of this wavenumber under variants, once.
+    BeatEngineCore._test_gpu_micro(wavenumber, prepared.device_cache) do t
+        assembled = _test_metal_operators(prepared, bem_mesh, wavenumber, singular_order, flux_columns; timing=t)
+        BeatEngineCore.release_operator_storage!(assembled.operators)
+    end
+    # Metal assembles the four operators on the GPU; the condensed algebra
+    # below is CPU-only, so bring them down and free the device copies.
+    host_row_weights = get(ENV, "BLAB_TEST_HOST_ROW_WEIGHTS", "0") == "1" &&
+                       get(ENV, "BLAB_TEST_BM_THREADED", "0") == "1" &&
+                       BeatEngineCore.normalized_symmetry_mode(prepared.symmetry_mode) != :off
+    host_row_weights && (BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = true)
+    # Test (BLAB_TEST_COMBINED_BM=1, with HOST_ROW_WEIGHTS): the GPU writes A = -D + βH and
+    # C = -S - βK' directly (see BeatEngineCore._TEST_COMBINED_BM).
+    combined_bm = host_row_weights && get(ENV, "BLAB_TEST_COMBINED_BM", "0") == "1"
+    combined_bm && (BeatEngineCore._TEST_COMBINED_BM[] = Complex{Float32}(burton_miller_coupling(wavenumber)))
+    if !isnothing(flux_columns)
+        BeatEngineCore._TEST_FLUX_MASK[] = BeatEngineCore.MtlArray(Int32.(flux_columns))
+    end
+    device_operators = try
+        assemble_regular_galerkin_operators(
+            bem_mesh,
+            prepared.p1,
+            prepared.dp0,
+            wavenumber,
+            prepared.rule;
+            skip_singular=false,
+            singular_order=singular_order,
+            backend=:metal,
+            device_cache=prepared.device_cache,
+            singular_cache=prepared.singular_cache,
+            device_singular_cache=prepared.device_singular_cache,
+            symmetry_mode=prepared.symmetry_mode,
+            timing=timing,
+        )
+    finally
+        BeatEngineCore._TEST_DEFER_ROW_WEIGHTS[] = false
+        BeatEngineCore._TEST_COMBINED_BM[] = nothing
+        BeatEngineCore._TEST_FLUX_MASK[] = nothing
+    end
+    row_weights = host_row_weights ? p1_symmetry_orbit_weights(bem_mesh, prepared.symmetry_mode) : nothing
+    _test_asm_timing_write(wavenumber)
+    # Test (BLAB_TEST_DELAY_GPU=<s>): lengthen the GPU lane by an idle wait (bottleneck test).
+    test_delay = parse(Float64, get(ENV, "BLAB_TEST_DELAY_GPU", "0"))
+    test_delay > 0 && sleep(test_delay)
+    # Wraps shared device storage in place (copies it when the storage mode
+    # is private); either way the host tuple owns the device buffers, so
+    # `device_operators` must not be released separately.
+    return (operators=metal_host_operators(device_operators), row_weights=row_weights, combined=combined_bm)
+end
+
+function condensed_metal_operators(
+    cache, bem_mesh::BoundaryMesh{T}, frequency_hz::T, sound_speed::T;
+    quadrature_order::Int, singular_order::Int, flux_columns=nothing,
+) where {T<:AbstractFloat}
+    prepared = merge(cache.base, cache.quadrature_bundles[quadrature_order])
+    omega = T(2pi) * frequency_hz
+    wavenumber = omega / sound_speed
+    # Test (BLAB_TEST_PREFETCH_OPT=1): the build's own assembly, with the flux mask the build used.
+    if get(ENV, "BLAB_TEST_PREFETCH_OPT", "0") == "1"
+        assembled = _test_metal_operators(prepared, bem_mesh, wavenumber, singular_order, flux_columns)
+        return (k=wavenumber, assembled..., flux_columns=flux_columns)
+    end
+    device_operators = assemble_regular_galerkin_operators(
+        bem_mesh,
+        prepared.p1,
+        prepared.dp0,
+        wavenumber,
+        prepared.rule;
+        skip_singular=false,
+        singular_order=singular_order,
+        backend=:metal,
+        device_cache=prepared.device_cache,
+        singular_cache=prepared.singular_cache,
+        device_singular_cache=prepared.device_singular_cache,
+        symmetry_mode=prepared.symmetry_mode,
+        timing=_test_asm_timing(),
+    )
+    _test_asm_timing_write(wavenumber)
+    return (k=wavenumber, operators=metal_host_operators(device_operators), flux_columns=nothing)
+end
+
+# Test hook: BLAB_TEST_ASM_TIMING=<file> appends the Metal assembly stage timings per call.
+const _TEST_ASM_TIMING = Dict{String,Any}()
+function _test_asm_timing()
+    isempty(get(ENV, "BLAB_TEST_ASM_TIMING", "")) && return nothing
+    empty!(_TEST_ASM_TIMING)
+    return _TEST_ASM_TIMING
+end
+function _test_asm_timing_write(k)
+    path = get(ENV, "BLAB_TEST_ASM_TIMING", "")
+    isempty(path) && return
+    open(path, "a") do io
+        println(io, "k=", round(Float64(k); digits=3), " ",
+                join(("$(key)=$(round(Float64(v); digits=4))" for (key, v) in sort!(collect(_TEST_ASM_TIMING)) if v isa Real), " "))
+    end
+end
+
 function release_condensed_coupled_system!(system)
+    if _test_host_pool_on() && hasproperty(system, :factorization) && system.factorization isa RefinedDenseLU
+        refined = system.factorization
+        _test_give!(refined.matrix)
+        factor = refined.factor
+        !isnothing(factor) && factor !== _TEST_STALE.factor && _test_give!(factor.factors)
+        isnothing(refined.correction) || _test_give!(refined.correction.block32)
+        data = system.interface_elimination_data
+        !isnothing(data) && hasproperty(data, :interface_block) && _test_give!(data.interface_block)
+        !isnothing(data) && hasproperty(data, :schur_blocks) && _test_give!(data.schur_blocks...)
+        condensation = system.condensation
+        !isnothing(condensation) && hasproperty(condensation, :schur) && _test_give!(condensation.schur)
+    end
     _release_condensation!(system.condensation)
     system.owns_cache && release_condensed_coupled_cache!(system.cache)
     return nothing
@@ -2365,6 +3315,10 @@ function solve_condensed_coupled_excitations(system, excitations; reconstruct_in
     if elimination_mode == :flux
         # BEM rows gain B_q M_Γ⁻¹ g from substituting q = M_Γ⁻¹ (S P p_B + E y - g).
         flux_rhs_solution = _split_timed!(solve_split, :flux_rhs_mass) do
+            # BLAB_TEST_ZERO_RHS_SKIP: a zero reduced right-hand side needs no mass solve.
+            get(ENV, "BLAB_TEST_ZERO_RHS_SKIP", "0") == "1" && all(iszero, reduced_rhs) ?
+            zeros(ComplexF64, hasproperty(elimination, :mass_operator) ? elimination.mass_operator.count :
+                              size(reduced_rhs, 1), size(reduced_rhs, 2)) :
             hasproperty(elimination, :mass_operator) ?
                 _interface_mass_apply(elimination.mass_operator, reduced_rhs) :
                 elimination.mass_factorization \ ComplexF64.(reduced_rhs)
