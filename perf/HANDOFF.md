@@ -22,59 +22,19 @@ Explain accuracy to the user in plain terms (dB change and seconds saved), not m
   off at 10-20 kHz at the quietest points of the 60 dB window (Float32 summation). A max-dB limit of
   0.01 there is below what Float32 can deliver; compare against stock, not against zero.
 
-## Status round 17 S4 (2026-09-27, NOTES "Round 17 S4")
-- Branch A (CPU leads). R17-3 **stopped**: micro gate failed (OpenBLAS64 4 threads beside MUMPS only 19.7 ms
-  better than Accelerate < 25), and a GMRES-length loop grows past the FEM stage on OpenBLAS. No switch added.
-- R17-6 **kept**: `BLAB_TEST_MUMPS_SPARSE_RHS=1` (ICNTL(20)=1 in `mumps_reduce`), reduce 14.3 -> 4.5 ms.
-  SAWMOD 50 f 0.565 -> 0.551 s/freq (busy machine), 0.0003 dB; V-C 0.0000 dB. In the round 17 app patch draft.
-- New: `perf/mumps_contention_micro.jl`, `mumps_loop_micro.jl` 3rd arg (reduce dump), `BLAB_TEST_DUMP_REDUCE`.
-- Open: R17-4 for the coupled singular kernels, R17-8 (needs Q2), R17-3 as other-Mac item. App patch not applied.
-
-## Status round 17 S3 (2026-09-27, NOTES "Round 17 S3")
-- prototype2 quarter, 200 freqs: stock 0.070, r16 0.054, **S3 0.040 s/freq** (-26 %), 0.0019 dB vs stock.
-- R17-2 done: `BLAB_METAL_PIPELINE=1` (bit-identical; the overlap model underrates the solve). R17-5 done:
-  `SING_SPLIT=0.4` (0.0001 dB), `POOL_ZERO2=1` (SAWMOD bit-identical, gain in noise).
-- R17-4 done for prototype2: `SING_PACKED=2`, 512 threads, singular 7.8 -> 2.7 ms; 0.0015 dB vs unpacked
-  (above the 0.001 gate, closer to stock than unpacked): user approved it for the app patch (2026-09-27).
-- R17-7 skipped (M4: no-loads probe -8 % < 15 %). M4 table in NOTES.
-- Cross-code exact checks: `BLAB_TEST_SAVE_RESULTS=<file>` + `perf/cmp_results.py`.
-- App patch draft `perf/app_patches/round17_engine_distribution.diff` (after round 16's); not applied.
-- Next: SAWMOD CPU chain (R17-3 micro, R17-6), per M1. quick.py still running (user stops it).
-
-## Status round 17 S2 (2026-09-27, NOTES "Round 17 S2")
-- R17-1 **stopped after steps 1-3**: user declined extending BeatEngineMetalBundle (deps + julia_metal re-resolve).
-  R17-1c declined too. R17-1b not needed (Y ~4.5 s).
-- Done: coupled engine is now module `julia_local/BeatEngineCoupledWorker.jl`; `coupled_solver.jl` is a thin loader
-  that uses the bundle only if the bundle carries that module (today never), else includes from source.
-- Results bit-identical to pre-S2 (SAWMOD, proto2q); cold/warm times unchanged. Revise harness works, module edits
-  hot-reload. Cold-start gain: 0 s until the bundle is extended (then expected ~-40..-55 s per M3).
-- `perf/cmp_dumps.py a.pkl b.pkl`: exact compare of APP_TIMING_DUMP pickles.
-- Next: R17-5, then by M1 verdict (plan §3), or R17-1 steps 4-6 if the user approves the bundle change.
-
-## Status round 17 S1 (2026-09-27, NOTES "Round 17 S1"; plan perf/PLAN_ROUND17.md)
-- M1 SAWMOD: **CPU chain leads by ~36 ms** (GPU +50 ms costs +5, CPU +50 ms costs +41; MUMPS ~-80 ms buys -74,
-  GPU -150 ms buys -12). Next for SAWMOD: R17-3 micro, then R17-6.
-- M2 prototype2 quarter: `BLAB_METAL_PIPELINE=1` 0.055 -> 0.047 s/freq (identical results); the overlap model
-  turns it off (solve model 1.9 ms vs ~8 ms real). R17-2 = switch/model fix; verify on proto2 full + 200 freqs.
-- M3 cold start: ~60 s (SAWMOD) / ~45 s (proto2q) of the wait is host JIT + includes (X), Metal kernel compile
-  only ~4.5 s (Y). So S2 = R17-1 (bundle), R17-1b dropped. Warm one-time cost ~1.5 s/request.
-- New hooks: `BLAB_TEST_DELAY_EXT_SOLVE`, `BLAB_TEST_COLD_LOG` (process env), overlap_plan line in PHASE_LOG,
-  `mkjob.py --request=`.
-- **S1 closed (tag metal-test-round17s1). Next: S2 (R17-1).** Ask PLAN Q1 first (extend `BeatEngineMetalBundle`
-  + precompile after each edit; app pre-start R17-1c). Cold runs: M3 commands in NOTES, `perf/cold_sum.py <log>`.
-  quick.py is stopped; the user stops it themselves (pkill is blocked for Claude by a permission check).
-
-## Status after round 16 (2026-09-27): GPU_PLAN T1-T5 worked through (NOTES "Round 16")
-- Kept (test-only switches, off by default, app patch `perf/app_patches/round16_engine_distribution.diff`
-  not yet applied): `BLAB_TEST_FUSED_IMAGE_ACC=1` + `BLAB_TEST_FUSED_PACKED=2` (T1, exterior),
-  `BLAB_TEST_FIELD_MULTI=1` (T3 part 1, coupled). App path: SAWMOD 32.5 -> 28.0 s, prototype2 quarter
-  14.3 -> 12.3 s (busy machine), 0.0005 / 0.002 dB.
-- No gain or rejected: T2 (early combine slower in the tile-reduce kernel, runtime-loop variant crashes
-  the Metal compiler; TY=8 neutral), T3 part 2 (centroid far field: 20-43 dB), T4 (3-point far pairs:
-  0.24-50 dB for <= 4 %), T5 (singular split: accurate only for k h < 0.8, ~2-3 ms/freq; optional
-  `BLAB_TEST_SING_SPLIT=0.6`, 0.0004 dB). T1 steps 3-4 skipped / no gain.
-- Metal compiler: a kernel with two runtime-loop quadrature bodies (or a runtime test loop beside the
-  tile-reduce barriers) fails at pipeline link; use one body per launch.
+## Status round 17 (closed 2026-09-27, tag metal-test-round17; NOTES "Round 17 summary")
+- App patch `perf/app_patches/round17_engine_distribution.diff` holds the round 16 + 17 switches (8 lines in
+  `METAL_TEST_SOLVER_OPTIONS`); it replaces round16_*.diff. Checked with `git apply --check`, not applied (the user applies).
+- App path warm, current app -> round 17 set (stock Metal): SAWMOD 50 f 29.7 -> 27.7 s (137.8),
+  proto2q 200 f 14.2 -> 7.9 s (20.6). Cold runs unchanged within noise (SAWMOD 90-99 s, proto2q 60-66 s).
+- Accuracy vs the current app env: SAWMOD 0.0004 dB, V-C 0.0000, proto2q 0.0018 (approved packed kernels, r16 + S3).
+- Kept: R17-2 `BLAB_METAL_PIPELINE=1`, R17-5 `SING_SPLIT=0.4` + `POOL_ZERO2=1`, R17-4 `SING_PACKED=2`,
+  R17-6 `MUMPS_SPARSE_RHS=1`. Stopped: R17-1 (bundle change declined), R17-3 (micro gate). Skipped: R17-7.
+- Next ideas: R17-1 steps 4-6 + R17-1c (cold start ~60 s is engine JIT; needs the bundle deps change, user said no
+  for now); R17-8 mirror-symmetric field grid (needs Q2); R17-4 for the coupled singular kernels (SAWMOD);
+  R17-3 OpenBLAS solve beside MUMPS on a Mac with more AMX contention; the SAWMOD CPU chain still leads (M1),
+  so MUMPS/elimination cuts pay ~1:1 and GPU cuts ~1:10. Other-Mac run: none available (2026-09-27).
+- Older status blocks (round 16, round 17 S1-S4) moved to `HANDOFF_ARCHIVE.md`.
 
 ## Standing facts from rounds 10-15 (full text: `perf/HANDOFF_ARCHIVE.md`)
 - SAWMOD per-frequency structure: pipeline `COUPLED_PREFETCH + EARLY_BUILD + PREFETCH_OPT + FEM_LANE=2`.

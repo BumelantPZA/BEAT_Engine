@@ -1,5 +1,30 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
+## Round 17 summary (2026-09-27, S5 wrap-up; tag metal-test-round17)
+App path (`app_timing.py`, app's own headless solve, run 1 cold then run 2 warm, to first freq / total, s).
+"current" = the app's test_env today (no round 16 switches applied), "r17" = current + `APP_TIMING_EXTRA` with the
+round 16 + 17 set, "stock" = `APP_TIMING_BACKEND=beat_metal`:
+| Project | current cold | r17 cold | current warm | **r17 warm** | stock warm |
+|---|---|---|---|---|---|
+| SAWMOD, 50 freqs | 64.9 / 90.2 | 70.8 / 98.5 | 1.75 / 29.65 | **1.80 / 27.68** (-7 %) | 3.89 / 137.76 |
+| proto2_quarter, 200 freqs | 51.4 / 66.3 | 51.1 / 60.2 | 0.22 / 14.18 | **0.24 / 7.94** (-44 %) | 0.28 / 20.62 |
+Cold totals are mostly engine JIT (S1 M3). SAWMOD r17 cold is 8 s slower here in one run each; not checked whether
+that is noise or JIT of the extra kernels. The harness base below (0.809 s/freq, 1 round, first job after the worker
+had idled) is far above earlier base runs (~0.53), so the harness gain overstates SAWMOD; use the app-path table.
+
+Accuracy, quick.py, config `base` = current app env vs `r17` (1 round each; harness s/freq for reference):
+| Set | base s/freq | r17 s/freq | maxdB |
+|---|---|---|---|
+| SAWMOD 50 f | 0.809 | 0.570 | 0.0004 |
+| proto2q 50 f | 0.073 | 0.042 | 0.0018 (approved: r16 FUSED_PACKED 0.002, S3 SING_PACKED 0.0015) |
+| vented_sub 12 f | 0.208 | 0.165 | 0.0000 |
+| compression_driver 12 f | 0.017 | 0.016 | 0.0000 |
+
+Switch list in `perf/app_patches/round17_engine_distribution.diff` (supersedes round16_*.diff; checked with
+`git apply --check`, not applied): round 16 `BLAB_TEST_FUSED_IMAGE_ACC=1`, `BLAB_TEST_FUSED_PACKED=2`,
+`BLAB_TEST_FIELD_MULTI=1`; round 17 `BLAB_METAL_PIPELINE=1`, `BLAB_TEST_SING_SPLIT=0.4`, `BLAB_TEST_SING_PACKED=2`,
+`BLAB_TEST_POOL_ZERO2=1`, `BLAB_TEST_MUMPS_SPARSE_RHS=1`. No other Mac available, so no OTHER_MAC.md.
+
 ## Round 17 S4 (2026-09-27): SAWMOD CPU chain (R17-3 stopped, R17-6 kept)
 Branch A (M1: CPU chain leads by ~36 ms). Checkpoint tag metal-test-round17-pre-s4.
 

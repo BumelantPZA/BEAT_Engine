@@ -290,7 +290,7 @@ Each session ends the same way:
 | S2 Cold start | R17-1 (+1b micro) | Sonnet (Opus if precompile debugging stalls) | [M] edits and precompile fixes. [R] cold/warm app runs, bit-identity compare |
 | S3 prototype2 GPU | R17-2 (code part, if M2 needs it), R17-5, M4, R17-4. R17-7 only if gated in. Split at R17-4 if the session runs long | Opus for kernel edits | [M] kernels. [R] V-P jobs, 200-freq job |
 | S4 SAWMOD lane | Per M1: R17-3 micro, then switch, then R17-6; or the GPU items | Sonnet | [M] micro code, switches. [R] V-S, V-C |
-| S5 Wrap-up (fold into S4 if short) | `perf/app_patches/round17_engine_distribution.diff`, V-A for both projects, HANDOFF | Sonnet | [R] V-A. [M] patch, handoff |
+| S5 Wrap-up (fold into S4 if short) *[done 2026-09-27, NOTES "Round 17 summary"]* | `perf/app_patches/round17_engine_distribution.diff`, V-A for both projects, HANDOFF | Sonnet | [R] V-A. [M] patch, handoff |
 
 **Delegate to horn-runner:** any step whose raw output the main session doesn't need, i.e. job runs,
 app_timing runs and package-load timing. **Keep in the main session:** anything that edits, compiles or
