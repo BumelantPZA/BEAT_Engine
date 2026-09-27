@@ -22,6 +22,14 @@ Explain accuracy to the user in plain terms (dB change and seconds saved), not m
   off at 10-20 kHz at the quietest points of the 60 dB window (Float32 summation). A max-dB limit of
   0.01 there is below what Float32 can deliver; compare against stock, not against zero.
 
+## Status round 17 S4 (2026-09-27, NOTES "Round 17 S4")
+- Branch A (CPU leads). R17-3 **stopped**: micro gate failed (OpenBLAS64 4 threads beside MUMPS only 19.7 ms
+  better than Accelerate < 25), and a GMRES-length loop grows past the FEM stage on OpenBLAS. No switch added.
+- R17-6 **kept**: `BLAB_TEST_MUMPS_SPARSE_RHS=1` (ICNTL(20)=1 in `mumps_reduce`), reduce 14.3 -> 4.5 ms.
+  SAWMOD 50 f 0.565 -> 0.551 s/freq (busy machine), 0.0003 dB; V-C 0.0000 dB. In the round 17 app patch draft.
+- New: `perf/mumps_contention_micro.jl`, `mumps_loop_micro.jl` 3rd arg (reduce dump), `BLAB_TEST_DUMP_REDUCE`.
+- Open: R17-4 for the coupled singular kernels, R17-8 (needs Q2), R17-3 as other-Mac item. App patch not applied.
+
 ## Status round 17 S3 (2026-09-27, NOTES "Round 17 S3")
 - prototype2 quarter, 200 freqs: stock 0.070, r16 0.054, **S3 0.040 s/freq** (-26 %), 0.0019 dB vs stock.
 - R17-2 done: `BLAB_METAL_PIPELINE=1` (bit-identical; the overlap model underrates the solve). R17-5 done:

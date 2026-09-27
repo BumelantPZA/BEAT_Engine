@@ -168,7 +168,7 @@ Accuracy is maxdB against `base`, the stock app environment, under the HANDOFF p
 - **Stop if:** `solve10` costs < 3 ms and all pipeline settings land within ±1 ms.
 - Not in any "didn't work" table (no round measured these switches).
 
-### R17-3 SAWMOD: move the solve beside MUMPS off the AMX units
+### R17-3 SAWMOD: move the solve beside MUMPS off the AMX units *[S4: STOPPED, micro gate failed (19.7 < 25 ms); NOTES "Round 17 S4"]*
 - **Helps:** SAWMOD and any MUMPS project; most where the CPU chain leads (M1; stronger-GPU Macs).
 - **Gain:** the 48 ms/freq contention on MUMPS (see §1).
   - Untested hypothesis: solve(i) competes with MUMPS(i+1) for the shared AMX units, since both run Accelerate zgemm/ztrsm.
@@ -211,7 +211,7 @@ Accuracy is maxdB against `base`, the stock app environment, under the HANDOFF p
 - **First step:** M1's `ty8` config, then a proto2q job at 200 freqs with SING_SPLIT off / 0.4 / 0.6, 2 rounds.
 - **Stop if:** no gain outside the noise, or > 0.001 dB.
 
-### R17-6 MUMPS sparse right-hand sides for the transducer reduction
+### R17-6 MUMPS sparse right-hand sides for the transducer reduction *[S4: DONE, kept; reduce 14.3 -> 4.5 ms, SAWMOD -14 ms/freq, 0.0003 dB]*
 - **Helps:** SAWMOD's CPU chain and any transducer project.
 - **Gain:**
   - The reduction takes 0.015 s alone and 0.021 s contended per freq (R13).

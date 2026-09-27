@@ -1,5 +1,41 @@
 # SAWMOD Metal performance experiments (2026-09-25)
 
+## Round 17 S4 (2026-09-27): SAWMOD CPU chain (R17-3 stopped, R17-6 kept)
+Branch A (M1: CPU chain leads by ~36 ms). Checkpoint tag metal-test-round17-pre-s4.
+
+**R17-3 micro** (`perf/mumps_contention_micro.jl <fem.jls> [trials] [its]`, 7 trials, medians, ms). MUMPS stays on
+Accelerate; the loop beside it = its x (ComplexF32 FAST_TRS nb=128 solve, 3 columns + F64 3116^2 x 3 zgemm):
+| loop (its) | variant | MUMPS alone | loop alone | MUMPS beside | loop beside | MUMPS + |
+|---|---|---|---|---|---|---|
+| 9 | a Accelerate | 175.6 | 70.3 | 204.6 | 88.1 | 29.0 |
+| 9 | b OpenBLAS64 4 thr | 174.9 | 121.0 | 184.9 | 129.6 | 10.0 |
+| 9 | b OpenBLAS64 8 thr | 173.2 | 87.4 | 221.6 | 144.5 | 48.4 |
+| 9 | c threaded Julia | 204.0 | 165.1 | 218.4 | 318.3 | 14.4 |
+| 18 | a Accelerate | 185.0 | 146.8 | 236.8 | 180.4 | 51.8 |
+| 18 | b OpenBLAS64 4 thr | 178.7 | 246.0 | 203.4 | 262.0 | 24.7 |
+| 18 | b OpenBLAS64 8 thr | 180.2 | 237.6 | 251.2 | 363.1 | 71.0 |
+| 18 | c threaded Julia | 224.0 | 376.1 | 249.8 | 602.1 | 25.8 |
+Gate (9 its, as specified): best is OpenBLAS 4 threads, 19.7 ms better than Accelerate < 25 ms: **R17-3 stopped**.
+The 18-its run (loop ~ the real stale GMRES, 147 ms alone) saves 33 ms on MUMPS, but the loop grows 180 -> 262 ms
+beside MUMPS; scaled to the real stale solve (0.208 s) that is ~0.30 s, past the FEM stage (0.295 s), so the solve
+would turn critical. No `BLAB_TEST_SOLVE_BLAS` switch was added. Park for Macs where AMX contention is larger.
+Pitfall: `openblas_set_num_threads64_` takes a C `int` by value; passing `Ref{Int64}` gives OpenBLAS a huge thread
+count and every call takes ~150-200 ms. Use `OpenBLAS_jll.libopenblas_handle` for the direct ccalls.
+
+**R17-6** MUMPS 5.9.1 guide: ICNTL(20)=1,2,3 conflicts only with ICNTL(32)=1; ICNTL(26)=1/2 says the right-hand side
+"can be dense, sparse or distributed". `BLAB_TEST_MUMPS_SPARSE_RHS=1` (`_solve_phase!` kwarg in `BeatEngineMumps.jl`,
+used by `mumps_reduce`; double-precision struct only): columns as Int32 CSC, `RHS` stays the dense output array.
+Hook `BLAB_TEST_DUMP_REDUCE=<file>` dumps the transducer columns (6 columns, 1613 nonzero rows of 24947).
+Micro (`mumps_loop_micro.jl <fem.jls> 40 <reduce.jls>`): reduce 14.3 -> 4.5 ms, the expansion after it 10.7 -> 11.0
+(unchanged), reduce and expand maxrel 2e-16 vs dense.
+| Set | base s/freq | srhs s/freq | maxdB |
+|---|---|---|---|
+| V-S SAWMOD 50 f, 3 rounds (base = app env + r16 switches incl. FIELD_MULTI) | 0.565 (r 0.565/0.603/0.563) | **0.551** (0.551/0.590/0.523) | 0.0003 |
+| V-C vented_sub 12 f, 2 rounds | 0.184 | 0.181 | 0.0000 |
+| V-C compression_driver 12 f, 2 rounds | 0.016 | 0.016 | 0.0000 |
+Per-round gain -14/-13/-40 ms (median -14). **Kept**, added to `perf/app_patches/round17_engine_distribution.diff`.
+The machine was busier than in M1 (base 0.565 vs 0.49), so compare within the job only.
+
 ## Round 17 S3 (2026-09-27): prototype2 GPU lane (R17-2, R17-5, M4, R17-4; R17-7 skipped)
 All configs carry the round 16 exterior switches (r16). Checkpoint tag metal-test-round17-pre-s3.
 | Step | Config | proto2q s/freq | proto2 full s/freq | maxdB |
