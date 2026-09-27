@@ -22,6 +22,15 @@ Explain accuracy to the user in plain terms (dB change and seconds saved), not m
   off at 10-20 kHz at the quietest points of the 60 dB window (Float32 summation). A max-dB limit of
   0.01 there is below what Float32 can deliver; compare against stock, not against zero.
 
+## Status after round 14 (2026-09-27) and next step
+- App path SAWMOD ~24 s warm (stock Metal 131 s); prototype2 quarter 13.9 s (stock 20.5 s). Tags up to
+  `metal-test-round14`. App patches in `perf/app_patches/` (user applies; field mode now 4).
+- MUMPS is exhausted in double precision (NOTES round 13b). The pipeline is balanced: CPU chain
+  (MUMPS 0.23 -> dense LU 0.14 on fresh freqs) vs GPU lane (BEM operators 0.25 + field 0.08).
+- Next candidates: (1) GPU BEM operator kernel (helps SAWMOD's GPU lane and the prototype, whose fused
+  exterior kernel spends 16 of 47 ms in two gather passes); (2) cold start ~40-60 s per app launch
+  (coupled_solver.jl has no precompiled bundle); ask the user which first.
+
 ## Where things stand (after round 11, 2026-09-26)
 - Goal: shorten the whole SAWMOD coupled FEM-BEM solve (50 freqs) in Boundary Lab's
   "BEAT Engine (Apple Metal test)" solver. In-app, 50 freqs: 141 s (stock) → 58 s (round 3) → 51.2 s
