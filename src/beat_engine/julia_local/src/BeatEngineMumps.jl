@@ -303,6 +303,7 @@ mutable struct MumpsSchurSolver
     factored::Bool
     analysis_count::Int
     factorization_count::Int
+    workspace::Vector{ComplexF64}
 end
 
 function MumpsSchurSolver(library::MumpsLibrary; threads::Int=mumps_threads())
@@ -314,8 +315,12 @@ function MumpsSchurSolver(library::MumpsLibrary; threads::Int=mumps_threads())
     _call!(library, s, -1)
     infog(s, 1) < 0 && error("MUMPS initialization failed: INFOG(1)=$(infog(s, 1)) INFOG(2)=$(infog(s, 2))")
     solver = MumpsSchurSolver(library, s, true, 0, Int[], Int[], Int[], Int[], Int32[], Int32[],
-        ComplexF64[], Int32[], ComplexF64[], threads, false, false, 0, 0)
+        ComplexF64[], Int32[], ComplexF64[], threads, false, false, 0, 0, ComplexF64[])
     _quiet!(s)
+    # No numerical pivoting: the FEM matrices condensed here are complex-symmetric and never delay a
+    # pivot, and the threshold search alone cost ~0.04 s per factorization on SAWMOD. A factorization
+    # that fails without pivoting restores MUMPS's default threshold (see `mumps_factorize!`).
+    _set_cntl!(s, 1, 0.0)
     LIVE_SOLVERS[solver] = nothing
     # A solver the owner forgot still returns its factors to the allocator eventually.
     finalizer(mumps_release!, solver)
@@ -338,6 +343,10 @@ function _quiet!(s::ZMumpsStruc)
     set_icntl!(s, 21, 0)   # centralized solution
     return s
 end
+
+_cntl(s::ZMumpsStruc, index::Integer) = GC.@preserve s unsafe_load(_field_pointer(s, :cntl, Float64), index)
+_set_cntl!(s::ZMumpsStruc, index::Integer, value::Real) =
+    GC.@preserve s unsafe_store!(_field_pointer(s, :cntl, Float64), Float64(value), index)
 
 function _check(solver::MumpsSchurSolver, phase::AbstractString)
     status = infog(solver.struc, 1)
@@ -441,8 +450,12 @@ Numeric LDLᵀ of the analysed pattern with `matrix`'s values and return the ful
 `S = A_ΓΓ - A_ΓI A_II⁻¹ A_IΓ` in `schur_variables` order. Refuses (throws) a matrix whose
 transpose entries differ by more than `symmetry_tolerance` relative, since SYM=2 reads only the
 lower triangle.
+
+`schur_storage`, when given, is an `m x m` matrix the Schur complement is written into and
+returned, so a caller can reuse its storage across factorizations.
 """
-function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; symmetry_tolerance::Real)
+function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; symmetry_tolerance::Real,
+                          schur_storage::Union{Nothing,Matrix{ComplexF64}}=nothing)
     solver.analysed || error("MUMPS factorization needs an analysis first.")
     values = nonzeros(matrix)
     for (index, position) in enumerate(solver.lower_positions)
@@ -460,6 +473,7 @@ function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; sym
     _set_blas_threads(solver)
     attempts = 0
     while true
+        _bind_workspace!(solver)
         GC.@preserve solver _call!(solver.library, s, 2)
         status = infog(s, 1)
         # -8/-9: workspace estimate too small; relax it and retry a bounded number of times.
@@ -468,13 +482,21 @@ function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; sym
             attempts += 1
             continue
         end
+        # Without pivoting a factorization can fail; fall back to MUMPS's default threshold for this
+        # and every later factorization of the solver.
+        if status < 0 && _cntl(s, 1) == 0.0
+            _set_cntl!(s, 1, 0.01)
+            @warn "MUMPS factorization without pivoting failed (INFOG(1)=$status); retrying with CNTL(1)=0.01"
+            continue
+        end
         break
     end
     _check(solver, "factorization")
     solver.factored = true
     solver.factorization_count += 1
     m = length(solver.schur_variables)
-    schur = copy(reshape(solver.schur_buffer, m, m))
+    schur = isnothing(schur_storage) ? copy(reshape(solver.schur_buffer, m, m)) :
+            copyto!(schur_storage, reshape(solver.schur_buffer, m, m))
     # MUMPS 5.9 returns the full matrix for SYM=2 with ICNTL(19)=3; older releases returned one
     # triangle. Complete it from the lower triangle if the strict upper part came back empty.
     if m > 1 && all(iszero, (schur[i, j] for j in 2:m for i in 1:(j-1))) &&
@@ -486,7 +508,26 @@ function mumps_factorize!(solver::MumpsSchurSolver, matrix::SparseMatrixCSC; sym
     return schur
 end
 
-function _solve_phase!(solver::MumpsSchurSolver, rhs::Matrix{ComplexF64}, reduced::Matrix{ComplexF64}, mode::Integer)
+"""
+MUMPS's main workspace (the factors and the Schur block) is a buffer kept per solver and passed as
+`WK_USER`, instead of MUMPS allocating it for every factorization and the kernel faulting its pages
+in again (SAWMOD FEM: 12.6k -> 3.0k page faults, 233 -> 218 ms). It is sized from `INFO(8)` and
+`ICNTL(14)` after the analysis, so the -8/-9 retry in `mumps_factorize!` grows it.
+"""
+function _bind_workspace!(solver::MumpsSchurSolver)
+    s = solver.struc
+    estimate = s.info[8] >= 0 ? Int(s.info[8]) : -Int(s.info[8]) * 1_000_000
+    need = ceil(Int, estimate * (1 + max(Int(icntl(s, 14)), 0) / 100))
+    need >= typemax(Int32) && (need = cld(need, 1_000_000) * 1_000_000)   # passed in millions
+    length(solver.workspace) < need && (solver.workspace = Vector{ComplexF64}(undef, need))
+    s.wk_user = pointer(solver.workspace)
+    s.lwk_user = length(solver.workspace) < typemax(Int32) ? Int32(length(solver.workspace)) :
+                 Int32(-(length(solver.workspace) ÷ 1_000_000))
+    return nothing
+end
+
+function _solve_phase!(solver::MumpsSchurSolver, rhs::Matrix{ComplexF64}, reduced::Matrix{ComplexF64}, mode::Integer;
+                       sparse_rhs::Bool=false)
     solver.factored || error("MUMPS solve needs a factorization first.")
     size(rhs, 1) == solver.n || error("MUMPS right-hand side must have one row per matrix row.")
     size(reduced) == (length(solver.schur_variables), size(rhs, 2)) ||
@@ -499,13 +540,26 @@ function _solve_phase!(solver::MumpsSchurSolver, rhs::Matrix{ComplexF64}, reduce
     s.lredrhs = Int32(length(solver.schur_variables))
     set_icntl!(s, 26, mode)
     _set_blas_threads(solver, mumps_solve_threads())
-    GC.@preserve solver rhs reduced begin
+    # A sparse right-hand side (ICNTL(20)=1) lets MUMPS prune the forward sweep; `rhs` is still the
+    # dense output array (ICNTL(21)=0).
+    sparse = sparse_rhs ? SparseMatrixCSC{ComplexF64,Int32}(rhs) : nothing
+    isnothing(sparse) || (set_icntl!(s, 20, 1); s.nz_rhs = Int32(nnz(sparse)))
+    GC.@preserve solver rhs reduced sparse begin
         s.rhs = pointer(rhs)
         s.redrhs = pointer(reduced)
+        if !isnothing(sparse)
+            s.irhs_ptr = pointer(sparse.colptr)
+            s.irhs_sparse = pointer(sparse.rowval)
+            s.rhs_sparse = pointer(sparse.nzval)
+        end
         _call!(solver.library, s, 3)
         s.rhs = C_NULL
         s.redrhs = C_NULL
+        s.irhs_ptr = C_NULL
+        s.irhs_sparse = C_NULL
+        s.rhs_sparse = C_NULL
     end
+    isnothing(sparse) || (set_icntl!(s, 20, 0); s.nz_rhs = Int32(0))
     set_icntl!(s, 26, 0)
     _check(solver, "solve (ICNTL(26)=$mode)")
     return rhs
@@ -515,12 +569,13 @@ end
     mumps_reduce(solver, rhs) -> Matrix{ComplexF64}
 
 Condensation phase (`ICNTL(26)=1`): `b_Γ - A_ΓI A_II⁻¹ b_I` for full-length right-hand-side
-columns `rhs`, in `schur_variables` order.
+columns `rhs`, in `schur_variables` order. The columns go in as a sparse right-hand side: FEM
+loads touch few rows, so MUMPS skips most of the forward sweep.
 """
 function mumps_reduce(solver::MumpsSchurSolver, rhs::AbstractMatrix)
     work = Matrix{ComplexF64}(rhs)
     reduced = zeros(ComplexF64, length(solver.schur_variables), size(work, 2))
-    _solve_phase!(solver, work, reduced, 1)
+    _solve_phase!(solver, work, reduced, 1; sparse_rhs=true)
     return reduced
 end
 
@@ -533,8 +588,9 @@ Expansion phase (`ICNTL(26)=2`) for the right-hand sides of the *immediately pre
 MUMPS 5.9 keeps the reduction's forward solution internally and ignores the `RHS` contents
 passed to the expansion (measured: expanding after reducing `b1` with `b2` in `RHS` returns
 the `b1` solution), and one expansion consumes it (a second fails with `INFOG(1)=-35`). The
-condensed solver therefore back-substitutes with `mumps_interior_solve` on an explicit
-right-hand side; this is kept for the self-test and for callers that pair the two calls.
+condensed solver expands its transducer columns right after reducing them, with `x_Γ = 0`
+(the interior solve, reusing the reduction's forward sweep); its back substitution of other
+right-hand sides uses `mumps_interior_solve`.
 """
 function mumps_expand(solver::MumpsSchurSolver, schur_solution::AbstractMatrix)
     solution = zeros(ComplexF64, solver.n, size(schur_solution, 2))
@@ -568,6 +624,9 @@ function mumps_release!(solver::MumpsSchurSolver)
     s.redrhs = C_NULL
     _call!(solver.library, s, -2)
     delete!(LIVE_SOLVERS, solver)
+    s.wk_user = C_NULL
+    s.lwk_user = Int32(0)
+    solver.workspace = ComplexF64[]
     return nothing
 end
 
