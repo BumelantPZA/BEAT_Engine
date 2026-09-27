@@ -95,12 +95,19 @@ end
 @testset "metal regular kernel mode aliases" begin
     withenv("BLAB_METAL_REGULAR_KERNEL_MODE" => nothing) do
         @test Engine._normalized_metal_regular_kernel_mode() === :pair_gather
+        # The condensed coupled builder's default; the variable still overrides it.
+        @test Engine._normalized_metal_regular_kernel_mode(nothing; default="pair_tilereduce") === :pair_tilereduce
+    end
+    withenv("BLAB_METAL_REGULAR_KERNEL_MODE" => "pair_gather") do
+        @test Engine._normalized_metal_regular_kernel_mode(nothing; default="pair_tilereduce") === :pair_gather
     end
     aliases = (
         "gather" => :pair_gather,
         "pair_gather" => :pair_gather,
         "chunked" => :pair_gather,
         "chunked_pair_gather" => :pair_gather,
+        "tilereduce" => :pair_tilereduce,
+        "pair_tilereduce" => :pair_tilereduce,
         "atomic" => :pair_atomic,
         "pair_atomic" => :pair_atomic,
         "fused_atomic" => :pair_atomic,

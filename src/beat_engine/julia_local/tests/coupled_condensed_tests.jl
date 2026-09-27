@@ -1473,6 +1473,95 @@ end
     @test_throws ArgumentError refined \ bad_rhs
 end
 
+@testset "Dense coupled solve: blocked factor, factor reuse and implicit flux products" begin
+    C = BeatEngineCoupledCondensed
+    Random.seed!(20260927)
+    n = 200
+    relative(reference, candidate) = norm(candidate - reference) / norm(reference)
+    basis = qr(randn(ComplexF64, n, n)).Q
+    matrix = Matrix(basis * Diagonal(ComplexF64.(exp10.(range(0, -4; length=n)))) * qr(randn(ComplexF64, n, n)).Q')
+    rhs = randn(ComplexF64, n, 3)
+
+    # Blocked LU and blocked triangular solves (several blocks here) against LAPACK's.
+    narrowed = ComplexF32.(matrix)
+    blocked = C._blocked_lu!(copy(narrowed), 48)
+    @test issuccess(blocked)
+    @test relative(narrowed[blocked.p, :], blocked.L * blocked.U) < 1e-5
+    # Backward error of the blocked solve at Float32 level, as LAPACK's own.
+    solved32 = C._lu_solve(blocked, ComplexF32.(rhs); nb=32)
+    backward(x) = opnorm(narrowed * x - ComplexF32.(rhs), 1) / (opnorm(narrowed, 1) * opnorm(x, 1))
+    @test backward(solved32) < 10 * backward(lu(narrowed) \ ComplexF32.(rhs)) + 1e-6
+    @test C._lu_solve(blocked, ComplexF32.(rhs[:, 1]); nb=32) isa Vector
+
+    # No reuse unless the caller passes a `DenseFactorReuse`.
+    @test !C.RefinedDenseLU(matrix).stale
+    @test !C.RefinedDenseLU(matrix).stale
+
+    # A nearby matrix (the next frequency) reuses the previous factor as a GMRES preconditioner
+    # and still reaches the Float64 backward error.
+    reuse = C.DenseFactorReuse()
+    first = C.RefinedDenseLU(matrix; reuse=reuse)
+    @test !first.stale && reuse.factor === first.factor
+    @test relative(lu(matrix) \ rhs, first \ rhs) < 1e-10
+    nearby = matrix .+ 1e-8 .* randn(ComplexF64, n, n)
+    second = C.RefinedDenseLU(nearby; reuse=reuse)
+    @test second.stale && second.factor === first.factor
+    @test relative(lu(nearby) \ rhs, second \ rhs) < 1e-10
+    @test second.backward_error <= 1
+    @test !reuse.disabled
+
+    # A far matrix: the stale solve gives up, factors afresh and ends reuse for the sweep.
+    far = Matrix(qr(randn(ComplexF64, n, n)).Q * Diagonal(ComplexF64.(exp10.(range(0, -4; length=n)))) *
+                 qr(randn(ComplexF64, n, n)).Q')
+    third = C.RefinedDenseLU(far; reuse=reuse)
+    @test third.stale
+    @test relative(lu(far) \ rhs, third \ rhs) < 1e-10
+    @test reuse.disabled && !third.stale && reuse.factor === third.factor
+    @test !C.RefinedDenseLU(nearby; reuse=reuse).stale
+
+    # Flux products kept out of the matrix: the solve matches the one with the product added.
+    rows = 21:120
+    columns = [3, 40, 77, 150]
+    coupling = randn(ComplexF64, length(rows), 5)
+    schur = 1e-2 .* randn(ComplexF64, 5, length(columns))
+    correction = (
+        rows=rows,
+        block32=ComplexF32.(coupling),
+        parts=[(columns=columns, coupling=coupling, coupling32=ComplexF32.(coupling), schur=schur)],
+    )
+    full = copy(matrix)
+    full[rows, columns] .+= coupling * schur
+    implicit = C.RefinedDenseLU(copy(matrix); correction=correction)
+    x = randn(ComplexF64, n, 2)
+    @test C._dense_mul!(zeros(ComplexF64, n, 2), implicit, x, one(ComplexF64), zero(ComplexF64)) ≈ full * x
+    @test relative(lu(full) \ rhs, implicit \ rhs) < 1e-10
+end
+
+@testset "Condensed host pool and threaded mass solve" begin
+    C = BeatEngineCoupledCondensed
+    C.clear_condensed_host_pool!()
+    array = C._pool_take(Float64, 7, 3)
+    C._pool_give!(array)
+    @test C._pool_take(Float64, 7, 3) === array
+    @test C._pool_take(Float64, 7, 3) !== array
+    C._pool_give!(array)
+    C.clear_condensed_host_pool!()
+    @test C._pool_take(Float64, 7, 3) !== array
+    @test C._pool_zeros(ComplexF64, 4, 5) == zeros(ComplexF64, 4, 5)
+    source = randn(ComplexF64, 6, 2)
+    @test C._pool_converted(ComplexF32, source) == ComplexF32.(source)
+
+    # The column-split Cholesky solve matches one solve of the whole real/imaginary panel (it was
+    # bit-identical on SAWMOD; different column counts may take different BLAS kernels).
+    Random.seed!(7)
+    m = 60
+    factor = cholesky(sparse(Symmetric(sprandn(m, m, 0.1) + 20I)))
+    block = (kind=:cholmod, factor=factor)
+    rhs = randn(ComplexF64, m, 12)
+    solved = factor \ hcat(real(rhs), imag(rhs))
+    @test C._mass_block_solve(block, rhs) ≈ complex.(solved[:, 1:12], solved[:, 13:24]) rtol = 1e-12
+end
+
 @testset "Double-precision FEM matrices (BLAB_COUPLED_FEM_FLOAT64)" begin
     mesh32 = load_gmsh41_volume(joinpath(CONDENSED_FIXTURE_ROOT, "femvolume.msh"), Float32(0.001))
     vertex_count = length(mesh32.vertices)

@@ -460,6 +460,53 @@ Float64:
 
 Each step agrees with its predecessor to within 1.6e-7 relative L2.
 
+### Sweep throughput on Metal
+
+A condensed Metal sweep runs two lanes per frequency: the host chain (FEM
+condensation with MUMPS, the flux elimination, the dense LU and solve) and the
+GPU lane (the BEM operators and the field). The defaults below keep both short
+and overlap them. None of them changes a result by more than Float32 round-off
+unless the table says so; the measurements are in [Measured sweep
+speed](#measured-sweep-speed).
+
+| Change | Where | Effect on results |
+| --- | --- | --- |
+| Tile-reduce regular kernels (`pair_tilereduce`): packed pair maths and a threadgroup reduction over test elements, so the gathers sum per node slot | `BeatEngineMetalTileReduceKernels.jl`; the condensed builder's default, `BLAB_METAL_REGULAR_KERNEL_MODE` overrides it | Float32 summation order |
+| Symmetry images summed in the same pair blocks, one gather per chunk | tile-reduce and fused exterior kernels | Float32 summation order |
+| Combined Burton-Miller assembly (`A = -D + βH`, `C = -S - βK'`) on the GPU under symmetry, with the row weights folded into the host combine | `MetalAssemblyOptions`, `_burton_miller_matrices_threaded` | Float32 summation order |
+| S and K' columns of faces without flux skipped | `MetalAssemblyOptions.flux_mask` | none (those columns are never read) |
+| Operator buffers, large host arrays and MUMPS's workspace reused across frequencies instead of allocated and page-faulted anew | `_take_pooled_operators`, `BeatEngineCoupledHostPool.jl`, `WK_USER` in `BeatEngineMumps.jl` | none |
+| No GC during a frequency; one collection after it | `solve_request_impl` | none |
+| Threaded Burton-Miller combine, FEM dynamic stiffness written in place, column-split Cholesky mass solve | `BeatEngineCoupledCondensed.jl` | none |
+| MUMPS: no numerical pivoting (CNTL(1) = 0; a failed factorization retries with 0.01), sparse right-hand sides for the reduction, the transducer columns' interior solve as the reduction's expansion | `BeatEngineMumps.jl`, `_build_mumps_condensation` | round-off |
+| Dense solve: blocked Float32 LU and triangular solves on large `gemm` calls, the previous frequency's factor as a GMRES preconditioner while it converges quickly, the flux products `B_q W` kept out of the matrix (exact in the Float64 residual) | `BeatEngineCoupledDenseLU.jl` | converges to the same Float64 backward error |
+| BLAS and LAPACK on Apple Accelerate (AMX), MUMPS included; `BLAB_MUMPS_THREADS` then has no effect | `use_accelerate_blas!` in `coupled_solver.jl` | round-off |
+| Frequency pipelining: frequency `i + 1` is built while `i` is solved, its operators assembled on the GPU in advance; with voltage drives and interior-free outputs its FEM stage starts as soon as `i`'s build returns | `BeatEngineCoupledPipeline.jl` | none (the reused dense factor stays in sweep order) |
+| Field: packed Float32 kernel with a range-reduced fast sin/cos and a precise distance; every drive of a frequency in one pass | `BeatEngineMetalFieldFast.jl` | at most 0.03 dB at 20 kHz against a Float64 field, as the previous kernel |
+| Fused exterior assembly: packed pair and singular kernels; below k h = 0.4 the singular part split as `G0 + G1` with `G0` computed once per mesh | `BeatEngineMetalFusedKernels.jl` | about 0.002 dB |
+
+The pipeline never runs a GPU assembly beside a field evaluation (that gave
+wrong results) and never runs two assemblies at once (they share scratch
+buffers). Other overlaps were measured and dropped: overlapping MUMPS
+factorizations of consecutive frequencies crashes inside MUMPS (process-global
+state), and any CPU-heavy stage beside MUMPS loses to contention on an M1 Pro.
+
+#### Measured sweep speed
+
+Apple M1 Pro (8 performance + 2 efficiency cores, 16-core GPU), 10 Julia
+threads, `scripts/benchmark_worker.py` with two sweeps in one warm worker; the
+second sweep's wall time, two runs per configuration. Accuracy is the worst
+level error within 30 dB of each output's peak.
+
+| Workload | `main` Metal | This backend | Peak memory | Accuracy |
+| --- | --- | --- | --- | --- |
+| `Multi_region_SAWMOD`, coupled, xy symmetry, 50 frequencies (20 Hz - 20 kHz, log) | 135.9-137.6 s | 25.4-26.0 s (5.3x) | 3.8 GB -> 6.1-6.5 GB | 0.0014 dB against `main` CPU Float64 (`main` Metal: 0.0009 dB) |
+| Waveguide, exterior-only system, quarter symmetry, 200 frequencies | 19.2-20.0 s | 9.7-10.4 s (2.0x) | 1.4 GB -> 1.5 GB | 0.0017 dB against `main` Metal |
+| `test_meshes/sample.msh`, source request, 12 frequencies | 1.9-2.3 s | 1.6-2.2 s | unchanged | 0.0005 dB against `main` Metal |
+
+`main` CPU Float64 takes 1,177 s on the SAWMOD sweep. The memory increase on
+SAWMOD is the pools and the frequency built ahead by the pipeline.
+
 ### Interior solver: UMFPACK, and the Accelerate path that was removed
 
 The condensation factors the FEM interior and then solves it against roughly one
@@ -524,7 +571,7 @@ Normal application use does not require these environment variables.
 | Variable | Default | Purpose |
 |---|---|---|
 | `BLAB_METAL_ASSEMBLY_MODE` | `native` | Use `host_staged` to assemble operators on the CPU and upload them as a diagnostic fallback. |
-| `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_gather` | Use `pair_atomic` for the fused atomic kernel, `pair_owned` for the deterministic colored kernels, or `entry_owned` as the correctness reference. |
+| `BLAB_METAL_REGULAR_KERNEL_MODE` | `pair_gather` (`pair_tilereduce` in condensed coupled solves) | Use `pair_tilereduce` for the tile-reduce kernels, `pair_atomic` for the fused atomic kernel, `pair_owned` for the deterministic colored kernels, or `entry_owned` as the correctness reference. Condensed coupled solves need `pair_tilereduce` for the combined assembly and the flux mask; with another mode they assemble the four operators. |
 | `BLAB_METAL_SINGULAR_MODE` | `native` | Use `host` to compute the Duffy singular corrections on the CPU and add them to the device operators, separating kernel defects from rule defects. |
 | `BLAB_METAL_KERNEL_GROUPSIZE` | `256` | Threads per threadgroup for the one-dimensional assembly kernels. |
 | `BLAB_METAL_ATOMIC_TILE` | `16x16` | Threadgroup shape (test, trial) of the two-dimensional pair kernels. |
@@ -552,7 +599,7 @@ Normal application use does not require these environment variables.
 | `BLAB_COUPLED_INTERFACE_BLOCKS` | `auto` on Metal, `off` elsewhere | As above. |
 | `BLAB_COUPLED_DEMAND_RECONSTRUCTION` | `auto` on Metal, `off` elsewhere | As above. |
 | `BLAB_COUPLED_FEM_SOLVER` | `mumps` on Metal, `umfpack` elsewhere | `umfpack` or `mumps`. |
-| `BLAB_MUMPS_THREADS` / `BLAB_MUMPS_SOLVE_THREADS` | `4` / `1` | BLAS threads for the MUMPS factorization and solve phases. |
+| `BLAB_MUMPS_THREADS` / `BLAB_MUMPS_SOLVE_THREADS` | `4` / `1` | BLAS threads for the MUMPS factorization and solve phases (OpenBLAS32; on Metal, where BLAS runs on Accelerate, they have no effect). |
 | `BLAB_SCHUR_BLOCK` | unset | Coupled solves: pins the Schur complement right-hand-side block width, bypassing the thread-count balancing. For measurement only. |
 | `BLAB_BEAT_FUSED_BM` | `1` | Set to `0` to assemble the four operators and combine them on the host for exterior solves. Coupled solves, `host_staged` assembly and the `host` singular mode always take the four-operator path. |
 
@@ -612,7 +659,7 @@ CPU-versus-Metal differences exceed their tolerances.
 - Frequency-independent caches remain resident for the worker's lifetime and are
   released when the worker exits.
 - The default `pair_gather` kernels are bitwise reproducible run to run, as
-  are `pair_owned` and `entry_owned`. `pair_atomic` is not (atomic
+  are `pair_tilereduce` (fixed reduction order), `pair_owned` and `entry_owned`. `pair_atomic` is not (atomic
   accumulation order); its differences are float32 summation noise.
 - That holds for the singular stage as well, but only since the deterministic
   write-back landed. Before it, every mode routed its singular corrections
