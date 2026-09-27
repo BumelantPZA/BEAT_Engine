@@ -528,3 +528,22 @@ GPU micro (`BLAB_TEST_GPU_MICRO`, SAWMOD alone on the GPU, ms per assembly, pair
   Rejected: the pressure varies linearly over an element, so a centroid source is only first-order
   accurate, and the quiet points of the 60 dB window amplify it. Even the best case saves only 8 ms.
   A correct version needs per-drive first moments (dipole correction) or a lower-order rule, not tried.
+
+**T5 (singular split), exterior path only; small gain, off by default.** `BLAB_TEST_SING_SPLIT=<kappa>`:
+G0 = 1/(4 pi r) parts per (pair, part) once per singular cache and transform (Sauter-Schwab, k = 0 pass
+`_test_singular_static_kernel!`, 25 floats), per frequency `_test_sing_split_kernel!` combines them with
+k and adds G1 = (e^{ikr}-1)/(4 pi r) on the regular R x R rule (cancellation-free forms). Used only while
+k h_max < kappa. prototype2 quarter, 50 freqs, on top of T1:
+| kappa | s/freq | maxdB vs T1 |
+|---|---|---|
+| off (T1) | 0.055-0.057 | 0 |
+| 0.4 | 0.052 | ~0 (0.0021 vs stock, same as T1) |
+| 0.6 | 0.055 (noisy run) | 0.0004 |
+| 0.8 | 0.054 | 0.0023 |
+| 1.2 | 0.058 | 0.107 |
+| 2 | 0.054 | 0.30 |
+| ungated | 0.048 | 56 (5.6 kHz+: > 16 dB) |
+The G0 part is right (< 0.0001 dB below 400 Hz); G1 on the regular rule fails on touching elements once
+k h grows (its -k^2 r/(8 pi) term has a kink at r = 0). Only the low-frequency part of a sweep can use it,
+so the gain is ~2-3 ms/freq (~4 %). Not ported to the coupled (SAWMOD) singular kernel: 14 ms in the GPU
+lane, which is not the longer lane on this M1 Pro.

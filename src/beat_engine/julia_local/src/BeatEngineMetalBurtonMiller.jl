@@ -1161,6 +1161,17 @@ function _launch_metal_fused_singular_kernels!(
     lhs_values = _test_fused_take(eltype(lhs), value_count, 9; zero_fill=false)   # every entry written below
     rhs_values = _test_fused_take(eltype(lhs), value_count, 3; zero_fill=false)
     stamp = _metal_gather_stage!("sing_alloc", timed, stamp)
+    if T === Float32 && _test_sing_split_on(regular_cache, k)
+        static = _test_singular_static(regular_cache, singular_cache, transform, part_count)
+        _metal_launch(
+            _test_sing_split_kernel!, value_count,
+            lhs_values, rhs_values, static, singular_cache.test_indices, singular_cache.trial_indices,
+            singular_cache.normal_products, regular_cache.element_rule_points, regular_cache.rule_points,
+            regular_cache.rule_weights, regular_cache.areas, regular_cache.normals, regular_cache.curls,
+            k, inv(k), Int32(regular_cache.face_count), Int32(pair_count), Int32(part_count), Val(regular_cache.rule_count),
+            sx, sy, sz, csx, csy, csz,
+        )
+    else
     _metal_launch(
         _metal_singular_fused_bm_blocks_kernel!,
         value_count,
@@ -1173,6 +1184,7 @@ function _launch_metal_fused_singular_kernels!(
         Int32(rule_point_count), Int32(part_count),
         sx, sy, sz, csx, csy, csz,
     )
+    end
     stamp = _metal_gather_stage!("sing_blocks", timed, stamp)
     if gather_tables === nothing
         _metal_launch(
@@ -1527,4 +1539,277 @@ end
 function solve_metal_burton_miller_system(system; method::Symbol=beat_dense_solve_method())
     pressure, _ = solve_metal_burton_miller_system_with_report(system; method=method)
     return pressure
+end
+
+# Test (BLAB_TEST_SING_SPLIT=1; quadrature change, judge in dB): singular corrections of the fused
+# exterior path as G = G0 + G1, G0 = 1/(4 pi r) (frequency-independent), G1 = (e^{ikr} - 1)/(4 pi r)
+# (bounded). Once per singular cache and transform, the Sauter-Schwab rule integrates the G0 parts per
+# (pair, part): S0 (3), K'0 (3), D0 (9), I0 = basis products x G0 (9), G0 total (1), 25 Float32.
+# Per frequency a small kernel combines them with k and adds the G1 part of each pair on the regular
+# R x R rule (part 1 only), so the gathers are unchanged.
+const _TEST_SING_STATIC = IdDict{Any,Dict{Tuple{Symbol,Int},Any}}()   # keyed by identity; at most 16 caches kept
+const _TEST_SING_STATIC_LOCK = ReentrantLock()
+const _TEST_SING_COMPONENTS = 25
+
+function _test_singular_static_kernel!(
+    static, test_indices, trial_indices, rule_indices, jac_scales, rule_offsets,
+    rule_test_points, rule_trial_points, rule_weights, face_vertices, normals,
+    face_count::Int32, pair_count::Int32, rule_point_count::Int32, part_count::Int32,
+    trial_sign_x, trial_sign_y, trial_sign_z,
+)
+    linear_index = Int32(thread_position_in_grid_1d())
+    linear_index > pair_count * part_count && return nothing
+    pair_position = (linear_index - Int32(1)) % pair_count + Int32(1)
+    part = (linear_index - Int32(1)) ÷ pair_count + Int32(1)
+    T = Float32
+    @inbounds begin
+        test_index = Int32(test_indices[pair_position])
+        trial_index = Int32(trial_indices[pair_position])
+        rule_index = Int32(rule_indices[pair_position])
+        q_first = Int32(rule_offsets[rule_index])
+        q_last = Int32(rule_offsets[rule_index + Int32(1)]) - Int32(1)
+        per_part = cld(q_last - q_first + Int32(1), part_count)
+        q = q_first + (part - Int32(1)) * per_part
+        q_stop = min(q + per_part - Int32(1), q_last)
+        jac_scale = jac_scales[pair_position]
+        test_nx = normals[test_index]
+        test_ny = normals[test_index + face_count]
+        test_nz = normals[test_index + Int32(2) * face_count]
+        trial_nx = trial_sign_x * normals[trial_index]
+        trial_ny = trial_sign_y * normals[trial_index + face_count]
+        trial_nz = trial_sign_z * normals[trial_index + Int32(2) * face_count]
+    end
+    inv_four_pi = T(0.07957747154594767)
+    s0 = zero(SVector{3,T}); k0 = zero(SVector{3,T})
+    d0 = zero(SVector{9,T}); i0 = zero(SVector{9,T}); g0 = zero(T)
+    while q <= q_stop
+        @inbounds begin
+            test_xi = rule_test_points[q]
+            test_eta = rule_test_points[q + rule_point_count]
+            trial_xi = rule_trial_points[q]
+            trial_eta = rule_trial_points[q + rule_point_count]
+            weight = rule_weights[q] * jac_scale
+        end
+        tb1 = one(T) - test_xi - test_eta
+        rb1 = one(T) - trial_xi - trial_eta
+        x, y, z = _metal_face_point(face_vertices, test_index, face_count, tb1, test_xi, test_eta)
+        sx, sy, sz = _metal_face_point(face_vertices, trial_index, face_count, rb1, trial_xi, trial_eta)
+        dx = sx * trial_sign_x - x
+        dy = sy * trial_sign_y - y
+        dz = sz * trial_sign_z - z
+        radius2 = dx * dx + dy * dy + dz * dz
+        if radius2 > zero(T)
+            inv_radius = one(T) / sqrt(radius2)
+            green = inv_radius * inv_four_pi * weight
+            grad = -green * inv_radius
+            test_dot = -(dx * test_nx + dy * test_ny + dz * test_nz) * inv_radius
+            trial_dot = (dx * trial_nx + dy * trial_ny + dz * trial_nz) * inv_radius
+            tb = SVector(tb1, test_xi, test_eta)
+            outer = SVector(
+                tb1 * rb1, test_xi * rb1, test_eta * rb1,
+                tb1 * trial_xi, test_xi * trial_xi, test_eta * trial_xi,
+                tb1 * trial_eta, test_xi * trial_eta, test_eta * trial_eta,
+            )
+            s0 += tb * green
+            k0 += tb * (grad * test_dot)
+            d0 += outer * (grad * trial_dot)
+            i0 += outer * green
+            g0 += green
+        end
+        q += Int32(1)
+    end
+    stride = pair_count * part_count
+    @inbounds begin
+        for i in 1:3
+            static[linear_index + Int32(i - 1) * stride] = s0[i]
+            static[linear_index + Int32(i + 2) * stride] = k0[i]
+        end
+        for i in 1:9
+            static[linear_index + Int32(i + 5) * stride] = d0[i]
+            static[linear_index + Int32(i + 14) * stride] = i0[i]
+        end
+        static[linear_index + Int32(24) * stride] = g0
+    end
+    return nothing
+end
+
+function _test_singular_static(regular_cache, singular_cache, transform, part_count)
+    key = (transform.label, part_count)
+    lock(_TEST_SING_STATIC_LOCK) do
+        if !haskey(_TEST_SING_STATIC, singular_cache.test_indices) && length(_TEST_SING_STATIC) >= 16
+            for (_, old) in _TEST_SING_STATIC, (_, buffer) in old
+                Metal.unsafe_free!(buffer)
+            end
+            empty!(_TEST_SING_STATIC)
+        end
+        per_cache = get!(() -> Dict{Tuple{Symbol,Int},Any}(), _TEST_SING_STATIC, singular_cache.test_indices)
+        get!(per_cache, key) do
+            pair_count = singular_cache.pair_count
+            static = Metal.zeros(Float32, pair_count * part_count * _TEST_SING_COMPONENTS)
+            _metal_launch(
+                _test_singular_static_kernel!, pair_count * part_count, static,
+                singular_cache.test_indices, singular_cache.trial_indices, singular_cache.rule_indices,
+                singular_cache.jac_scales, singular_cache.rule_offsets,
+                singular_cache.rule_test_points, singular_cache.rule_trial_points, singular_cache.rule_weights,
+                regular_cache.face_vertices, regular_cache.normals,
+                Int32(regular_cache.face_count), Int32(pair_count), Int32(length(singular_cache.rule_weights)), Int32(part_count),
+                Float32(transform.signs[1]), Float32(transform.signs[2]), Float32(transform.signs[3]),
+            )
+            Metal.synchronize()
+            static
+        end
+    end
+end
+
+# G1 = (e^{ikr} - 1)/(4 pi r) and its r-derivative, both bounded at r = 0, without Float32 cancellation:
+# cos(kr) - 1 = -2 sin^2(kr/2); kr - sin(kr) by its series for small kr.
+@inline function _test_g1(radius, k, scale)
+    phase = k * radius
+    half = 0.5f0 * phase
+    sh = sin(half)
+    g1_re = -2.0f0 * sh * sh * scale                       # scale = weight / (4 pi r)
+    g1_im = sin(phase) * scale
+    # d/dr: ik (G1 + G0) - G1 / r
+    #   re: -k g1_im - g1_re / r      im: k g1_re + (k r - sin(kr)) scale / r
+    kms = phase < 0.05f0 ? phase * phase * phase * (1.0f0 / 6.0f0 - phase * phase * (1.0f0 / 120.0f0)) : phase - sin(phase)
+    return g1_re, g1_im, kms
+end
+
+function _test_sing_split_kernel!(
+    lhs_values, rhs_values, static, test_indices, trial_indices, normal_products,
+    element_rule_points, rule_points, rule_weights, areas, normals, curls,
+    k::Float32, inverse_k::Float32, face_count::Int32, pair_count::Int32, part_count::Int32, ::Val{R},
+    trial_sign_x, trial_sign_y, trial_sign_z, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
+) where {R}
+    linear_index = Int32(thread_position_in_grid_1d())
+    linear_index > pair_count * part_count && return nothing
+    pair_position = (linear_index - Int32(1)) % pair_count + Int32(1)
+    part = (linear_index - Int32(1)) ÷ pair_count + Int32(1)
+    stride = pair_count * part_count
+    T = Float32
+    inv_four_pi = T(0.07957747154594767)
+    @inbounds begin
+        test_index = Int32(test_indices[pair_position])
+        trial_index = Int32(trial_indices[pair_position])
+        normal_product = normal_products[pair_position]
+        s0 = SVector{3,T}(ntuple(i -> static[linear_index + Int32(i - 1) * stride], Val(3)))
+        k0 = SVector{3,T}(ntuple(i -> static[linear_index + Int32(i + 2) * stride], Val(3)))
+        d0 = SVector{9,T}(ntuple(i -> static[linear_index + Int32(i + 5) * stride], Val(9)))
+        i0 = SVector{9,T}(ntuple(i -> static[linear_index + Int32(i + 14) * stride], Val(9)))
+        g0 = static[linear_index + Int32(24) * stride]
+    end
+    curl_scale = inverse_k * k * k * normal_product
+    # G0 part: rhs = -S0 - (i/k) K'0; lhs = -D0 - i curl_scale I0 (+ curl term below).
+    rhs_re = -s0
+    rhs_im = -inverse_k * k0
+    lhs_re = -d0
+    lhs_im = -curl_scale * i0
+    g_total_re = g0
+    g_total_im = zero(T)
+    if part == Int32(1)
+        @inbounds begin
+            test_nx = normals[test_index]
+            test_ny = normals[test_index + face_count]
+            test_nz = normals[test_index + Int32(2) * face_count]
+            trial_nx = trial_sign_x * normals[trial_index]
+            trial_ny = trial_sign_y * normals[trial_index + face_count]
+            trial_nz = trial_sign_z * normals[trial_index + Int32(2) * face_count]
+            jac_scale = T(4) * areas[test_index] * areas[trial_index]
+        end
+        tq = Int32(1)
+        while tq <= Int32(R)
+            @inbounds begin
+                test_xi = rule_points[tq]
+                test_eta = rule_points[tq + Int32(R)]
+                tw = rule_weights[tq]
+                pi_ = test_index + face_count * (tq - Int32(1))
+                x = element_rule_points[pi_]
+                y = element_rule_points[pi_ + face_count * Int32(R)]
+                z = element_rule_points[pi_ + face_count * Int32(2 * R)]
+            end
+            tb1 = one(T) - test_xi - test_eta
+            tb = SVector(tb1, test_xi, test_eta)
+            rq = Int32(1)
+            while rq <= Int32(R)
+                @inbounds begin
+                    trial_xi = rule_points[rq]
+                    trial_eta = rule_points[rq + Int32(R)]
+                    weight = tw * rule_weights[rq] * jac_scale
+                    pj = trial_index + face_count * (rq - Int32(1))
+                    sx = element_rule_points[pj] * trial_sign_x
+                    sy = element_rule_points[pj + face_count * Int32(R)] * trial_sign_y
+                    sz = element_rule_points[pj + face_count * Int32(2 * R)] * trial_sign_z
+                end
+                rb1 = one(T) - trial_xi - trial_eta
+                outer = SVector(
+                    tb1 * rb1, test_xi * rb1, test_eta * rb1,
+                    tb1 * trial_xi, test_xi * trial_xi, test_eta * trial_xi,
+                    tb1 * trial_eta, test_xi * trial_eta, test_eta * trial_eta,
+                )
+                dx = sx - x
+                dy = sy - y
+                dz = sz - z
+                radius2 = dx * dx + dy * dy + dz * dz
+                if radius2 > zero(T)
+                    radius = sqrt(radius2)
+                    inv_radius = one(T) / radius
+                    scale = inv_radius * inv_four_pi * weight
+                    g1_re, g1_im, kms = _test_g1(radius, k, scale)
+                    grad_re = -k * g1_im - g1_re * inv_radius
+                    grad_im = k * g1_re + kms * scale * inv_radius
+                    test_dot = -(dx * test_nx + dy * test_ny + dz * test_nz) * inv_radius
+                    trial_dot = (dx * trial_nx + dy * trial_ny + dz * trial_nz) * inv_radius
+                else
+                    # r = 0: G1 = ik/(4 pi); the gradient terms carry n.(x - y)/r = 0 on a flat element.
+                    g1_re = zero(T)
+                    g1_im = k * inv_four_pi * weight
+                    grad_re = zero(T); grad_im = zero(T); test_dot = zero(T); trial_dot = zero(T)
+                end
+                rhs_re += tb * (-g1_re + inverse_k * (grad_im * test_dot))
+                rhs_im += tb * (-g1_im - inverse_k * (grad_re * test_dot))
+                u_re = -(grad_re * trial_dot) + curl_scale * g1_im
+                u_im = -(grad_im * trial_dot) - curl_scale * g1_re
+                lhs_re += outer * u_re
+                lhs_im += outer * u_im
+                g_total_re += g1_re
+                g_total_im += g1_im
+                rq += Int32(1)
+            end
+            tq += Int32(1)
+        end
+    end
+    curl_products = _metal_pair_curl_products(
+        curls, test_index, trial_index, face_count, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
+    )
+    lhs_re -= curl_products * (inverse_k * g_total_im)
+    lhs_im += curl_products * (inverse_k * g_total_re)
+    @inbounds begin
+        i = 1
+        while i <= 3
+            rhs_values[linear_index + Int32(i - 1) * stride] = Complex(rhs_re[i], rhs_im[i])
+            i += 1
+        end
+        i = 1
+        while i <= 9
+            lhs_values[linear_index + Int32(i - 1) * stride] = Complex(lhs_re[i], lhs_im[i])
+            i += 1
+        end
+    end
+    return nothing
+end
+
+# BLAB_TEST_SING_SPLIT=<kappa>: split only while k h_max < kappa (h_max: the largest element's
+# equilateral edge from its area), where the regular rule still integrates G1 accurately; above it the
+# stock Sauter-Schwab evaluation runs.
+const _TEST_SING_HMAX = IdDict{Any,Float32}()
+function _test_sing_split_on(regular_cache, k)
+    raw = get(ENV, "BLAB_TEST_SING_SPLIT", "0")
+    raw == "0" && return false
+    kappa = parse(Float32, raw)
+    hmax = lock(_TEST_SING_STATIC_LOCK) do
+        get!(_TEST_SING_HMAX, regular_cache.areas) do
+            Float32(sqrt(4 * maximum(Array(regular_cache.areas)) / sqrt(3)))
+        end
+    end
+    return abs(k) * hmax < kappa
 end
