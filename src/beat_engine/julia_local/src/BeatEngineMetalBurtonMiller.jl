@@ -462,7 +462,11 @@ function _test_fused_pair_blocks_packed_kernel!(
     trial_sign_x, trial_sign_y, trial_sign_z, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
     ::Val{ACC},
     ::Val{LOOP},
-) where {R,ACC,LOOP}
+    ::Val{FAR}=Val(0),
+    centroids4=nothing,
+    far_rho::Float32=0.0f0,
+    far_kh::Float32=0.0f0,
+) where {R,ACC,LOOP,FAR}
     position = thread_position_in_grid_2d()
     test_position = Int32(position.x)
     trial_local = Int32(position.y)
@@ -470,8 +474,22 @@ function _test_fused_pair_blocks_packed_kernel!(
     @inbounds test_index = Int32(elements[test_position])
     @inbounds trial_index = Int32(elements[chunk_start + trial_local - Int32(1)])
     base = test_position + element_count * (trial_local - Int32(1))
-    if _metal_pair_is_skipped(faces, face_count, test_index, trial_index, pair_offsets, singular_trial_indices, skip_mode)
-        ACC && return nothing
+    # Test (BLAB_TEST_FAR_ORDER=rho/kh): FAR = 1 is the near pass (full rule, far pairs skipped), FAR = 2
+    # the far pass (launched with the 3-point tables, adds far pairs only). Far: centroid distance at least
+    # rho x (sum of the circumradii) and k x (sum of the circumradii) below kh.
+    skip_far = false
+    if FAR > 0
+        @inbounds ct = centroids4[test_index]
+        @inbounds cr = centroids4[trial_index]
+        ex = cr[1].value * trial_sign_x - ct[1].value
+        ey = cr[2].value * trial_sign_y - ct[2].value
+        ez = cr[3].value * trial_sign_z - ct[3].value
+        radii = ct[4].value + cr[4].value
+        far = ex * ex + ey * ey + ez * ez >= far_rho * far_rho * radii * radii && k * radii < far_kh
+        skip_far = FAR == 1 ? far : !far
+    end
+    if skip_far || _metal_pair_is_skipped(faces, face_count, test_index, trial_index, pair_offsets, singular_trial_indices, skip_mode)
+        (ACC || FAR == 2) && return nothing
         component = Int32(0)
         while component < Int32(_METAL_FUSED_COMPONENTS)
             @inbounds blocks[base + component * pair_stride] = zero(eltype(blocks))
@@ -723,6 +741,13 @@ function _launch_metal_fused_pair_kernels!(lhs, rhs_partial, q_neumann, cache::M
     timed = get(ENV, "BLAB_METAL_GATHER_TIMING", "0") == "1"
     packed_mode = parse(Int, get(ENV, "BLAB_TEST_FUSED_PACKED", "0"))
     packed = packed_mode > 0 ? _metal_packed_pair_tables_for(cache) : nothing
+    far_setting = strip(get(ENV, "BLAB_TEST_FAR_ORDER", ""))
+    far_tables = nothing
+    far_rho = far_kh = 0.0f0
+    if packed_mode == 2 && !isempty(far_setting) && cache.rule_count > 3
+        far_rho, far_kh = parse.(Float32, split(far_setting, "/"))
+        far_tables = _test_far_order_tables_for(cache)
+    end
     timed && Metal.synchronize()
     stamp = time()
     for chunk in 1:tables.chunk_count
@@ -772,6 +797,19 @@ function _launch_metal_fused_pair_kernels!(lhs, rhs_partial, q_neumann, cache::M
                 trial_sign_x, trial_sign_y, trial_sign_z, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
                 Val(transform_number > 1), Val(packed_mode == 2),
             )
+            if far_tables !== nothing
+                near_args = (packed_args..., Val(1), far_tables.centroids4, far_rho, far_kh)
+                Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _test_fused_pair_blocks_packed_kernel!(near_args...)
+                packed_args = (
+                    tables.blocks, far_tables.points3, packed.normals4, cache.areas, packed.curls4, cache.faces, tables.elements,
+                    far_tables.rule3_points, far_tables.rule3_weights,
+                    Int32(element_count), Int32(chunk_start), Int32(chunk_count), pair_stride,
+                    k, inv(k), Int32(cache.face_count), Val(_TEST_RULE3), Val(3),
+                    pair_offsets, singular_trial_indices, skip_mode,
+                    trial_sign_x, trial_sign_y, trial_sign_z, trial_curl_sign_x, trial_curl_sign_y, trial_curl_sign_z,
+                    Val(true), Val(true), Val(2), far_tables.centroids4, far_rho, far_kh,
+                )
+            end
             chunk == 1 && transform_number == 1 && _test_pipeinfo("fused_pair_packed", _test_fused_pair_blocks_packed_kernel!, packed_args...)
             Metal.@metal threads=(tile_x, tile_y) groups=(cld(element_count, tile_x), cld(chunk_count, tile_y)) _test_fused_pair_blocks_packed_kernel!(packed_args...)
         else
@@ -1812,4 +1850,41 @@ function _test_sing_split_on(regular_cache, k)
         end
     end
     return abs(k) * hmax < kappa
+end
+
+# BLAB_TEST_FAR_ORDER tables: the 3-point rule's points per face (float4, face-major), and per face the
+# centroid and circumradius (largest vertex distance from the centroid).
+const _TEST_RULE3 = (1.0f0 / 6, 2.0f0 / 3, 1.0f0 / 6, 1.0f0 / 6, 1.0f0 / 6, 2.0f0 / 3, 1.0f0 / 6, 1.0f0 / 6, 1.0f0 / 6)
+struct TestFarOrderTables
+    points3
+    centroids4
+    rule3_points
+    rule3_weights
+end
+const _TEST_FAR_ORDER = IdDict{Any,TestFarOrderTables}()
+function _test_far_order_tables_for(cache::MetalRegularAssemblyCache)
+    lock(_TEST_SING_STATIC_LOCK) do
+        get!(_TEST_FAR_ORDER, cache.face_vertices) do
+            F = cache.face_count
+            fv = Array(cache.face_vertices)
+            vertex(face, v) = (Float64(fv[face + (3 * (v - 1)) * F]), Float64(fv[face + (3 * (v - 1) + 1) * F]),
+                               Float64(fv[face + (3 * (v - 1) + 2) * F]))
+            points3 = Vector{_MetalFloat4}(undef, 3 * F)
+            centroids4 = Vector{_MetalFloat4}(undef, F)
+            for face in 1:F
+                a, b, c = vertex(face, 1), vertex(face, 2), vertex(face, 3)
+                for q in 1:3
+                    xi, eta = Float64(_TEST_RULE3[q]), Float64(_TEST_RULE3[3 + q])
+                    b1 = 1 - xi - eta
+                    p = ntuple(i -> b1 * a[i] + xi * b[i] + eta * c[i], 3)
+                    points3[(face - 1) * 3 + q] = _metal_float4(Float32(p[1]), Float32(p[2]), Float32(p[3]), 0.0f0)
+                end
+                ce = ntuple(i -> (a[i] + b[i] + c[i]) / 3, 3)
+                radius = maximum(sqrt(sum((v[i] - ce[i])^2 for i in 1:3)) for v in (a, b, c))
+                centroids4[face] = _metal_float4(Float32(ce[1]), Float32(ce[2]), Float32(ce[3]), Float32(radius))
+            end
+            TestFarOrderTables(MtlArray(points3), MtlArray(centroids4),
+                MtlArray(collect(_TEST_RULE3[1:6])), MtlArray(collect(_TEST_RULE3[7:9])))
+        end
+    end
 end

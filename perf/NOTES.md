@@ -547,3 +547,19 @@ The G0 part is right (< 0.0001 dB below 400 Hz); G1 on the regular rule fails on
 k h grows (its -k^2 r/(8 pi) term has a kink at r = 0). Only the low-frequency part of a sweep can use it,
 so the gain is ~2-3 ms/freq (~4 %). Not ported to the coupled (SAWMOD) singular kernel: 14 ms in the GPU
 lane, which is not the longer lane on this M1 Pro.
+
+**T4 (distance-adaptive quadrature), rejected.** `BLAB_TEST_FAR_ORDER=rho/kh` (exterior fused packed kernel,
+T1 mode 2 only, rules > 3 points): far pairs (centroid distance >= rho x sum of circumradii, k x radii <
+kh) use the 3-point rule in a second launch (`FAR` 1 = near pass, 2 = far pass; one kernel holding both
+rule bodies crashes the Metal compiler at pipeline link, like TR_EARLY_COMB=2). prototype2 quarter,
+50 freqs, 1 round, machine busy (WindowServer/Beeper ~45 % CPU each; absolute times ~+50 %):
+| Setting | s/freq | maxdB vs stock |
+|---|---|---|
+| T1 | 0.079 | 0.0021 |
+| rho 2, any kh | 0.076 | 42.2 |
+| rho 3, any kh | 0.078 | 43.8 |
+| rho 5, any kh | 0.080 | 49.9 |
+| rho 3, kh < 1 | 0.079 | 0.24 |
+The pair kernel is not the only cost any more after T1 (gathers, singular, field, solve), the second
+launch re-reads every pair, and the 3-point rule cannot follow the phase once k h ~ 1. SAWMOD already
+uses the 3-point rule (only a 1-point rule would be cheaper, first-order like T3 part 2): not tried.
